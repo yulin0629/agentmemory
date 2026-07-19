@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
  * hook entries.
  */
 
-type HookHandler = { type: string; command: string; [key: string]: unknown };
+type HookHandler = { type: string; command?: string; [key: string]: unknown };
 type HookEntry = { matcher?: string; hooks: HookHandler[]; [key: string]: unknown };
 export type HookManifest = { hooks: Record<string, HookEntry[]> };
 
@@ -70,9 +70,9 @@ export function findPluginRoot(startUrl: string = import.meta.url): string {
 /**
  * Build the merged hooks.json content.
  *
- *   1. Strip any entry from `existing` whose first hook command points
- *      under `<pluginRoot>/scripts/`. This lets us re-install idempotently
- *      without leaving stale references.
+ *   1. Strip AgentMemory command handlers from `existing`. This lets us
+ *      re-install idempotently without leaving stale references while
+ *      preserving command-less Claude Code prompt and agent handlers.
  *   2. Append fresh entries from the bundled Codex manifest with
  *      `${CLAUDE_PLUGIN_ROOT}` rewritten to the absolute plugin path.
  *      Matcher values from the bundled manifest are preserved so PreToolUse
@@ -104,10 +104,17 @@ export function buildMergedHooks(
   for (const [event, entries] of Object.entries(ours.hooks)) {
     const resolvedEntries: HookEntry[] = entries.map((entry) => {
       const next: HookEntry = {
-        hooks: entry.hooks.map((handler) => ({
-          ...handler,
-          command: handler.command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginRoot),
-        })),
+        hooks: entry.hooks.map((handler) =>
+          typeof handler.command === "string"
+            ? {
+                ...handler,
+                command: handler.command.replace(
+                  /\$\{CLAUDE_PLUGIN_ROOT\}/g,
+                  pluginRoot,
+                ),
+              }
+            : { ...handler },
+        ),
       };
       if (entry.matcher !== undefined) next.matcher = entry.matcher;
       return next;
@@ -119,6 +126,7 @@ export function buildMergedHooks(
 }
 
 function isAgentmemoryHandler(handler: HookHandler, scriptsDir: string): boolean {
+  if (typeof handler.command !== "string") return false;
   const normalizedScriptsDir = normalizePathForCommandMatch(scriptsDir);
   const command = normalizePathForCommandMatch(handler.command);
   if (command.includes(normalizedScriptsDir)) return true;

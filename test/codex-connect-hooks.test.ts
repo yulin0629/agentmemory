@@ -78,7 +78,9 @@ describe("buildMergedHooks", () => {
     );
     expect(userHook, "user's SessionStart hook should survive").toBeDefined();
     const ours = sessionStart.find((e) =>
-      e.hooks.some((h) => h.command.includes(`${PLUGIN_ROOT}/scripts/session-start.mjs`)),
+      e.hooks.some((h) =>
+        h.command?.includes(`${PLUGIN_ROOT}/scripts/session-start.mjs`),
+      ),
     );
     expect(ours, "agentmemory SessionStart hook should be appended").toBeDefined();
   });
@@ -142,6 +144,27 @@ describe("buildMergedHooks", () => {
       command: "echo user-hook",
       timeout: 7,
     });
+  });
+
+  it("preserves command-less Claude Code prompt and agent handlers", () => {
+    const existing: HookManifest = {
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [
+              { type: "prompt", prompt: "Keep this prompt hook" },
+              { type: "agent", agent: "keep-this-agent" },
+            ],
+          },
+        ],
+      },
+    };
+
+    const merged = buildMergedHooks(existing, PLUGIN_ROOT);
+
+    expect(merged.hooks["SessionStart"]![0]!.hooks).toEqual(
+      existing.hooks["SessionStart"]![0]!.hooks,
+    );
   });
 
   it("re-install preserves unrelated user entries", () => {

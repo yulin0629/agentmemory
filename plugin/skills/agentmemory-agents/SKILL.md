@@ -23,7 +23,7 @@ After wiring, restart the host or run its MCP reload (for example `/mcp` in Clau
 ## Notes
 
 - The action skills (remember, recall, and the rest) are installed separately with `npx skills add rohitg00/agentmemory`. `connect` makes tools available; skills teach the agent when to use them.
-- Windows: use WSL2 for the general case. Native Windows supports `agentmemory connect copilot-cli` and `agentmemory connect codex --with-hooks`; other adapters still require manual setup.
+- Windows: use WSL2 for the general case. Native Windows supports `agentmemory connect copilot-cli`, `agentmemory connect codex --with-hooks`, and `agentmemory connect claude-code --with-hooks`; other adapters still require manual setup.
 
 ## See also
 
