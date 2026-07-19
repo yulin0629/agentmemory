@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Native Windows Claude Code hook installation.** `agentmemory connect claude-code --with-hooks` now passes the Windows dispatcher gate, preserves existing Claude Code hooks while merging all 12 AgentMemory events, and previews both MCP and hook changes in `--dry-run` mode. `PostToolUse` also waits for the remote observation request instead of exiting after 500 ms, preventing dropped tool observations on higher-latency relays.
+
 ## [0.9.27] — 2026-06-07
 
 Wave release closing several breaking regressions reported against v0.9.26, plus an agent-scope isolation security fix, an iii version-pin audit fix, and a benchmark scorecard correction. No breaking changes; drop-in upgrade.

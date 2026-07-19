@@ -58,7 +58,10 @@ export function isWindowsConnectAllowed(
 ): boolean {
   if (all || positional.length !== 1) return false;
   const agent = positional[0]?.toLowerCase();
-  return agent === "copilot-cli" || (agent === "codex" && withHooks);
+  return (
+    agent === "copilot-cli" ||
+    ((agent === "codex" || agent === "claude-code") && withHooks)
+  );
 }
 
 function parseFlags(args: string[]): {

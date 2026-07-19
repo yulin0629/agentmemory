@@ -37,7 +37,7 @@ async function main() {
 
   const { imageData, cleanOutput } = extractImageData(toolOutput(data));
 
-  fetch(`${REST_URL}/agentmemory/observe`, {
+  await fetch(`${REST_URL}/agentmemory/observe`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({
@@ -55,7 +55,6 @@ async function main() {
     }),
     signal: AbortSignal.timeout(3000),
   }).catch(() => {});
-  setTimeout(() => process.exit(0), 500).unref();
 }
 
 function toolOutput(data: Record<string, unknown>): unknown {

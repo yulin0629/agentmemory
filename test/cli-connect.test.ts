@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import * as p from "@clack/prompts";
 
 import {
   ADAPTERS,
@@ -85,10 +86,12 @@ describe("agentmemory connect — dispatcher", () => {
     }
   });
 
-  it("allows only explicit Codex hook installation and Copilot on Windows", () => {
+  it("allows only explicit hook installation for Codex and Claude Code, plus Copilot, on Windows", () => {
     expect(isWindowsConnectAllowed(["copilot-cli"], false, false)).toBe(true);
     expect(isWindowsConnectAllowed(["codex"], true, false)).toBe(true);
+    expect(isWindowsConnectAllowed(["claude-code"], true, false)).toBe(true);
     expect(isWindowsConnectAllowed(["codex"], false, false)).toBe(false);
+    expect(isWindowsConnectAllowed(["claude-code"], false, false)).toBe(false);
     expect(isWindowsConnectAllowed([], true, true)).toBe(false);
   });
 });
@@ -268,6 +271,23 @@ describe("agentmemory connect — claude-code adapter (mock filesystem)", () => 
 
     const after = readFileSync(join(tmpHome, ".claude.json"), "utf-8");
     expect(after).toBe(before);
+  });
+
+  it("install() with --dry-run and --with-hooks previews both MCP and hooks", async () => {
+    require("node:fs").mkdirSync(join(tmpHome, ".claude"), { recursive: true });
+    const claudeJson = JSON.stringify({ mcpServers: {} });
+    const settings = JSON.stringify({ hooks: {} });
+    writeFileSync(join(tmpHome, ".claude.json"), claudeJson);
+    writeFileSync(join(tmpHome, ".claude", "settings.json"), settings);
+    const info = vi.spyOn(p.log, "info");
+
+    const a = await loadAdapter();
+    const result = await a.install({ dryRun: true, force: false, withHooks: true });
+
+    expect(result.kind).toBe("installed");
+    expect(info.mock.calls.some(([message]) => String(message).includes("hook entries"))).toBe(true);
+    expect(readFileSync(join(tmpHome, ".claude.json"), "utf-8")).toBe(claudeJson);
+    expect(readFileSync(join(tmpHome, ".claude", "settings.json"), "utf-8")).toBe(settings);
   });
 
   it("install() creates a backup file under ~/.agentmemory/backups/", async () => {

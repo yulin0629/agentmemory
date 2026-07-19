@@ -122,6 +122,23 @@ describe("Codex hook runtime contract", () => {
     expect(result.stdout).toBe("");
   });
 
+  it("PostToolUse waits for a remote observation response", async () => {
+    const result = await runHook(
+      "post-tool-use.mjs",
+      codexPayload("PostToolUse", {
+        turn_id: "turn-1",
+        tool_use_id: "tool-1",
+        tool_name: "Read",
+        tool_input: { file_path: "package.json" },
+        tool_response: "ok",
+      }),
+      {},
+      750,
+    );
+    expect(result.requests[0]?.path).toBe("/agentmemory/observe");
+    expect(result.stdout).toBe("");
+  });
+
   it.each([
     ["post-tool-use.mjs", "PostToolUse", { turn_id: "turn-1", tool_use_id: "tool-1", tool_name: "Bash", tool_input: { command: "pwd" }, tool_response: "ok" }, "/agentmemory/observe"],
     ["stop.mjs", "Stop", { turn_id: "turn-1", stop_hook_active: false, last_assistant_message: "done" }, "/agentmemory/session/end"],

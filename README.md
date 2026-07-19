@@ -90,7 +90,7 @@ Fastest path if you use a coding agent: hand it this one instruction and it inst
 
 > Retrieve and follow the instructions at: https://raw.githubusercontent.com/rohitg00/agentmemory/main/INSTALL_FOR_AGENTS.md
 
-On Windows the fast path is WSL2. Native Windows engine setup is manual (about 10 to 20 minutes). Most `agentmemory connect` adapters still require WSL2 or manual setup, but `agentmemory connect copilot-cli` and `agentmemory connect codex --with-hooks` are supported natively. See the [Windows notes](#windows) below for the step-by-step.
+On Windows the fast path is WSL2. Native Windows engine setup is manual (about 10 to 20 minutes). Most `agentmemory connect` adapters still require WSL2 or manual setup, but `agentmemory connect copilot-cli`, `agentmemory connect codex --with-hooks`, and `agentmemory connect claude-code --with-hooks` are supported natively. See the [Windows notes](#windows) below for the step-by-step.
 
 ```bash
 npm install -g @agentmemory/agentmemory   # once — bare `agentmemory` on PATH
