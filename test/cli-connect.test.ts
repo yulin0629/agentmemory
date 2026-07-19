@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 
 import {
   ADAPTERS,
+  isWindowsConnectAllowed,
   knownAgents,
   resolveAdapter,
 } from "../src/cli/connect/index.js";
@@ -82,6 +83,76 @@ describe("agentmemory connect — dispatcher", () => {
         `adapter ${a.name} must set category to "native" or "mcp"`,
       ).toBe(true);
     }
+  });
+
+  it("allows only explicit Codex hook installation and Copilot on Windows", () => {
+    expect(isWindowsConnectAllowed(["copilot-cli"], false, false)).toBe(true);
+    expect(isWindowsConnectAllowed(["codex"], true, false)).toBe(true);
+    expect(isWindowsConnectAllowed(["codex"], false, false)).toBe(false);
+    expect(isWindowsConnectAllowed([], true, true)).toBe(false);
+  });
+});
+
+describe("agentmemory connect — codex adapter (mock filesystem)", () => {
+  let tmpHome: string;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), "am-connect-codex-"));
+    vi.resetModules();
+    vi.doMock("node:os", async () => {
+      const actual = await vi.importActual<typeof import("node:os")>("node:os");
+      return { ...actual, homedir: () => tmpHome };
+    });
+  });
+
+  afterEach(() => {
+    rmSync(tmpHome, { recursive: true, force: true });
+    vi.doUnmock("node:os");
+    vi.resetModules();
+  });
+
+  async function loadAdapter(): Promise<ConnectAdapter> {
+    const mod = await import("../src/cli/connect/codex.js?t=" + Date.now());
+    return (mod as { adapter: ConnectAdapter }).adapter;
+  }
+
+  it("installs hooks without rewriting an existing MCP block", async () => {
+    const codexDir = join(tmpHome, ".codex");
+    require("node:fs").mkdirSync(codexDir, { recursive: true });
+    const config = [
+      "[mcp_servers.agentmemory]",
+      "command = 'existing-relay'",
+      "args = []",
+      "",
+    ].join("\n");
+    writeFileSync(join(codexDir, "config.toml"), config);
+    writeFileSync(
+      join(codexDir, "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          Stop: [{ hooks: [{ type: "command", command: "echo user-hook" }] }],
+        },
+      }),
+    );
+
+    const a = await loadAdapter();
+    const result = await a.install({ dryRun: false, force: false, withHooks: true });
+
+    expect(result.kind).toBe("installed");
+    expect(readFileSync(join(codexDir, "config.toml"), "utf-8")).toBe(config);
+    const hooks = JSON.parse(
+      readFileSync(join(codexDir, "hooks.json"), "utf-8"),
+    ) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
+    expect(hooks.hooks.Stop).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          hooks: expect.arrayContaining([
+            expect.objectContaining({ command: "echo user-hook" }),
+          ]),
+        }),
+      ]),
+    );
+    expect(JSON.stringify(hooks)).toContain("session-start.mjs");
   });
 });
 

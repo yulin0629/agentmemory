@@ -18,3 +18,8 @@ The Claude Code plugin registers hooks on 12 lifecycle events to capture observa
 - `TaskCompleted`
 - `UserPromptSubmit`
 <!-- AUTOGEN:hooks END -->
+
+The Windows Codex global fallback intentionally installs only `SessionStart`,
+`UserPromptSubmit`, `PostToolUse`, and `Stop`. Codex `PreToolUse` enrichment and
+`PreCompact` context output are not installed until their Codex-specific input
+and output contracts are supported end to end.

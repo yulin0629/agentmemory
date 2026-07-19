@@ -30,26 +30,30 @@ describe("buildMergedHooks", () => {
     }
   });
 
-  it("preserves matchers from the bundled manifest (e.g. PreToolUse)", () => {
-    const merged = buildMergedHooks(null, PLUGIN_ROOT);
-    const preToolUse = merged.hooks["PreToolUse"];
-    expect(preToolUse).toBeDefined();
-    expect(preToolUse!.length).toBeGreaterThan(0);
-    expect(preToolUse![0].matcher).toBe("Edit|Write|Read|Glob|Grep");
-  });
-
-  it("includes all six expected lifecycle events", () => {
+  it("installs only Codex-compatible observation events", () => {
     const merged = buildMergedHooks(null, PLUGIN_ROOT);
     for (const event of [
       "SessionStart",
       "UserPromptSubmit",
-      "PreToolUse",
       "PostToolUse",
-      "PreCompact",
       "Stop",
     ]) {
       expect(Object.keys(merged.hooks)).toContain(event);
     }
+    expect(Object.keys(merged.hooks)).not.toContain("PreToolUse");
+    expect(Object.keys(merged.hooks)).not.toContain("PreCompact");
+  });
+
+  it("preserves bundled handler metadata while resolving commands", () => {
+    const merged = buildMergedHooks(null, PLUGIN_ROOT);
+    const handler = merged.hooks["SessionStart"]![0]!.hooks[0] as Record<
+      string,
+      unknown
+    >;
+    expect(handler).toMatchObject({
+      type: "command",
+      statusMessage: "agentmemory: loading session context",
+    });
   });
 
   it("appends to existing user hooks without dropping them", () => {
@@ -88,6 +92,56 @@ describe("buildMergedHooks", () => {
         `${event} should not double after second install`,
       ).toBe(first.hooks[event]!.length);
     }
+  });
+
+  it("re-install strips entries from a stale agentmemory package root", () => {
+    const stale: HookManifest = {
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [
+              {
+                type: "command",
+                command:
+                  'node "C:\\old-prefix\\node_modules\\@agentmemory\\agentmemory\\plugin\\scripts\\pre-compact.mjs"',
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const merged = buildMergedHooks(stale, PLUGIN_ROOT);
+    expect(merged.hooks["SessionStart"]).toHaveLength(1);
+    expect(merged.hooks["SessionStart"]![0]!.hooks[0]!.command).toContain(
+      `${PLUGIN_ROOT}/scripts/session-start.mjs`,
+    );
+  });
+
+  it("removes only stale agentmemory handlers from a mixed entry", () => {
+    const existing: HookManifest = {
+      hooks: {
+        Stop: [
+          {
+            matcher: ".*",
+            hooks: [
+              {
+                type: "command",
+                command:
+                  'node "C:\\old-prefix\\node_modules\\@agentmemory\\agentmemory\\plugin\\scripts\\stop.mjs"',
+              },
+              { type: "command", command: "echo user-hook", timeout: 7 },
+            ],
+          },
+        ],
+      },
+    };
+    const merged = buildMergedHooks(existing, PLUGIN_ROOT);
+    const userHandler = merged.hooks["Stop"]![0]!.hooks[0];
+    expect(userHandler).toEqual({
+      type: "command",
+      command: "echo user-hook",
+      timeout: 7,
+    });
   });
 
   it("re-install preserves unrelated user entries", () => {
