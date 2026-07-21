@@ -76,6 +76,7 @@ export const adapter: ConnectAdapter = {
       p.log.info(
         `[dry-run] Would ${alreadyHas ? "overwrite" : "add"} mcpServers.agentmemory in ${CLAUDE_JSON}`,
       );
+      if (opts.withHooks) installClaudeHooks(opts);
       return { kind: "installed", mutatedPath: CLAUDE_JSON };
     }
 

@@ -21,9 +21,26 @@ import { fileURLToPath } from "node:url";
  * hook entries.
  */
 
-type HookHandler = { type: string; command: string };
-type HookEntry = { matcher?: string; hooks: HookHandler[] };
+type HookHandler = { type: string; command?: string; [key: string]: unknown };
+type HookEntry = { matcher?: string; hooks: HookHandler[]; [key: string]: unknown };
 export type HookManifest = { hooks: Record<string, HookEntry[]> };
+
+// Keep removed scripts here so stale installations remain identifiable.
+const KNOWN_AGENTMEMORY_HOOK_SCRIPT_NAMES = new Set([
+  "notification.mjs",
+  "post-commit.mjs",
+  "post-tool-failure.mjs",
+  "post-tool-use.mjs",
+  "pre-compact.mjs",
+  "pre-tool-use.mjs",
+  "prompt-submit.mjs",
+  "session-end.mjs",
+  "session-start.mjs",
+  "stop.mjs",
+  "subagent-start.mjs",
+  "subagent-stop.mjs",
+  "task-completed.mjs",
+]);
 
 /**
  * Locate the bundled `plugin/` directory at runtime. Walks up from the
@@ -53,9 +70,9 @@ export function findPluginRoot(startUrl: string = import.meta.url): string {
 /**
  * Build the merged hooks.json content.
  *
- *   1. Strip any entry from `existing` whose first hook command points
- *      under `<pluginRoot>/scripts/`. This lets us re-install idempotently
- *      without leaving stale references.
+ *   1. Strip AgentMemory command handlers from `existing`. This lets us
+ *      re-install idempotently without leaving stale references while
+ *      preserving command-less Claude Code prompt and agent handlers.
  *   2. Append fresh entries from the bundled Codex manifest with
  *      `${CLAUDE_PLUGIN_ROOT}` rewritten to the absolute plugin path.
  *      Matcher values from the bundled manifest are preserved so PreToolUse
@@ -74,7 +91,12 @@ export function buildMergedHooks(
 
   if (existing?.hooks) {
     for (const [event, entries] of Object.entries(existing.hooks)) {
-      const kept = entries.filter((entry) => !isAgentmemoryEntry(entry, scriptsDir));
+      const kept = entries.flatMap((entry) => {
+        const hooks = entry.hooks.filter(
+          (handler) => !isAgentmemoryHandler(handler, scriptsDir),
+        );
+        return hooks.length > 0 ? [{ ...entry, hooks }] : [];
+      });
       if (kept.length > 0) out.hooks[event] = kept;
     }
   }
@@ -82,10 +104,17 @@ export function buildMergedHooks(
   for (const [event, entries] of Object.entries(ours.hooks)) {
     const resolvedEntries: HookEntry[] = entries.map((entry) => {
       const next: HookEntry = {
-        hooks: entry.hooks.map((handler) => ({
-          type: handler.type,
-          command: handler.command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginRoot),
-        })),
+        hooks: entry.hooks.map((handler) =>
+          typeof handler.command === "string"
+            ? {
+                ...handler,
+                command: handler.command.replace(
+                  /\$\{CLAUDE_PLUGIN_ROOT\}/g,
+                  pluginRoot,
+                ),
+              }
+            : { ...handler },
+        ),
       };
       if (entry.matcher !== undefined) next.matcher = entry.matcher;
       return next;
@@ -96,10 +125,15 @@ export function buildMergedHooks(
   return out;
 }
 
-function isAgentmemoryEntry(entry: HookEntry, scriptsDir: string): boolean {
+function isAgentmemoryHandler(handler: HookHandler, scriptsDir: string): boolean {
+  if (typeof handler.command !== "string") return false;
   const normalizedScriptsDir = normalizePathForCommandMatch(scriptsDir);
-  return entry.hooks.some((handler) =>
-    normalizePathForCommandMatch(handler.command).includes(normalizedScriptsDir),
+  const command = normalizePathForCommandMatch(handler.command);
+  if (command.includes(normalizedScriptsDir)) return true;
+  return [...KNOWN_AGENTMEMORY_HOOK_SCRIPT_NAMES].some(
+    (script) =>
+      command.includes(`/@agentmemory/agentmemory/plugin/scripts/${script}`) ||
+      command.includes(`/agentmemory/plugin/scripts/${script}`),
   );
 }
 

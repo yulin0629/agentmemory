@@ -51,6 +51,19 @@ export function knownAgents(): string[] {
   return ADAPTERS.map((a) => a.name);
 }
 
+export function isWindowsConnectAllowed(
+  positional: readonly string[],
+  withHooks: boolean,
+  all: boolean,
+): boolean {
+  if (all || positional.length !== 1) return false;
+  const agent = positional[0]?.toLowerCase();
+  return (
+    agent === "copilot-cli" ||
+    ((agent === "codex" || agent === "claude-code") && withHooks)
+  );
+}
+
 function parseFlags(args: string[]): {
   dryRun: boolean;
   force: boolean;
@@ -99,8 +112,7 @@ export async function runAdapter(
 
 export async function runConnect(args: string[]): Promise<void> {
   const { dryRun, force, all, withHooks, positional } = parseFlags(args);
-  const allowWindowsAdapter =
-    positional.length === 1 && positional[0]?.toLowerCase() === "copilot-cli";
+  const allowWindowsAdapter = isWindowsConnectAllowed(positional, withHooks, all);
   if (platform() === "win32" && !allowWindowsAdapter) {
     p.intro("agentmemory connect");
     p.log.warn(

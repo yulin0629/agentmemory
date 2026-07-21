@@ -50,7 +50,7 @@ async function main() {
 	const toolName = data.tool_name ?? data.toolName;
 	const toolInput = data.tool_input ?? data.toolArgs;
 	const { imageData, cleanOutput } = extractImageData(toolOutput(data));
-	fetch(`${REST_URL}/agentmemory/observe`, {
+	await fetch(`${REST_URL}/agentmemory/observe`, {
 		method: "POST",
 		headers: authHeaders(),
 		body: JSON.stringify({
@@ -68,7 +68,6 @@ async function main() {
 		}),
 		signal: AbortSignal.timeout(3e3)
 	}).catch(() => {});
-	setTimeout(() => process.exit(0), 500).unref();
 }
 function toolOutput(data) {
 	if (data.tool_response !== void 0) return data.tool_response;

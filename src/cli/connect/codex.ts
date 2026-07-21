@@ -78,6 +78,9 @@ export const adapter: ConnectAdapter = {
     const wired = isWiredText(current);
 
     if (wired && !opts.force) {
+      if (opts.withHooks) {
+        return installCodexHooks(opts);
+      }
       logAlreadyWired("Codex CLI", CODEX_TOML);
       return { kind: "already-wired", mutatedPath: CODEX_TOML };
     }
