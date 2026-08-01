@@ -46,6 +46,7 @@ async function main() {
 	} catch {
 		return;
 	}
+	if (!data || typeof data !== "object") return;
 	if (isSdkChildContext(data)) return;
 	const sessionId = data.session_id || data.sessionId || `ses_${Date.now().toString(36)}`;
 	const cwd = data.cwd || process.cwd();
@@ -74,14 +75,11 @@ async function main() {
 		});
 		if (res.ok) {
 			const result = await res.json();
-			if (result.context) process.stdout.write(data.hook_event_name === "SessionStart" ? JSON.stringify({ hookSpecificOutput: {
-				hookEventName: "SessionStart",
-				additionalContext: result.context
-			} }) : result.context);
+			if (result.context) process.stdout.write(result.context);
 		}
 	} catch {}
 }
-main();
+main().catch(() => process.exit(0));
 //#endregion
 export {};
 

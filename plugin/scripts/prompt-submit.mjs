@@ -43,6 +43,7 @@ async function main() {
 	} catch {
 		return;
 	}
+	if (!data || typeof data !== "object") return;
 	if (isSdkChildContext(data)) return;
 	const sessionId = data.session_id || data.sessionId || "unknown";
 	fetch(`${REST_URL}/agentmemory/observe`, {
@@ -58,9 +59,9 @@ async function main() {
 		}),
 		signal: AbortSignal.timeout(3e3)
 	}).catch(() => {});
-	setTimeout(() => process.exit(0), 1500).unref();
+	setTimeout(() => process.exit(0), 500).unref();
 }
-main();
+main().catch(() => process.exit(0));
 //#endregion
 export {};
 

@@ -21,17 +21,24 @@ async function main() {
 	} catch {
 		return;
 	}
+	if (!data || typeof data !== "object") return;
 	if (isSdkChildContext(data)) return;
 	const sessionId = data.session_id || data.sessionId || "unknown";
+	fetch(`${REST_URL}/agentmemory/summarize`, {
+		method: "POST",
+		headers: authHeaders(),
+		body: JSON.stringify({ sessionId }),
+		signal: AbortSignal.timeout(12e4)
+	}).catch(() => {});
 	fetch(`${REST_URL}/agentmemory/session/end`, {
 		method: "POST",
 		headers: authHeaders(),
 		body: JSON.stringify({ sessionId }),
 		signal: AbortSignal.timeout(5e3)
 	}).catch(() => {});
-	setTimeout(() => process.exit(0), 500).unref();
+	setTimeout(() => process.exit(0), 1500).unref();
 }
-main();
+main().catch(() => process.exit(0));
 //#endregion
 export {};
 
