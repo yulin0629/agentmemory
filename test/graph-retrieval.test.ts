@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
-import type { GraphNode, GraphEdge } from "../src/types.js";
+import type { GraphNode, GraphEdge, GraphSnapshot } from "../src/types.js";
 
 function mockKV(
   nodes: GraphNode[] = [],
   edges: GraphEdge[] = [],
+  failList = false,
 ) {
   const store = new Map<string, Map<string, unknown>>();
   const nodesMap = new Map<string, unknown>();
@@ -14,6 +15,21 @@ function mockKV(
   const edgesMap = new Map<string, unknown>();
   for (const e of edges) edgesMap.set(e.id, e);
   store.set("mem:graph:edges", edgesMap);
+  const snapshot: GraphSnapshot = {
+    version: 1,
+    topNodes: nodes,
+    topEdges: edges,
+    topDegrees: {},
+    stats: {
+      totalNodes: nodes.length,
+      totalEdges: edges.length,
+      nodesByType: {},
+      edgesByType: {},
+    },
+    updatedAt: new Date().toISOString(),
+    dirty: false,
+  };
+  store.set("mem:graph:snapshot", new Map([["current", snapshot]]));
 
   return {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
@@ -28,6 +44,7 @@ function mockKV(
       store.get(scope)?.delete(key);
     },
     list: async <T>(scope: string): Promise<T[]> => {
+      if (failList) throw new Error(`unexpected list: ${scope}`);
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
@@ -81,6 +98,15 @@ describe("GraphRetrieval", () => {
 
     const results = await retrieval.searchByEntities(["React"]);
     expect(results.length).toBeGreaterThan(0);
+    expect(results[0].obsId).toBe("obs_1");
+  });
+
+  it("uses the bounded snapshot without enumerating legacy graph scopes", async () => {
+    const nodes = [makeNode("n1", "React", "library", ["obs_1"])];
+    const kv = mockKV(nodes, [], true);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const results = await retrieval.searchByEntities(["React"]);
     expect(results[0].obsId).toBe("obs_1");
   });
 

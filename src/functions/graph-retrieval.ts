@@ -1,6 +1,7 @@
 import type {
   GraphNode,
   GraphEdge,
+  GraphSnapshot,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
@@ -38,7 +39,33 @@ function buildGraphContext(
   return parts.join(" ");
 }
 
+const GRAPH_SNAPSHOT_KEY = "current";
+
 export class GraphRetrieval {
+  // Legacy graph scopes can contain hundreds of megabytes of stale rows.
+  // Use the bounded top-degree snapshot for retrieval; enumerating the full
+  // nodes/edges scopes can starve the iii heartbeat and stop the worker.
+  private async loadGraphSnapshot(): Promise<{
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+  }> {
+    const snapshot = await this.kv
+      .get<GraphSnapshot>(KV.graphSnapshot, GRAPH_SNAPSHOT_KEY)
+      .catch(() => null);
+    if (
+      !snapshot ||
+      snapshot.version !== 1 ||
+      !Array.isArray(snapshot.topNodes) ||
+      !Array.isArray(snapshot.topEdges)
+    ) {
+      return { nodes: [], edges: [] };
+    }
+    return {
+      nodes: snapshot.topNodes.filter((node) => !node.stale),
+      edges: snapshot.topEdges.filter((edge) => !edge.stale),
+    };
+  }
+
   constructor(private kv: StateKV) {}
 
   async searchByEntities(
@@ -46,8 +73,7 @@ export class GraphRetrieval {
     maxDepth = 2,
     maxResults = 20,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const { nodes: allNodes, edges: allEdges } = await this.loadGraphSnapshot();
 
     const matchingNodes = allNodes.filter((n) => {
       const nameLower = n.name.toLowerCase();
@@ -119,8 +145,7 @@ export class GraphRetrieval {
     maxDepth = 1,
     maxResults = 10,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const { nodes: allNodes, edges: allEdges } = await this.loadGraphSnapshot();
 
     const linkedNodes = allNodes.filter((n) =>
       n.sourceObservationIds.some((id) => obsIds.includes(id)),

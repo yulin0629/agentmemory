@@ -5,7 +5,15 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerReflectFunctions } from "../src/functions/reflect.js";
-import type { Insight, GraphNode, GraphEdge, SemanticMemory, Lesson, Crystal } from "../src/types.js";
+import type {
+  Insight,
+  GraphNode,
+  GraphEdge,
+  GraphSnapshot,
+  SemanticMemory,
+  Lesson,
+  Crystal,
+} from "../src/types.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -16,12 +24,41 @@ function mockKV() {
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
       if (!store.has(scope)) store.set(scope, new Map());
       store.get(scope)!.set(key, data);
+      if (scope === "mem:graph:nodes" || scope === "mem:graph:edges") {
+        const nodes = Array.from(store.get("mem:graph:nodes")?.values() ?? []) as GraphNode[];
+        const edges = Array.from(store.get("mem:graph:edges")?.values() ?? []) as GraphEdge[];
+        const nodesByType: Record<string, number> = {};
+        for (const node of nodes) nodesByType[node.type] = (nodesByType[node.type] ?? 0) + 1;
+        const edgesByType: Record<string, number> = {};
+        for (const edge of edges) edgesByType[edge.type] = (edgesByType[edge.type] ?? 0) + 1;
+        const snapshot: GraphSnapshot = {
+          version: 1,
+          topNodes: nodes,
+          topEdges: edges,
+          topDegrees: {},
+          stats: {
+            totalNodes: nodes.length,
+            totalEdges: edges.length,
+            nodesByType,
+            edgesByType,
+          },
+          updatedAt: new Date().toISOString(),
+          dirty: false,
+        };
+        if (!store.has("mem:graph:snapshot")) {
+          store.set("mem:graph:snapshot", new Map());
+        }
+        store.get("mem:graph:snapshot")!.set("current", snapshot);
+      }
       return data;
     },
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
     },
     list: async <T>(scope: string): Promise<T[]> => {
+      if (scope === "mem:graph:nodes") {
+        throw new Error("reflect must read the graph snapshot, not graph nodes");
+      }
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
