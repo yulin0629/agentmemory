@@ -59,7 +59,7 @@ async function main() {
 		}),
 		signal: AbortSignal.timeout(3e3)
 	}).catch(() => {});
-	setTimeout(() => process.exit(0), 500).unref();
+	setTimeout(() => process.exit(0), 1500).unref();
 }
 main().catch(() => process.exit(0));
 //#endregion

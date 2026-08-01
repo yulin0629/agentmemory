@@ -75,7 +75,10 @@ async function main() {
 		});
 		if (res.ok) {
 			const result = await res.json();
-			if (result.context) process.stdout.write(result.context);
+			if (result.context) process.stdout.write(data.hook_event_name === "SessionStart" ? JSON.stringify({ hookSpecificOutput: {
+				hookEventName: "SessionStart",
+				additionalContext: result.context
+			} }) : result.context);
 		}
 	} catch {}
 }
