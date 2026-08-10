@@ -46,6 +46,7 @@ describe("agentmemory connect — dispatcher", () => {
     expect(knownAgents().sort()).toEqual(
       [
         "antigravity",
+        "antigravity-cli",
         "claude-code",
         "cline",
         "copilot-cli",
@@ -65,7 +66,7 @@ describe("agentmemory connect — dispatcher", () => {
         "zed",
       ].sort(),
     );
-    expect(ADAPTERS.length).toBe(18);
+    expect(ADAPTERS.length).toBe(19);
   });
 
   it("every adapter exposes detect() and install()", () => {

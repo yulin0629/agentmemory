@@ -2,6 +2,7 @@ import { TriggerAction, type ISdk, type ApiRequest } from "iii-sdk";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
+import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
 import { getLatestHealth } from "../health/monitor.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
@@ -851,11 +852,21 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
-      const summaries = await Promise.all(
-        filtered.map((s) =>
-          kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
-        ),
-      );
+      // Bounded fan-out: each kv.get is a full engine invocation, so
+      // Promise.all over hundreds of sessions saturates the invocation
+      // pool. Batch in chunks of 10 (parallel within a chunk, sequential
+      // across chunks); the summaries array stays index-aligned with
+      // `filtered`.
+      const summaries: Array<SessionSummary | null> = [];
+      for (let batch = 0; batch < filtered.length; batch += 10) {
+        const chunk = filtered.slice(batch, batch + 10);
+        const results = await Promise.all(
+          chunk.map((s) =>
+            kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
+          ),
+        );
+        summaries.push(...results);
+      }
       const withSummary = filtered.map((s, i) =>
         summaries[i] ? { ...s, summary: summaries[i] } : s,
       );
@@ -1639,6 +1650,43 @@ export function registerApiTriggers(
     type: "http",
     function_id: "api::graph-build",
     config: { api_path: "/agentmemory/graph/build", http_method: "POST" },
+  });
+
+  // Import graphify's structural graph (graphify-out/graph.json) into the
+  // memory graph. Deterministic, no LLM call; idempotent via the graph
+  // name-index upsert.
+  sdk.registerFunction("api::graph-import-graphify",
+    async (req: ApiRequest<{ path?: string; cwd?: string }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const { path, cwd } = req.body ?? {};
+      if (
+        (path !== undefined && typeof path !== "string") ||
+        (cwd !== undefined && typeof cwd !== "string")
+      ) {
+        return {
+          status_code: 400,
+          body: { error: "path and cwd must be strings when provided" },
+        };
+      }
+      try {
+        const result = await sdk.trigger({
+          function_id: "mem::graph::import-graphify",
+          payload: {
+            ...(path !== undefined ? { path } : {}),
+            ...(cwd !== undefined ? { cwd } : {}),
+          },
+        });
+        return { status_code: 200, body: result };
+      } catch {
+        return graphDisabledResponse();
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-import-graphify",
+    config: { api_path: "/agentmemory/graph/import-graphify", http_method: "POST" },
   });
 
   sdk.registerFunction("api::consolidate-pipeline",
@@ -2719,9 +2767,10 @@ export function registerApiTriggers(
       const sinceTime = since ? new Date(since).getTime() : 0;
       const df = <T>(items: T[], field: "updatedAt" | "createdAt") =>
         items.filter((i) => new Date((i as Record<string, unknown>)[field] as string).getTime() > sinceTime);
-      const memories = await kv.list<import("../types.js").Memory>(KV.memories);
+      let memories = await kv.list<import("../types.js").Memory>(KV.memories);
       let actions = await kv.list<import("../types.js").Action>(KV.actions);
       if (project) {
+        memories = memories.filter((m) => m.project === project);
         actions = actions.filter((a) => a.project === project);
       }
       const body: Record<string, unknown> = {
@@ -2741,6 +2790,14 @@ export function registerApiTriggers(
           (n) => new Date(n.updatedAt || n.createdAt).getTime() > sinceTime,
         );
         body.graphEdges = df(graphEdges, "createdAt");
+      }
+      // Fail an over-frame export with 413 instead of dropping the worker.
+      const oversized = checkPayloadFrameSize(
+        body,
+        "use ?since to fetch only changes after a timestamp, or ?project to scope the export",
+      );
+      if (oversized) {
+        return { status_code: 413, body: oversized };
       }
       return { status_code: 200, body };
     },
@@ -3149,6 +3206,21 @@ export function registerApiTriggers(
     return { status_code: 200, body: result };
   });
   sdk.registerTrigger({ type: "http", function_id: "api::lesson-strengthen", config: { api_path: "/agentmemory/lessons/strengthen", http_method: "POST" } });
+
+  sdk.registerFunction("api::lesson-delete",  async (req: ApiRequest) => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = req.body as Record<string, unknown>;
+    const lessonId = typeof body?.lessonId === "string" ? body.lessonId.trim() : "";
+    if (!lessonId) return { status_code: 400, body: { error: "lessonId is required" } };
+    const result = await sdk.trigger({ function_id: "mem::lesson-delete", payload: { lessonId } });
+    const resp = result as { success?: boolean; error?: string };
+    if (resp?.success === false && resp.error === "lesson not found") {
+      return { status_code: 404, body: { error: "lesson not found" } };
+    }
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({ type: "http", function_id: "api::lesson-delete", config: { api_path: "/agentmemory/lessons/delete", http_method: "POST" } });
 
   sdk.registerFunction("api::obsidian-export", async (req: ApiRequest) => {
     const denied = checkAuth(req, secret);
