@@ -16,6 +16,7 @@ import {
 import { VISION_DESCRIPTION_PROMPT } from "../prompts/vision.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
 import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
+import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { CompressOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreCompression } from "../eval/quality.js";
@@ -64,6 +65,104 @@ function parseCompressionXml(
   };
 }
 
+// Last-resort persistence when the LLM compression path fails (provider
+// error, or unparseable output). Without this the observation is dropped
+// entirely and silently — the raw payload is never written to kv, and no
+// backfill/retry mechanism exists to recover it. Falls back to the same
+// zero-LLM synthetic compression that mem::observe uses when
+// AGENTMEMORY_AUTO_COMPRESS is off, so recall and BM25 search still work.
+// The synthetic result carries confidence 0.3 (vs. the LLM path's
+// qualityScore/100), which keeps degraded entries distinguishable.
+async function persistSyntheticFallback(
+  sdk: ISdk,
+  kv: StateKV,
+  data: { observationId: string; sessionId: string; raw: RawObservation },
+  reason: string,
+): Promise<CompressedObservation | null> {
+  try {
+    const synthetic: CompressedObservation = {
+      ...buildSyntheticCompression(data.raw),
+      id: data.observationId,
+      sessionId: data.sessionId,
+    };
+
+    await kv.set(
+      KV.observations(data.sessionId),
+      data.observationId,
+      synthetic,
+    );
+
+    try {
+      getSearchIndex().add(synthetic);
+    } catch (err) {
+      logger.warn("Failed to index synthetic fallback observation into BM25", {
+        obsId: synthetic.id,
+        sessionId: synthetic.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    await vectorIndexAddGuarded(
+      synthetic.id,
+      synthetic.sessionId,
+      synthetic.title + " " + (synthetic.narrative || ""),
+      { kind: "synthetic", logId: synthetic.id },
+    );
+
+    const streamResults = await Promise.allSettled([
+      sdk.trigger({
+        function_id: "stream::set",
+        payload: {
+          stream_name: STREAM.name,
+          group_id: STREAM.group(data.sessionId),
+          item_id: data.observationId,
+          data: { type: "compressed", observation: synthetic },
+        },
+      }),
+      sdk.trigger({
+        function_id: "stream::set",
+        payload: {
+          stream_name: STREAM.name,
+          group_id: STREAM.viewerGroup,
+          item_id: data.observationId,
+          data: {
+            type: "compressed",
+            observation: synthetic,
+            sessionId: data.sessionId,
+          },
+        },
+      }),
+    ]);
+    for (const result of streamResults) {
+      if (result.status === "rejected") {
+        logger.warn("Non-fatal stream publish failure after synthetic fallback", {
+          sessionId: data.sessionId,
+          observationId: data.observationId,
+          error:
+            result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason),
+        });
+      }
+    }
+
+    logger.warn("Compression degraded to synthetic fallback", {
+      obsId: data.observationId,
+      sessionId: data.sessionId,
+      reason,
+    });
+    return synthetic;
+  } catch (err) {
+    logger.error("Synthetic fallback failed; observation is lost", {
+      obsId: data.observationId,
+      sessionId: data.sessionId,
+      reason,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
 export function registerCompressFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -77,6 +176,9 @@ export function registerCompressFunction(
       raw: RawObservation;
     }) => {
       const startMs = Date.now();
+      // Guards the catch below: once the LLM result is in kv, a later
+      // failure (metrics, stream) must not overwrite it with a synthetic.
+      let persisted = false;
 
       let imageDescription: string | undefined;
       const hasImage = data.raw.modality === "image" || data.raw.modality === "mixed";
@@ -151,7 +253,18 @@ export function registerCompressFunction(
             obsId: data.observationId,
             retried,
           });
-          return { success: false, error: "parse_failed" };
+          const synthetic = await persistSyntheticFallback(
+            sdk,
+            kv,
+            data,
+            "parse_failed",
+          );
+          return {
+            success: false,
+            error: "parse_failed",
+            degraded: synthetic !== null,
+            ...(synthetic ? { compressed: synthetic } : {}),
+          };
         }
 
         const qualityScore = scoreCompression(parsed);
@@ -173,6 +286,7 @@ export function registerCompressFunction(
           data.observationId,
           compressed,
         );
+        persisted = true;
 
         try {
           getSearchIndex().add(compressed);
@@ -260,7 +374,20 @@ export function registerCompressFunction(
           obsId: data.observationId,
           error: msg,
         });
-        return { success: false, error: "compression_failed" };
+        const synthetic = persisted
+          ? null
+          : await persistSyntheticFallback(
+              sdk,
+              kv,
+              data,
+              "compression_failed",
+            );
+        return {
+          success: false,
+          error: "compression_failed",
+          degraded: synthetic !== null,
+          ...(synthetic ? { compressed: synthetic } : {}),
+        };
       }
     },
   );
