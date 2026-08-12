@@ -854,12 +854,21 @@ export function registerApiTriggers(
         : sessions;
       // Bounded fan-out: each kv.get is a full engine invocation, so
       // Promise.all over hundreds of sessions saturates the invocation
-      // pool. Batch in chunks of 10 (parallel within a chunk, sequential
-      // across chunks); the summaries array stays index-aligned with
-      // `filtered`.
+      // pool. Batch in chunks (parallel within a chunk, sequential across
+      // chunks); the summaries array stays index-aligned with `filtered`.
+      //
+      // The chunk size is a latency/saturation tradeoff, and 10 is too
+      // small once a store has thousands of sessions: it serialises
+      // ceil(n/10) round-trips, so a 9,767-session store needs 977 of
+      // them. Measured on that store, this endpoint took 13.5s on an
+      // idle engine and returned 500 "Invocation stopped" as soon as the
+      // engine had other work — which surfaces as `agentmemory status`
+      // reporting Sessions and Observations as 0 while every other field
+      // reads correctly.
+      const SUMMARY_FANOUT = 100;
       const summaries: Array<SessionSummary | null> = [];
-      for (let batch = 0; batch < filtered.length; batch += 10) {
-        const chunk = filtered.slice(batch, batch + 10);
+      for (let batch = 0; batch < filtered.length; batch += SUMMARY_FANOUT) {
+        const chunk = filtered.slice(batch, batch + SUMMARY_FANOUT);
         const results = await Promise.all(
           chunk.map((s) =>
             kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
