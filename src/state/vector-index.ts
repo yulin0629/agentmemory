@@ -49,6 +49,7 @@ export class VectorIndex {
   search(
     query: Float32Array,
     limit = 20,
+    filter?: (obsId: string) => boolean,
   ): Array<{ obsId: string; sessionId: string; score: number }> {
     const results: Array<{
       obsId: string;
@@ -58,6 +59,7 @@ export class VectorIndex {
     let minScore = -Infinity;
 
     for (const [obsId, entry] of this.vectors) {
+      if (filter && !filter(obsId)) continue;
       const score = cosineSimilarity(query, entry.embedding);
       if (results.length < limit) {
         results.push({ obsId, sessionId: entry.sessionId, score });

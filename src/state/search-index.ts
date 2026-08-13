@@ -77,6 +77,7 @@ export class SearchIndex {
   search(
     query: string,
     limit = 20,
+    filter?: (obsId: string) => boolean,
   ): Array<{ obsId: string; sessionId: string; score: number }> {
     const rawTerms = this.tokenize(query.toLowerCase());
     if (rawTerms.length === 0) return [];
@@ -151,6 +152,7 @@ export class SearchIndex {
     }
 
     return Array.from(scores.entries())
+      .filter(([obsId]) => (filter ? filter(obsId) : true))
       .map(([obsId, score]) => {
         const entry = this.entries.get(obsId)!;
         return { obsId, sessionId: entry.sessionId, score };
