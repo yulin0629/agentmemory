@@ -310,11 +310,21 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
     })
   }
 
+  // Index memories BEFORE walking observations. The rebuild is
+  // fire-and-forget and takes hours on a large corpus (see the note at
+  // its call site in src/index.ts), so a hard exit routinely kills it
+  // partway. Whatever hasn't run by then is missing from the vector
+  // index for good: the next boot sees a non-empty BM25, skips the
+  // rebuild, and the backfill it runs instead only repairs BM25.
+  // Memories are orders of magnitude fewer than observations, so
+  // front-loading them costs seconds and keeps deliberate saves
+  // semantically searchable across an interrupted rebuild.
+  let indexed = await indexRecords([], memories)
+
   const sessions = await kv.list<Session>(KV.sessions)
   const failedSessions: string[] = []
   // Index each session chunk as it loads instead of accumulating every
   // observation first, so peak memory stays bounded to one chunk.
-  let indexed = 0
   for (let batch = 0; batch < sessions.length; batch += 10) {
     const chunk = sessions.slice(batch, batch + 10)
     const results = await Promise.all(
@@ -336,7 +346,6 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
     logger.warn('rebuildIndex: failed to load observations for sessions', { failedSessions })
   }
 
-  indexed += await indexRecords([], memories)
   return indexed
 }
 

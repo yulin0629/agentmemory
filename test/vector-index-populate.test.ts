@@ -9,7 +9,12 @@ vi.mock("../src/state/keyed-mutex.js", () => ({
 }));
 
 import { registerRememberFunction } from "../src/functions/remember.js";
-import { setVectorIndex, setEmbeddingProvider, getVectorIndex } from "../src/functions/search.js";
+import {
+  setVectorIndex,
+  setEmbeddingProvider,
+  getVectorIndex,
+  rebuildIndex,
+} from "../src/functions/search.js";
 import { VectorIndex } from "../src/state/vector-index.js";
 import type { EmbeddingProvider } from "../src/types.js";
 
@@ -99,6 +104,33 @@ describe("vector index population on remember", () => {
     });
 
     expect(vectorIndex.size).toBe(2);
+  });
+
+  it("embeds memories before observations so an interrupted rebuild keeps them", async () => {
+    // rebuildIndex clears the vector index and is fire-and-forget, so a
+    // hard exit partway through the (hours-long) observation walk used to
+    // leave every saved memory without an embedding permanently — the
+    // next boot skips the rebuild and only backfills BM25.
+    const memory = {
+      id: "mem_test1234_0123456789ab",
+      createdAt: new Date().toISOString(),
+      title: "Saved memory",
+      content: "Deliberately remembered content",
+      concepts: [],
+      files: [],
+      sessionIds: [],
+      strength: 7,
+      isLatest: true,
+    };
+    const kv = {
+      list: async <T>(scope: string): Promise<T[]> => {
+        if (scope === "mem:memories") return [memory] as T[];
+        throw new Error("killed mid-rebuild");
+      },
+    };
+
+    await expect(rebuildIndex(kv as never)).rejects.toThrow("killed mid-rebuild");
+    expect(vectorIndex.size).toBe(1);
   });
 
   it("handles missing embedder gracefully (vectorIndex stays null)", async () => {
