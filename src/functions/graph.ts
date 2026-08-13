@@ -76,19 +76,36 @@ function emptySnapshot(): GraphSnapshot {
   };
 }
 
-export async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
+// The read has three outcomes, and collapsing two of them into `null` is
+// what wiped the graph in production: a `state::get` that exhausts the
+// 180s invocation budget looks exactly like "no snapshot exists" once the
+// error is swallowed. A caller that only renders the snapshot can treat
+// both as empty, but one that is about to write the snapshot back — or to
+// fall through to a full kv.list — has to tell them apart.
+export type SnapshotRead =
+  | { status: "ok"; snapshot: GraphSnapshot }
+  | { status: "absent" }
+  | { status: "unavailable"; error: string };
+
+export async function readSnapshotResult(kv: StateKV): Promise<SnapshotRead> {
   try {
     const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
     if (snap && typeof snap === "object" && snap.version === 1) {
-      return snap;
+      return { status: "ok", snapshot: snap };
     }
-    return null;
+    return { status: "absent" };
   } catch (err) {
-    logger.warn("Graph snapshot read failed", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
+    const error = err instanceof Error ? err.message : String(err);
+    logger.warn("Graph snapshot read failed", { error });
+    return { status: "unavailable", error };
   }
+}
+
+// Convenience wrapper for read-only callers, where both failure modes are
+// equally "nothing to render".
+export async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
+  const read = await readSnapshotResult(kv);
+  return read.status === "ok" ? read.snapshot : null;
 }
 
 function buildSnapshotFromArrays(
@@ -467,7 +484,17 @@ export async function persistGraphDelta(
   edges: GraphEdge[],
   obsIds: string[],
 ): Promise<{ newNodeCount: number; newEdgeCount: number }> {
-  const snap = (await readSnapshot(kv)) ?? emptySnapshot();
+  // A snapshot we failed to READ must never be replaced by a fresh empty
+  // one. The durable graph is unaffected either way — nodes, edges, the
+  // name index and the degree map are all written below regardless — but
+  // overwriting KV.graphSnapshot discards the aggregate counts and the
+  // top-degree subgraph that every post-#816 read path depends on, so the
+  // graph reads as empty until extracts slowly refill it. Skipping the
+  // write instead leaves the snapshot stale by this batch, which the next
+  // successful extract corrects.
+  const read = await readSnapshotResult(kv);
+  const snapshotReadable = read.status !== "unavailable";
+  const snap = read.status === "ok" ? read.snapshot : emptySnapshot();
   const capturedAt = new Date().toISOString();
   let newNodeCount = 0;
   let newEdgeCount = 0;
@@ -584,9 +611,17 @@ export async function persistGraphDelta(
   }
 
   if (newNodeCount > 0 || newEdgeCount > 0 || snapMutated) {
-    snap.updatedAt = capturedAt;
-    snap.dirty = false;
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+    if (snapshotReadable) {
+      snap.updatedAt = capturedAt;
+      snap.dirty = false;
+      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+    } else {
+      logger.warn("Graph snapshot write skipped; prior snapshot preserved", {
+        reason: "snapshot read failed, writing would discard it",
+        newNodeCount,
+        newEdgeCount,
+      });
+    }
   }
 
   return { newNodeCount, newEdgeCount };
@@ -815,8 +850,9 @@ export function registerGraphFunction(
   // envelope + a warning pointing at the snapshot-rebuild or graph-reset
   // endpoints — never a 500.
   sdk.registerFunction("mem::graph-stats", async () => {
-    const snap = await readSnapshot(kv);
-    if (snap) {
+    const read = await readSnapshotResult(kv);
+    if (read.status === "ok") {
+      const snap = read.snapshot;
       return {
         ...snap.stats,
         fromSnapshot: true,
@@ -828,6 +864,26 @@ export function registerGraphFunction(
                 "Counts are eventually consistent.",
             }
           : {}),
+      };
+    }
+    // Zeroes mean two very different things here, and the remedy for one
+    // is harmful for the other: rebuilding is reasonable on a legacy
+    // corpus that never had a snapshot, but on a read that merely timed
+    // out the snapshot is still there and a rebuild would enumerate the
+    // whole graph for nothing.
+    if (read.status === "unavailable") {
+      return {
+        totalNodes: 0,
+        totalEdges: 0,
+        nodesByType: {},
+        edgesByType: {},
+        fromSnapshot: false,
+        snapshotUnavailable: true,
+        warning:
+          "Graph snapshot could not be read, so these counts are unknown, " +
+          `not zero (${read.error}). The snapshot itself is intact — retry ` +
+          "once the engine is responsive. Do NOT run snapshot-rebuild or " +
+          "reset in response to this.",
       };
     }
     return {
@@ -870,30 +926,43 @@ export function registerGraphFunction(
       // never truthy strings/numbers, so a hand-crafted JSON payload
       // can't accidentally bypass the legacy-corpus safeguard.
       const forceRebuild = data?.force === true;
-      try {
-        const existing = await readSnapshot(kv);
-        if (!existing && !forceRebuild) {
-          logger.warn("Graph snapshot rebuild refused: no prior snapshot", {
-            hint: "legacy corpus or empty store",
-          });
-          return {
-            success: false,
-            legacyCorpus: true,
-            error:
-              "No prior snapshot found. Rebuild would call kv.list on " +
-              "KV.graphNodes/Edges, which heartbeat-crashes the worker " +
-              "on corpora past the iii state response budget (~25K nodes). " +
-              "Either (a) call POST /agentmemory/graph/reset to drop into " +
-              "incremental-only mode and rebuild from new extracts, or " +
-              "(b) re-send with `force: true` if you're certain the " +
-              "corpus is small.",
-          };
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn("Graph snapshot pre-flight read failed", { error: msg });
-        // Fall through; the user passed force=true or the snapshot
-        // read itself failed (separate problem).
+      const existing = await readSnapshotResult(kv);
+      // An unreadable snapshot used to fall through to the enumeration
+      // below, which is the worst available outcome: the engine is already
+      // too loaded to answer a single-key get, and this would ask it for
+      // every node and edge. It also tells us nothing about corpus size,
+      // so the ceiling check further down cannot help.
+      if (existing.status === "unavailable" && !forceRebuild) {
+        logger.warn("Graph snapshot rebuild refused: snapshot unreadable", {
+          error: existing.error,
+        });
+        return {
+          success: false,
+          snapshotUnavailable: true,
+          error:
+            `Snapshot read failed (${existing.error}), so we cannot tell ` +
+            "whether this corpus is small enough to enumerate. The snapshot " +
+            "is most likely intact and the engine merely unresponsive — " +
+            "retry once it recovers rather than forcing a rebuild, which " +
+            "would kv.list the entire graph.",
+        };
+      }
+      if (existing.status === "absent" && !forceRebuild) {
+        logger.warn("Graph snapshot rebuild refused: no prior snapshot", {
+          hint: "legacy corpus or empty store",
+        });
+        return {
+          success: false,
+          legacyCorpus: true,
+          error:
+            "No prior snapshot found. Rebuild would call kv.list on " +
+            "KV.graphNodes/Edges, which heartbeat-crashes the worker " +
+            "on corpora past the iii state response budget (~25K nodes). " +
+            "Either (a) call POST /agentmemory/graph/reset to drop into " +
+            "incremental-only mode and rebuild from new extracts, or " +
+            "(b) re-send with `force: true` if you're certain the " +
+            "corpus is small.",
+        };
       }
 
       try {

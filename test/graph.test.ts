@@ -729,4 +729,118 @@ describe("Graph Functions", () => {
       expect(listCalls).toBe(0);
     });
   });
+
+  describe("snapshot read failures are not empty snapshots", () => {
+    // Regression: `state::get` on the snapshot key can exhaust the 180s
+    // invocation budget on a loaded engine. The error was swallowed into
+    // null, which is indistinguishable from "no snapshot exists", so the
+    // next extract wrote a fresh empty snapshot over a real one. Observed
+    // in production 2026-08-12/13: 28035 nodes -> 20.
+    function failingSnapshotKV(): ReturnType<typeof mockKV> {
+      const kv = mockKV();
+      const baseGet = kv.get;
+      kv.get = (async <T,>(scope: string, key: string): Promise<T | null> => {
+        if (scope === "mem:graph:snapshot") {
+          throw new Error("Invocation timeout after 180000ms: state::get");
+        }
+        return baseGet.call(kv, scope, key) as Promise<T | null>;
+      }) as typeof kv.get;
+      return kv;
+    }
+
+    it("graph-extract preserves the stored snapshot when the read fails", async () => {
+      // The counts here are deliberately far larger than one extract can
+      // produce. An earlier version of this test seeded a two-node
+      // snapshot and passed against the unfixed code by coincidence: the
+      // wipe-and-refill happened to land on the same total.
+      const stored = {
+        version: 1 as const,
+        topNodes: [],
+        topEdges: [],
+        topDegrees: {},
+        stats: {
+          totalNodes: 28035,
+          totalEdges: 22000,
+          nodesByType: { concept: 28035 },
+          edgesByType: { related_to: 22000 },
+        },
+        updatedAt: "2026-08-12T00:00:00.000Z",
+        dirty: false,
+      };
+
+      const kvWithFailingRead = failingSnapshotKV();
+      await kvWithFailingRead.set("mem:graph:snapshot", "current", stored);
+
+      const localSdk = mockSdk();
+      registerGraphFunction(
+        localSdk as never,
+        kvWithFailingRead as never,
+        mockProvider as never,
+      );
+      await localSdk.trigger("mem::graph-extract", {
+        observations: [testObs],
+      });
+
+      // Unfixed, this reads back 2 nodes / 1 edge — the batch we just
+      // extracted, written over a 28k-node snapshot.
+      const after = await kvWithFailingRead.list<{
+        stats: { totalNodes: number; totalEdges: number };
+        updatedAt: string;
+      }>("mem:graph:snapshot");
+      expect(after).toHaveLength(1);
+      expect(after[0]?.stats.totalNodes).toBe(28035);
+      expect(after[0]?.stats.totalEdges).toBe(22000);
+      expect(after[0]?.updatedAt).toBe("2026-08-12T00:00:00.000Z");
+
+      // The durable graph is still written — only the snapshot write is
+      // skipped, so the extract is not lost, just not yet reflected.
+      const nodes = await kvWithFailingRead.list<GraphNode>("mem:graph:nodes");
+      expect(nodes.length).toBeGreaterThan(0);
+    });
+
+    it("graph-stats reports unknown counts rather than zero", async () => {
+      const localSdk = mockSdk();
+      registerGraphFunction(
+        localSdk as never,
+        failingSnapshotKV() as never,
+        mockProvider as never,
+      );
+
+      const stats = (await localSdk.trigger("mem::graph-stats", {})) as {
+        totalNodes: number;
+        snapshotUnavailable?: boolean;
+        warning?: string;
+      };
+      expect(stats.snapshotUnavailable).toBe(true);
+      expect(stats.warning).toMatch(/not zero/);
+      // Must not send the operator to the destructive remedies.
+      expect(stats.warning).not.toMatch(/Run POST/);
+    });
+
+    it("snapshot-rebuild refuses instead of enumerating", async () => {
+      const kvWithFailingRead = failingSnapshotKV();
+      let listCalls = 0;
+      const baseList = kvWithFailingRead.list;
+      kvWithFailingRead.list = async <T,>(scope: string): Promise<T[]> => {
+        listCalls += 1;
+        return baseList.call(kvWithFailingRead, scope) as Promise<T[]>;
+      };
+      const localSdk = mockSdk();
+      registerGraphFunction(
+        localSdk as never,
+        kvWithFailingRead as never,
+        mockProvider as never,
+      );
+
+      const result = (await localSdk.trigger(
+        "mem::graph-snapshot-rebuild",
+        {},
+      )) as { success: boolean; snapshotUnavailable?: boolean };
+      expect(result.success).toBe(false);
+      expect(result.snapshotUnavailable).toBe(true);
+      // The whole point: an engine too busy to answer one get must not be
+      // asked to enumerate every node and edge.
+      expect(listCalls).toBe(0);
+    });
+  });
 });
