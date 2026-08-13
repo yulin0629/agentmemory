@@ -345,7 +345,17 @@ export class HybridSearch {
           this.bm25Weight * (1 / (RRF_K + s.bm25Rank)) +
           this.vectorWeight * (1 / (RRF_K + s.vectorRank)),
       }))
-      .sort((a, b) => b.combinedScore - a.combinedScore)
+      .sort((a, b) => {
+        // Lexical hits first: the query terms actually occur in those
+        // memories. Vector-only hits over the memory subset are
+        // routinely unrelated — memory embedding coverage is sparse, so
+        // cosine returns a near-arbitrary top-k — and only fill the
+        // slots BM25 left empty.
+        const aLexical = a.bm25Score > 0;
+        const bLexical = b.bm25Score > 0;
+        if (aLexical !== bLexical) return aLexical ? -1 : 1;
+        return b.combinedScore - a.combinedScore;
+      })
       .slice(0, limit);
   }
 
