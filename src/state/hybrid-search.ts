@@ -19,6 +19,14 @@ import { rerank } from "./reranker.js";
 
 const RRF_K = 60;
 
+// Deliberate memories (mem::remember) share one index with
+// hook-captured observations, which outnumber them by orders of
+// magnitude, so a saved memory almost never survives into the top
+// `limit` of the flat ranking (upstream #819). Reserve a few slots for
+// the best memory-only hits whenever the flat ranking surfaced fewer.
+const MEMORY_QUOTA = 3;
+const isMemoryId = (id: string): boolean => id.startsWith("mem_");
+
 export class HybridSearch {
   private graphRetrieval: GraphRetrieval;
 
@@ -225,18 +233,120 @@ export class HybridSearch {
     const diversified = this.diversifyBySession(combined, retrievalDepth);
     const enriched = await this.enrichResults(diversified, retrievalDepth);
 
+    let ordered = enriched;
     if (this.rerankEnabled && enriched.length > 1) {
       try {
         const head = enriched.slice(0, rerankWindow);
         const tail = enriched.slice(rerankWindow);
-        const reranked = await rerank(query, head, rerankWindow);
-        return reranked.concat(tail).slice(0, limit);
+        ordered = (await rerank(query, head, rerankWindow)).concat(tail);
       } catch {
-        return enriched.slice(0, limit);
+        // keep the pre-rerank order
       }
     }
 
-    return enriched.slice(0, limit);
+    return this.withMemoryQuota(query, queryEmbedding, ordered, limit);
+  }
+
+  // Fills the reserved memory slots (see MEMORY_QUOTA) from a
+  // memory-only retrieval pass, appended at the tail so the flat
+  // ranking keeps the head. No-op when the flat ranking already
+  // returned enough memories.
+  private async withMemoryQuota(
+    query: string,
+    queryEmbedding: Float32Array | null,
+    ranked: HybridSearchResult[],
+    limit: number,
+  ): Promise<HybridSearchResult[]> {
+    const top = ranked.slice(0, limit);
+    const quota = Math.min(MEMORY_QUOTA, Math.ceil(limit / 3));
+    const missing =
+      quota - top.filter((r) => isMemoryId(r.observation.id)).length;
+    if (missing <= 0) return top;
+
+    const seen = new Set(top.map((r) => r.observation.id));
+    const candidates = this.memoryOnlyCandidates(query, queryEmbedding, quota)
+      .filter((c) => !seen.has(c.obsId))
+      .slice(0, missing);
+    if (candidates.length === 0) return top;
+
+    const memoryResults = await this.enrichResults(
+      candidates,
+      candidates.length,
+    );
+    return top
+      .slice(0, Math.max(0, limit - memoryResults.length))
+      .concat(memoryResults);
+  }
+
+  // BM25 + vector over the memory subset only. Ranks come from that
+  // subset, so combinedScore is comparable within the returned list but
+  // not against the flat ranking's scores.
+  private memoryOnlyCandidates(
+    query: string,
+    queryEmbedding: Float32Array | null,
+    limit: number,
+  ): Array<{
+    obsId: string;
+    sessionId: string;
+    bm25Score: number;
+    vectorScore: number;
+    graphScore: number;
+    combinedScore: number;
+  }> {
+    const bm25Hits = this.bm25.search(query, limit, isMemoryId);
+    const vectorHits =
+      queryEmbedding && this.vector
+        ? this.vector.search(queryEmbedding, limit, isMemoryId)
+        : [];
+
+    const scores = new Map<
+      string,
+      {
+        sessionId: string;
+        bm25Score: number;
+        vectorScore: number;
+        bm25Rank: number;
+        vectorRank: number;
+      }
+    >();
+    const entryFor = (obsId: string, sessionId: string) => {
+      const existing = scores.get(obsId);
+      if (existing) return existing;
+      const created = {
+        sessionId,
+        bm25Score: 0,
+        vectorScore: 0,
+        bm25Rank: Infinity,
+        vectorRank: Infinity,
+      };
+      scores.set(obsId, created);
+      return created;
+    };
+
+    bm25Hits.forEach((r, i) => {
+      const entry = entryFor(r.obsId, r.sessionId);
+      entry.bm25Rank = i + 1;
+      entry.bm25Score = r.score;
+    });
+    vectorHits.forEach((r, i) => {
+      const entry = entryFor(r.obsId, r.sessionId);
+      entry.vectorRank = i + 1;
+      entry.vectorScore = r.score;
+    });
+
+    return Array.from(scores.entries())
+      .map(([obsId, s]) => ({
+        obsId,
+        sessionId: s.sessionId,
+        bm25Score: s.bm25Score,
+        vectorScore: s.vectorScore,
+        graphScore: 0,
+        combinedScore:
+          this.bm25Weight * (1 / (RRF_K + s.bm25Rank)) +
+          this.vectorWeight * (1 / (RRF_K + s.vectorRank)),
+      }))
+      .sort((a, b) => b.combinedScore - a.combinedScore)
+      .slice(0, limit);
   }
 
   private diversifyBySession(

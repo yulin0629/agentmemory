@@ -180,4 +180,55 @@ describe("HybridSearch", () => {
     expect(results[0].observation.narrative).toBe("Test memory for search");
     expect(results[0].observation.concepts).toEqual(["test", "search"]);
   });
+
+  it("reserves tail slots for saved memories buried by observation volume (#819)", async () => {
+    // Hook-captured observations outnumber deliberate memories by
+    // orders of magnitude and each one matches the query better than
+    // the memory does, so a flat ranking never surfaces the memory.
+    for (let i = 0; i < 200; i++) {
+      const obs = makeObs({
+        id: `obs_${i}`,
+        sessionId: `ses_${i}`,
+        title: `transcript proofreading run ${i}`,
+        narrative: "transcript proofreading multi model voting run",
+        concepts: ["transcript", "proofreading"],
+      });
+      bm25.add(obs);
+      await kv.set(`mem:obs:ses_${i}`, `obs_${i}`, obs);
+    }
+
+    const memory = {
+      id: "mem_vote",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      type: "fact",
+      title: "Multi-model voting for transcript proofreading",
+      content: "Run a second independent transcription and compare",
+      concepts: ["transcript", "voting"],
+      files: [],
+      sessionIds: [],
+      strength: 7,
+      version: 1,
+      isLatest: true,
+    };
+    bm25.add({
+      id: "mem_vote",
+      sessionId: "memory",
+      timestamp: memory.createdAt,
+      type: "decision",
+      title: memory.title,
+      facts: [memory.content],
+      narrative: memory.content,
+      concepts: memory.concepts,
+      files: [],
+      importance: 7,
+    });
+    await kv.set("mem:memories", "mem_vote", memory);
+
+    const hybrid = new HybridSearch(bm25, null, null, kv as never);
+    const results = await hybrid.search("transcript proofreading", 10);
+
+    expect(results.length).toBe(10);
+    expect(results.map((r) => r.observation.id)).toContain("mem_vote");
+  });
 });
