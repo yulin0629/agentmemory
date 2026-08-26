@@ -1481,7 +1481,13 @@ async function runStatus() {
   try {
     const [healthRes, sessionsRes, graphRes, memoriesRes, flagsRes, followupRes] = await Promise.all([
       apiFetch<any>(base, "health"),
-      apiFetch<any>(base, "sessions"),
+      // `sessions` returns every session plus its summary, so it is orders of
+      // magnitude heavier than the other five: ~3 MB and ~4s server-side on a
+      // 9.8k-session store, more over an SSH tunnel. The default 5s budget
+      // aborts it, and apiFetch swallows the abort into null, which used to
+      // render as a confident "Sessions: 0" — indistinguishable from an empty
+      // store. Give it room, and report failure as failure below.
+      apiFetch<any>(base, "sessions", 30000),
       apiFetch<any>(base, "graph/stats"),
       apiFetch<any>(base, "memories?count=true"),
       apiFetch<any>(base, "config/flags"),
@@ -1494,6 +1500,9 @@ async function runStatus() {
     const h = healthRes?.health;
     const status = healthRes?.status || "unknown";
     const version = healthRes?.version || "?";
+    // apiFetch returns null on any failure (timeout, non-JSON, network), so a
+    // zero count is ambiguous without this flag.
+    const sessionsUnavailable = !Array.isArray(sessionsRes?.sessions);
     const sessionList = Array.isArray(sessionsRes?.sessions) ? sessionsRes.sessions : [];
     const sessions = sessionList.length;
     const nodes = Number(graphRes?.totalNodes ?? graphRes?.nodes ?? graphRes?.nodeCount ?? 0);
@@ -1516,8 +1525,8 @@ async function runStatus() {
 
     const lines = [
       `Health:       ${status === "healthy" ? pc.green("✓ healthy") : pc.yellow(status)}`,
-      `Sessions:     ${sessions}`,
-      `Observations: ${obsCount}`,
+      `Sessions:     ${sessionsUnavailable ? pc.yellow("unavailable (request failed)") : sessions}`,
+      `Observations: ${sessionsUnavailable ? pc.yellow("unavailable (request failed)") : obsCount}`,
       `Memories:     ${memCount}`,
       `Graph:        ${nodes} nodes, ${edges} edges`,
       `Circuit:      ${cb}`,
