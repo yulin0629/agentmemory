@@ -266,6 +266,69 @@ function parseSummaryXml(
   };
 }
 
+// mem::observe writes the raw observation under the same kv key that
+// mem::compress later overwrites with the compressed one, so an entry
+// without a `title` means "compression still in flight". /session/end
+// fans out to mem::summarize the moment the last observe returns, while
+// that observation's mem::compress is still running (8.5s mean on the
+// reference deployment vs. a sub-second observe→end gap for one-shot
+// runs like `claude -p` / `pi -p`). Bailing with no_observations there
+// loses the summary permanently — nothing re-triggers summarize. Wait
+// for the pending compressions to land instead; on timeout summarize
+// whatever did compress rather than dropping the session.
+const COMPRESS_WAIT_MS_DEFAULT = 60_000;
+const COMPRESS_POLL_MS = 500;
+
+function getCompressWaitMs(): number {
+  const raw = process.env.SUMMARIZE_COMPRESS_WAIT_MS;
+  if (!raw) return COMPRESS_WAIT_MS_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : COMPRESS_WAIT_MS_DEFAULT;
+}
+
+async function waitForPendingCompressions(
+  kv: StateKV,
+  sessionId: string,
+): Promise<{
+  observations: CompressedObservation[];
+  compressed: CompressedObservation[];
+}> {
+  const deadline = Date.now() + getCompressWaitMs();
+  let observations = await kv.list<CompressedObservation>(
+    KV.observations(sessionId),
+  );
+  let compressed = observations.filter((o) => o.title);
+  if (compressed.length === observations.length) {
+    return { observations, compressed };
+  }
+
+  const startedAt = Date.now();
+  while (compressed.length < observations.length && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, COMPRESS_POLL_MS));
+    observations = await kv.list<CompressedObservation>(
+      KV.observations(sessionId),
+    );
+    compressed = observations.filter((o) => o.title);
+  }
+
+  const waitedMs = Date.now() - startedAt;
+  if (compressed.length < observations.length) {
+    logger.warn("Summarizing with compressions still pending", {
+      sessionId,
+      compressed: compressed.length,
+      total: observations.length,
+      waitedMs,
+    });
+  } else {
+    logger.info("Waited for in-flight compressions before summarizing", {
+      sessionId,
+      observationCount: compressed.length,
+      waitedMs,
+    });
+  }
+  return { observations, compressed };
+}
+
 export function registerSummarizeFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -292,14 +355,13 @@ export function registerSummarizeFunction(
           return { success: false, error: "session_not_found" };
         }
 
-        const observations = await kv.list<CompressedObservation>(
-          KV.observations(sessionId),
-        );
-        const compressed = observations.filter((o) => o.title);
+        const { observations, compressed } =
+          await waitForPendingCompressions(kv, sessionId);
 
         if (compressed.length === 0) {
           logger.info("No observations to summarize", {
             sessionId,
+            rawPending: observations.length,
           });
           return { success: false, error: "no_observations" };
         }
