@@ -555,7 +555,7 @@ codex plugin add agentmemory@agentmemory
 Codex プラグインは Claude Code プラグインと同じ `plugin/` ディレクトリから出荷されます。以下を登録します:
 
 - `@agentmemory/mcp` を MCP サーバーとして(`AGENTMEMORY_URL` が動作中の agentmemory サーバーを指す場合は 54 ツールすべてをプロキシ、サーバーに到達できない場合はローカルで 7 ツールにフォールバック)
-- 6 つのライフサイクル hooks: `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PreCompact`、`Stop`
+- 4 つのライフサイクル hooks: `SessionStart`、`UserPromptSubmit`、`PostToolUse`、`Stop`
 - 呼び出し可能な 9 つの skills: `/recall`、`/remember`、`/session-history`、`/forget`、`/recap`、`/handoff`、`/lesson`、`/commit-context`、`/commit-history`、さらにエージェントが必要時に読み込む 8 つのリファレンス skills(memory discipline, MCP ツール、REST API、設定、エージェント、フック、アーキテクチャ、skill 執筆ガイド)
 
 Codex の hook エンジンは hook サブプロセスに `CLAUDE_PLUGIN_ROOT` を注入する([`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs))ので、同じ hook スクリプトが両ホストで重複なく動きます。Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure イベントは Claude Code 専用で、Codex には登録されません。
@@ -668,7 +668,7 @@ skills CLI がまだカバーしていない少数のエージェント(Zed v1.3
 | **GitHub Copilot CLI(フルプラグイン)** | Copilot プラグインインストール | GitHub サブディレクトリのプラグインは `copilot plugin install rohitg00/agentmemory:plugin`。 |
 | **OpenClaw** | OpenClaw MCP 設定 | 同じ `mcpServers` ブロック。より深く: `openclaw plugins install ./integrations/openclaw` は OpenClaw のメモリスロットを占有します(`memory-core` から自動切り替え)。`plugins.entries.agentmemory.hooks.allowConversationAccess=true` を設定しないと、ターンキャプチャがサイレントにブロックされます。[`integrations/openclaw`](integrations/openclaw/) を参照。 |
 | **Codex CLI(MCP のみ)** | `.codex/config.toml` | TOML シェイプ: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`、または `[mcp_servers.agentmemory]` を手動で追加。 |
-| **Codex CLI(フルプラグイン)** | Codex プラグインマーケットプレイス | `codex plugin marketplace add rohitg00/agentmemory` のあと `codex plugin add agentmemory@agentmemory`。MCP + 6 つのライフサイクル hooks(SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、PreCompact、Stop)+ 17 個の skills を登録。Codex Desktop では、[openai/codex#16430](https://github.com/openai/codex/issues/16430) が解決するまで `agentmemory connect codex --with-hooks` も実行してください。そちらではプラグイン hooks が現在無音です。 |
+| **Codex CLI(フルプラグイン)** | Codex プラグインマーケットプレイス | `codex plugin marketplace add rohitg00/agentmemory` のあと `codex plugin add agentmemory@agentmemory`。MCP + 4 つのライフサイクル hooks(SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、PreCompact、Stop)+ 17 個の skills を登録。Codex Desktop では、[openai/codex#16430](https://github.com/openai/codex/issues/16430) が解決するまで `agentmemory connect codex --with-hooks` も実行してください。そちらではプラグイン hooks が現在無音です。 |
 | **OpenCode(MCP のみ)** | `opencode.json` | 異なるシェイプ: トップレベルの `mcp` キー、command は配列: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`。 |
 | **OpenCode(フルプラグイン)** | `plugin/opencode/` | 22 個の自動キャプチャ hooks がセッションライフサイクル、メッセージ、ツール、エラーをカバー。プロジェクトの帰属はセッション単位なので、1 つの OpenCode プロセスが複数のリポジトリにまたがっても、各セッションはそれぞれのプロジェクトに記録されます。2 つのスラッシュコマンド(`/recall`、`/remember`)。`plugin/opencode/` を OpenCode ワークスペースにコピーし、プラグインエントリを `opencode.json` に追加。完全な hook 表とギャップ分析は [`plugin/opencode/README.md`](../plugin/opencode/README.md) を参照。 |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | `agentmemory connect pi` が同梱の拡張を pi の自動検出ディレクトリにインストールします(エージェント開始時のリコール、終了時のキャプチャ、`memory_search` / `memory_save` / `memory_health` ツール、`/agentmemory-status`)。実行中の pi では `/reload` で反映されます。[`integrations/pi`](../integrations/pi/) は pi パッケージでもあります(チェックアウトから `pi install ./integrations/pi`)。 |

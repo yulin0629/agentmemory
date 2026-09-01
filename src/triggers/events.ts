@@ -109,7 +109,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       fireVoid("mem::slot-reflect", { sessionId: data.sessionId });
     }
     // No enabled-flag gate: mem::graph-extract decides internally whether to
-    // run its LLM pass. The fingerprint check below is the only skip path.
+    // run its LLM pass. Skips below: an empty compressed set, or a
+    // fingerprint identical to the last extracted set.
     try {
       const observations = await kv.list<CompressedObservation>(
         KV.observations(data.sessionId),

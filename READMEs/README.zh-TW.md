@@ -553,7 +553,7 @@ codex plugin add agentmemory@agentmemory
 Codex 外掛與 Claude Code 外掛同源,來自相同的 `plugin/` 目錄。它註冊:
 
 - `@agentmemory/mcp` 作為 MCP 伺服器(當 `AGENTMEMORY_URL` 指向執行中的 agentmemory 伺服器時,代理全部 54 個工具;若伺服器不可達,本地回退至 7 個工具)
-- 6 個生命週期 hooks:`SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PreCompact`、`Stop`
+- 4 個生命週期 hooks:`SessionStart`、`UserPromptSubmit`、`PostToolUse`、`Stop`
 - 9 個可呼叫 skills:`/recall`、`/remember`、`/session-history`、`/forget`、`/recap`、`/handoff`、`/lesson`、`/commit-context`、`/commit-history`,外加 8 個代理按需載入的參考 skills(memory discipline, MCP 工具、REST API、設定、代理、hooks、架構,以及 skill 撰寫指南)
 
 Codex 的 hook 引擎會把 `CLAUDE_PLUGIN_ROOT` 注入 hook 子行程(參見 [`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs)),因此同樣的 hook 腳本在兩個宿主中都能運作,無需重複實作。Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure 事件僅 Claude Code 支援,Codex 未註冊這些。
@@ -666,7 +666,7 @@ npx skills add rohitg00/agentmemory -y -a '*'   # 安裝到每個已安裝的代
 | **GitHub Copilot CLI(完整外掛)** | Copilot 外掛安裝 | `copilot plugin install rohitg00/agentmemory:plugin` 安裝 GitHub 子目錄中的外掛。 |
 | **OpenClaw** | OpenClaw MCP 設定 | 同樣的 `mcpServers` 區塊。更深:`openclaw plugins install ./integrations/openclaw` 會佔用 OpenClaw 的記憶槽位(自動從 `memory-core` 切換);設定 `plugins.entries.agentmemory.hooks.allowConversationAccess=true`,否則輪次擷取會被靜默封鎖。見 [`integrations/openclaw`](integrations/openclaw/)。 |
 | **Codex CLI(僅 MCP)** | `.codex/config.toml` | TOML 形式:`codex mcp add agentmemory -- npx -y @agentmemory/mcp`,或手動新增 `[mcp_servers.agentmemory]`。 |
-| **Codex CLI(完整外掛)** | Codex 外掛市集 | `codex plugin marketplace add rohitg00/agentmemory` 然後 `codex plugin add agentmemory@agentmemory`。註冊 MCP + 6 個生命週期 hooks(SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、PreCompact、Stop)+ 17 個 skills。在 Codex Desktop 上,直到 [openai/codex#16430](https://github.com/openai/codex/issues/16430) 落地之前,還要執行 `agentmemory connect codex --with-hooks`;那裡的外掛 hooks 目前沒有回應。 |
+| **Codex CLI(完整外掛)** | Codex 外掛市集 | `codex plugin marketplace add rohitg00/agentmemory` 然後 `codex plugin add agentmemory@agentmemory`。註冊 MCP + 4 個生命週期 hooks(SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、PreCompact、Stop)+ 17 個 skills。在 Codex Desktop 上,直到 [openai/codex#16430](https://github.com/openai/codex/issues/16430) 落地之前,還要執行 `agentmemory connect codex --with-hooks`;那裡的外掛 hooks 目前沒有回應。 |
 | **OpenCode(僅 MCP)** | `opencode.json` | 不同結構:頂層 `mcp` key,command 是陣列:`{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`。 |
 | **OpenCode(完整外掛)** | `plugin/opencode/` | 22 個自動捕捉 hooks,涵蓋會話生命週期、訊息、工具、錯誤。專案歸屬是按會話計的,所以一個橫跨多個倉庫的 OpenCode 行程會把每個會話歸檔到各自的專案下。兩個斜線指令(`/recall`、`/remember`)。把 `plugin/opencode/` 複製到你的 OpenCode 工作區並把外掛條目新增到 `opencode.json`。完整 hook 表與差異分析見 [`plugin/opencode/README.md`](../plugin/opencode/README.md)。 |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | `agentmemory connect pi` 會把捆綁的擴充功能安裝到 pi 的自動探索目錄(代理啟動時召回、代理結束時捕捉、`memory_search` / `memory_save` / `memory_health` 工具、`/agentmemory-status`)。在執行中的 pi 裡 `/reload` 即可接收。[`integrations/pi`](../integrations/pi/) 也是一個 pi 套件(從 checkout 執行 `pi install ./integrations/pi`)。 |
