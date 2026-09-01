@@ -178,7 +178,12 @@ def _api(base: str, path: str, body: dict | None = None, method: str = "POST", s
     if not _validate_url(base):
         return None
     url = f"{base}/agentmemory/{path}"
-    headers = {"Content-Type": "application/json"}
+    # Explicit UA: some corporate egress proxies 403 the default
+    # "Python-urllib/x.y", which urlopen surfaces as a silent capture drop.
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "agentmemory-hermes-plugin",
+    }
     auth = secret or os.environ.get("AGENTMEMORY_SECRET", "")
     _check_plaintext_bearer_guard(base, auth)
     if auth:
