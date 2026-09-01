@@ -30,7 +30,7 @@ async function main() {
 		body: JSON.stringify({ sessionId }),
 		signal: AbortSignal.timeout(5e3)
 	}).catch(() => {});
-	setTimeout(() => process.exit(0), 1500).unref();
+	setTimeout(() => process.exit(0), 500).unref();
 }
 main().catch(() => process.exit(0));
 //#endregion

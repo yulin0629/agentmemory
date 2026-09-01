@@ -108,7 +108,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     if (isReflectEnabled()) {
       fireVoid("mem::slot-reflect", { sessionId: data.sessionId });
     }
-    // Unconditional: mem::graph-extract gates its LLM pass internally.
+    // No enabled-flag gate: mem::graph-extract decides internally whether to
+    // run its LLM pass. The fingerprint check below is the only skip path.
     try {
       const observations = await kv.list<CompressedObservation>(
         KV.observations(data.sessionId),
@@ -136,7 +137,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
         }
       }
     } catch (err) {
-      logger.warn("graph-extract trigger failed", {
+      logger.warn("graph-extract dedup state failed", {
         sessionId: data.sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
