@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { HybridSearch } from "../src/state/hybrid-search.js";
 import { SearchIndex } from "../src/state/search-index.js";
+import { VectorIndex } from "../src/state/vector-index.js";
 import type { CompressedObservation, EmbeddingProvider } from "../src/types.js";
 
 function makeObs(
@@ -179,5 +180,138 @@ describe("HybridSearch", () => {
     expect(results[0].observation.id).toBe("mem_abc");
     expect(results[0].observation.narrative).toBe("Test memory for search");
     expect(results[0].observation.concepts).toEqual(["test", "search"]);
+  });
+
+  it("reserves tail slots for saved memories buried by observation volume (#819)", async () => {
+    // Hook-captured observations outnumber deliberate memories by
+    // orders of magnitude and each one matches the query better than
+    // the memory does, so a flat ranking never surfaces the memory.
+    for (let i = 0; i < 200; i++) {
+      const obs = makeObs({
+        id: `obs_${i}`,
+        sessionId: `ses_${i}`,
+        title: `transcript proofreading run ${i}`,
+        narrative: "transcript proofreading multi model voting run",
+        concepts: ["transcript", "proofreading"],
+      });
+      bm25.add(obs);
+      await kv.set(`mem:obs:ses_${i}`, `obs_${i}`, obs);
+    }
+
+    const memory = {
+      id: "mem_vote",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      type: "fact",
+      title: "Multi-model voting for transcript proofreading",
+      content: "Run a second independent transcription and compare",
+      concepts: ["transcript", "voting"],
+      files: [],
+      sessionIds: [],
+      strength: 7,
+      version: 1,
+      isLatest: true,
+    };
+    bm25.add({
+      id: "mem_vote",
+      sessionId: "memory",
+      timestamp: memory.createdAt,
+      type: "decision",
+      title: memory.title,
+      facts: [memory.content],
+      narrative: memory.content,
+      concepts: memory.concepts,
+      files: [],
+      importance: 7,
+    });
+    await kv.set("mem:memories", "mem_vote", memory);
+
+    const hybrid = new HybridSearch(bm25, null, null, kv as never);
+    const results = await hybrid.search("transcript proofreading", 10);
+
+    expect(results.length).toBe(10);
+    expect(results.map((r) => r.observation.id)).toContain("mem_vote");
+  });
+
+  it("fills reserved memory slots with lexical hits before vector-only ones", async () => {
+    // Memory embedding coverage is sparse in practice, so the
+    // memory-subset vector stream returns near-arbitrary hits. A memory
+    // that actually contains the query term must outrank them.
+    const makeMemory = (id: string, title: string, content: string) => ({
+      id,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      type: "fact",
+      title,
+      content,
+      concepts: [],
+      files: [],
+      sessionIds: [],
+      strength: 7,
+      version: 1,
+      isLatest: true,
+    });
+    const lexical = makeMemory(
+      "mem_lexical",
+      "Checkmarx replaced Fortify",
+      "The transcript said Fortify but the tool is Checkmarx",
+    );
+    const unrelated = makeMemory(
+      "mem_unrelated",
+      "Breakfast recipes",
+      "Coffee and toast",
+    );
+    for (const m of [lexical, unrelated]) {
+      bm25.add({
+        id: m.id,
+        sessionId: "memory",
+        timestamp: m.createdAt,
+        type: "decision",
+        title: m.title,
+        facts: [m.content],
+        narrative: m.content,
+        concepts: [],
+        files: [],
+        importance: 7,
+      });
+      await kv.set("mem:memories", m.id, m);
+    }
+
+    // Observation volume owns the whole flat ranking, so the reserved
+    // slots decide which memory the caller sees.
+    const vector = new VectorIndex();
+    for (let i = 0; i < 200; i++) {
+      const obs = makeObs({
+        id: `obs_${i}`,
+        sessionId: `ses_${i}`,
+        title: `Checkmarx scan run ${i}`,
+        narrative: "Checkmarx scan run",
+        concepts: ["checkmarx"],
+      });
+      bm25.add(obs);
+      vector.add(obs.id, obs.sessionId, new Float32Array([1, 0]));
+      await kv.set(`mem:obs:ses_${i}`, obs.id, obs);
+    }
+    // Only the unrelated memory has an embedding, and it matches the
+    // query vector perfectly — without the lexical-first ordering it
+    // takes the reserved slot.
+    vector.add("mem_unrelated", "memory", new Float32Array([1, 0]));
+    const provider: EmbeddingProvider = {
+      name: "stub",
+      dimensions: 2,
+      embed: async () => new Float32Array([1, 0]),
+      embedBatch: async (texts: string[]) =>
+        texts.map(() => new Float32Array([1, 0])),
+    };
+
+    const hybrid = new HybridSearch(bm25, vector, provider, kv as never);
+    const ids = (await hybrid.search("Checkmarx", 6)).map(
+      (r) => r.observation.id,
+    );
+
+    expect(ids).toContain("mem_lexical");
+    expect(ids.indexOf("mem_lexical")).toBeLessThan(
+      ids.indexOf("mem_unrelated"),
+    );
   });
 });

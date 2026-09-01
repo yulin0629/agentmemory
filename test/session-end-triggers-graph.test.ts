@@ -100,7 +100,7 @@ describe("event::session::stopped graph-extract dedup", () => {
 
   it("fingerprints the compressed set before triggering mem::graph-extract", () => {
     expect(events).toMatch(
-      /const fingerprint = computeInputFingerprint\(compressed\);[\s\S]*?function_id:\s*"mem::graph-extract"/,
+      /const fingerprint = computeInputFingerprint\(compressed\);[\s\S]*?fireVoid\("mem::graph-extract"/,
     );
   });
 
@@ -112,7 +112,7 @@ describe("event::session::stopped graph-extract dedup", () => {
 
   it("persists the fingerprint under KV.graphExtractState before triggering", () => {
     expect(events).toMatch(
-      /kv\.set\(KV\.graphExtractState,\s*data\.sessionId,\s*\{\s*fingerprint,[\s\S]*?\}\);[\s\S]*?function_id:\s*"mem::graph-extract"/,
+      /kv\.set\(KV\.graphExtractState,\s*data\.sessionId,\s*\{\s*fingerprint,[\s\S]*?\}\);[\s\S]*?fireVoid\("mem::graph-extract"/,
     );
   });
 });

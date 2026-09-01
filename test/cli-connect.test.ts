@@ -53,7 +53,9 @@ describe("agentmemory connect — dispatcher", () => {
         "codex",
         "continue",
         "cursor",
+    "devin",
         "droid",
+        "dsh",
         "gemini-cli",
         "hermes",
         "kiro",
@@ -66,7 +68,7 @@ describe("agentmemory connect — dispatcher", () => {
         "zed",
       ].sort(),
     );
-    expect(ADAPTERS.length).toBe(19);
+    expect(ADAPTERS.length).toBe(21);
   });
 
   it("every adapter exposes detect() and install()", () => {
@@ -587,9 +589,4 @@ describe("agentmemory connect — stub adapters log + return stub", () => {
     expect(result.kind).toBe("stub");
   });
 
-  it("pi adapter returns stub", async () => {
-    const { adapter } = await import("../src/cli/connect/pi.js");
-    const result = await adapter.install({ dryRun: false, force: false });
-    expect(result.kind).toBe("stub");
-  });
 });
