@@ -84,6 +84,18 @@ function makeObs(i: number, sessionId: string): CompressedObservation {
   };
 }
 
+// mem::observe writes this shape first; mem::compress overwrites the same
+// key with a titled CompressedObservation once the LLM call returns.
+function makeRawObs(i: number, sessionId: string) {
+  return {
+    id: `obs_${i}`,
+    sessionId,
+    timestamp: new Date().toISOString(),
+    hookType: "PostToolUse",
+    raw: {},
+  };
+}
+
 function makeProvider(responses: string[]): MemoryProvider & {
   calls: Array<{ system: string; user: string }>;
 } {
@@ -592,5 +604,97 @@ describe("mem::summarize dedup (double-trigger guard)", () => {
     expect(result.skipped).toBeUndefined();
     expect(result.summary.title).toBe("Second run");
     expect(provider.calls).toHaveLength(2);
+  });
+});
+
+describe("mem::summarize waits for in-flight compressions", () => {
+  afterEach(() => {
+    delete process.env.SUMMARIZE_COMPRESS_WAIT_MS;
+  });
+
+  it("summarizes once a raw observation finishes compressing after session/end", async () => {
+    process.env.SUMMARIZE_COMPRESS_WAIT_MS = "5000";
+    const provider = makeProvider([summaryXml({ title: "Late compress" })]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_pending",
+      obsCount: 0,
+      provider,
+    });
+    // observe has landed, its mem::compress is still running.
+    await kv.set("obs:ses_pending", "obs_0", makeRawObs(0, "ses_pending") as any);
+
+    const run = handler({ sessionId: "ses_pending" });
+    setTimeout(() => {
+      void kv.set("obs:ses_pending", "obs_0", makeObs(0, "ses_pending"));
+    }, 600);
+
+    const result: any = await run;
+
+    expect(result.success).toBe(true);
+    expect(result.summary.title).toBe("Late compress");
+    expect(result.summary.observationCount).toBe(1);
+  });
+
+  it("waits for every pending compression, not just the first", async () => {
+    process.env.SUMMARIZE_COMPRESS_WAIT_MS = "5000";
+    const provider = makeProvider([summaryXml({ title: "All three" })]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_partial",
+      obsCount: 0,
+      provider,
+    });
+    for (let i = 0; i < 3; i++) {
+      await kv.set(`obs:ses_partial`, `obs_${i}`, makeRawObs(i, "ses_partial") as any);
+    }
+
+    const run = handler({ sessionId: "ses_partial" });
+    setTimeout(() => {
+      void kv.set("obs:ses_partial", "obs_0", makeObs(0, "ses_partial"));
+    }, 200);
+    setTimeout(() => {
+      void kv.set("obs:ses_partial", "obs_1", makeObs(1, "ses_partial"));
+      void kv.set("obs:ses_partial", "obs_2", makeObs(2, "ses_partial"));
+    }, 900);
+
+    const result: any = await run;
+
+    expect(result.success).toBe(true);
+    expect(result.summary.observationCount).toBe(3);
+  });
+
+  it("gives up after the wait budget and summarizes what did compress", async () => {
+    process.env.SUMMARIZE_COMPRESS_WAIT_MS = "600";
+    const provider = makeProvider([summaryXml({ title: "Partial" })]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_stuck",
+      obsCount: 1,
+      provider,
+    });
+    // obs_9's compression never completes.
+    await kv.set("obs:ses_stuck", "obs_9", makeRawObs(9, "ses_stuck") as any);
+
+    const result: any = await handler({ sessionId: "ses_stuck" });
+
+    expect(result.success).toBe(true);
+    expect(result.summary.observationCount).toBe(1);
+  });
+
+  it("still returns no_observations when the session has nothing at all", async () => {
+    process.env.SUMMARIZE_COMPRESS_WAIT_MS = "5000";
+    const provider = makeProvider([summaryXml({ title: "never" })]);
+    const { handler } = await setupHandler({
+      sessionId: "ses_empty",
+      obsCount: 0,
+      provider,
+    });
+
+    const started = Date.now();
+    const result: any = await handler({ sessionId: "ses_empty" });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("no_observations");
+    expect(provider.calls).toHaveLength(0);
+    // No raw observations means nothing to wait for — must not burn the budget.
+    expect(Date.now() - started).toBeLessThan(1000);
   });
 });
