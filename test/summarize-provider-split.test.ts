@@ -167,18 +167,26 @@ describe("summarize provider split (#899)", () => {
     });
 
     it("joins both lanes after the lane's own model and before the other providers", async () => {
-      useAnthropicSummaries();
+      // Live shape: summarize model differs from ANTHROPIC_MODEL, so the bare
+      // "anthropic" entry is a distinct third hop in both lanes.
+      process.env.AGENTMEMORY_SUMMARIZE_PROVIDER = "anthropic";
+      process.env.AGENTMEMORY_SUMMARIZE_MODEL = "claude-opus-5";
+      process.env.ANTHROPIC_MODEL = "claude-sonnet-5";
       failing.add("openai:glm-5.3-flash");
       failing.add("anthropic:claude-opus-5");
+      failing.add("openai:gpt-5.6-luna");
       const p = await build([{ provider: "openai", model: "gpt-5.6-luna" }, "anthropic"]);
       await p.compress("s", "u");
       await p.summarize("s", "u");
       expect(calls).toEqual([
         "compress:openai:glm-5.3-flash",
         "compress:openai:gpt-5.6-luna",
+        "compress:anthropic:claude-sonnet-5",
         "summarize:anthropic:claude-opus-5",
         "summarize:openai:gpt-5.6-luna",
+        "summarize:anthropic:claude-sonnet-5",
       ]);
+      expect(anthropicInstances).toBe(2);
     });
 
     it("inherits the primary's explicit baseURL and skips the primary's own model", async () => {
