@@ -12,7 +12,7 @@ import { OpenRouterProvider } from "./openrouter.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
 import { SplitProvider } from "./split.js";
-import { getEnvVar } from "../config.js";
+import { getEnvVar, loadSummarizeConfig } from "../config.js";
 
 export { createEmbeddingProvider, createImageEmbeddingProvider } from "./embedding/index.js";
 
@@ -53,66 +53,28 @@ function defaultModelFor(providerType: ProviderConfig["provider"]): string {
   }
 }
 
-// Provider-side base URL for providers that don't read their own env
-// (AnthropicProvider takes it as a ctor arg only). Without this, a
-// fallback / summarize Anthropic provider bypasses ANTHROPIC_BASE_URL.
-function baseUrlFor(providerType: ProviderConfig["provider"]): string | undefined {
-  return providerType === "anthropic" ? getEnvVar("ANTHROPIC_BASE_URL") : undefined;
-}
-
-const SUMMARIZE_PROVIDER_TYPES = new Set<ProviderConfig["provider"]>([
-  "openai",
-  "anthropic",
-  "gemini",
-  "openrouter",
-  "minimax",
-]);
-
-// #899: AGENTMEMORY_SUMMARIZE_PROVIDER (+ optional AGENTMEMORY_SUMMARIZE_MODEL)
-// routes summarize() to its own provider; compress() stays on the primary.
-function withSummarizeProvider(
-  primary: MemoryProvider,
-  config: ProviderConfig,
-): MemoryProvider {
-  const raw = getEnvVar("AGENTMEMORY_SUMMARIZE_PROVIDER");
-  if (!raw) return primary;
-  const type = raw.toLowerCase() as ProviderConfig["provider"];
-  if (!SUMMARIZE_PROVIDER_TYPES.has(type)) {
-    process.stderr.write(
-      `[agentmemory] Ignoring AGENTMEMORY_SUMMARIZE_PROVIDER='${raw}': ` +
-        `expected one of ${[...SUMMARIZE_PROVIDER_TYPES].join(", ")}.\n`,
-    );
-    return primary;
-  }
-  const model = getEnvVar("AGENTMEMORY_SUMMARIZE_MODEL") || defaultModelFor(type);
-  if (type === config.provider && model === config.model) return primary;
-  return new SplitProvider(
-    primary,
-    createBaseProvider({
-      provider: type,
-      model,
-      maxTokens: config.maxTokens,
-      baseURL: baseUrlFor(type),
-    }),
-  );
+// #899: resolve the summarize-lane config, or undefined when unset / same as primary.
+function summarizeProviderConfig(primary: ProviderConfig): ProviderConfig | undefined {
+  const lane = loadSummarizeConfig();
+  if (!lane) return undefined;
+  const model = lane.model || defaultModelFor(lane.provider);
+  if (lane.provider === primary.provider && model === primary.model) return undefined;
+  return { provider: lane.provider, model, maxTokens: primary.maxTokens };
 }
 
 export function createProvider(config: ProviderConfig): ResilientProvider {
-  return new ResilientProvider(
-    withSummarizeProvider(createBaseProvider(config), config),
-  );
+  return createFallbackProvider(config, { providers: [] });
 }
 
 export function createFallbackProvider(
   config: ProviderConfig,
   fallbackConfig: FallbackConfig,
 ): ResilientProvider {
-  if (fallbackConfig.providers.length === 0) {
-    return createProvider(config);
-  }
-
+  const summarizeConfig = summarizeProviderConfig(config);
+  const summarizer = summarizeConfig && createBaseProvider(summarizeConfig);
+  const base = createBaseProvider(config);
   const providers: MemoryProvider[] = [
-    withSummarizeProvider(createBaseProvider(config), config),
+    summarizer ? new SplitProvider(base, summarizer) : base,
   ];
   for (const providerType of fallbackConfig.providers) {
     if (providerType === config.provider) continue;
@@ -126,9 +88,14 @@ export function createFallbackProvider(
         provider: providerType,
         model: defaultModelFor(providerType),
         maxTokens: config.maxTokens,
-        baseURL: baseUrlFor(providerType),
       };
-      providers.push(createBaseProvider(fbConfig));
+      // Reuse the summarizer instance when the fallback is the same
+      // provider+model, so a failed summarize() isn't retried verbatim.
+      const reuseSummarizer =
+        summarizer &&
+        summarizeConfig?.provider === fbConfig.provider &&
+        summarizeConfig.model === fbConfig.model;
+      providers.push(reuseSummarizer ? summarizer : createBaseProvider(fbConfig));
     } catch {
       // skip unavailable fallback providers
     }

@@ -12,12 +12,10 @@ export class SplitProvider implements MemoryProvider {
     private readonly summarizer: MemoryProvider,
   ) {
     this.name = `${primary.name}+${summarizer.name}`;
-    if (primary.describeImage) {
-      this.describeImage = primary.describeImage.bind(primary);
-    }
+    this.describeImage = primary.describeImage?.bind(primary);
   }
 
-  describeImage?: MemoryProvider["describeImage"];
+  readonly describeImage?: MemoryProvider["describeImage"];
 
   compress(systemPrompt: string, userPrompt: string): Promise<string> {
     return this.primary.compress(systemPrompt, userPrompt);

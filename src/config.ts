@@ -7,6 +7,7 @@ import type {
   ProviderConfig,
   EmbeddingConfig,
   FallbackConfig,
+  ProviderType,
   ClaudeBridgeConfig,
   TeamConfig,
 } from "./types.js";
@@ -518,4 +519,26 @@ export function loadFallbackConfig(): FallbackConfig {
       return true;
     });
   return { providers };
+}
+
+// #899: AGENTMEMORY_SUMMARIZE_PROVIDER (+ optional AGENTMEMORY_SUMMARIZE_MODEL)
+// routes summarize() to its own provider; compress() stays on the primary.
+// agent-sdk is never allowed here (Stop-hook recursion, see loadFallbackConfig).
+export function loadSummarizeConfig():
+  | { provider: ProviderType; model?: string }
+  | undefined {
+  const env = getMergedEnv();
+  const provider = (env["AGENTMEMORY_SUMMARIZE_PROVIDER"] || "").trim();
+  if (!provider) return undefined;
+  if (!VALID_PROVIDERS.has(provider) || provider === "agent-sdk") {
+    process.stderr.write(
+      `[agentmemory] Ignoring AGENTMEMORY_SUMMARIZE_PROVIDER='${provider}': ` +
+        "unknown provider or not allowed for summaries.\n",
+    );
+    return undefined;
+  }
+  return {
+    provider: provider as ProviderType,
+    model: env["AGENTMEMORY_SUMMARIZE_MODEL"] || undefined,
+  };
 }

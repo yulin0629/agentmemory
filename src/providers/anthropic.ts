@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { MemoryProvider } from '../types.js'
+import { getEnvVar } from '../config.js'
 
 export class AnthropicProvider implements MemoryProvider {
   name = 'anthropic'
@@ -8,7 +9,8 @@ export class AnthropicProvider implements MemoryProvider {
   private maxTokens: number
 
   constructor(apiKey: string, model: string, maxTokens: number, baseURL?: string) {
-    this.client = new Anthropic({ apiKey, ...(baseURL ? { baseURL } : {}) })
+    const resolvedBaseURL = baseURL || getEnvVar('ANTHROPIC_BASE_URL')
+    this.client = new Anthropic({ apiKey, ...(resolvedBaseURL ? { baseURL: resolvedBaseURL } : {}) })
     this.model = model
     this.maxTokens = maxTokens
   }
