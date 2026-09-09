@@ -1,3 +1,4 @@
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import type { ISdk } from "iii-sdk";
 import type {
   Session,
@@ -310,7 +311,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         // multiplies in-flight deletes to chunk-size squared.
         const obsDeletes: Array<{ sessionId: string; obsId: string }> = [];
         await runChunked(existing, async (session) => {
-          await kv.delete(KV.sessions, session.id);
+          await withKeyedLock(`session:${session.id}`, () => kv.delete(KV.sessions, session.id));
           const obs = await kv
             .list<CompressedObservation>(KV.observations(session.id))
             .catch(() => []);

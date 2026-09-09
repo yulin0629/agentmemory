@@ -1,3 +1,4 @@
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import type { ISdk } from "iii-sdk";
 import type {
   Session,
@@ -134,7 +135,33 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
       const summaryIds = new Set(summaries.map((s) => s.sessionId));
 
       for (const session of sessions) {
-        if (!session.startedAt) continue;
+        if (!session.startedAt) {
+          if (!session.id || !session.endedAt || summaryIds.has(session.id)) continue;
+          const observations = await kv
+            .list(KV.observations(session.id))
+            .catch(() => null);
+          if (!observations || observations.length > 0) continue;
+          if (dryRun) {
+            stats.staleSessions++;
+          } else {
+            try {
+              await withKeyedLock(`session:${session.id}`, () => kv.delete(KV.sessions, session.id));
+              stats.staleSessions++;
+              await recordAudit(kv, "delete", "mem::evict", [session.id], {
+                resource: "session",
+                reason: "orphan_session_without_observations",
+                dryRun,
+              });
+            } catch (err) {
+              logger.warn("Eviction delete failed", {
+                resource: "session",
+                id: session.id,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          continue;
+        }
         const age = now - new Date(session.startedAt).getTime();
         const staleDays = cfg.staleSessionDays * MS_PER_DAY;
         if (age > staleDays && !summaryIds.has(session.id)) {
@@ -170,7 +197,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
             }
 
             try {
-              await kv.delete(KV.sessions, session.id);
+              await withKeyedLock(`session:${session.id}`, () => kv.delete(KV.sessions, session.id));
               stats.staleSessions++;
             } catch (err) {
               logger.warn("Eviction delete failed", {

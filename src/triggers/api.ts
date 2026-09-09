@@ -665,10 +665,17 @@ export function registerApiTriggers(
           body: { error: "sessionId is required and must be a non-empty string" },
         };
       }
-      await kv.update(KV.sessions, sessionId, [
-        { type: "set", path: "endedAt", value: new Date().toISOString() },
-        { type: "set", path: "status", value: "completed" },
-      ]);
+      const ended = await withKeyedLock(`session:${sessionId}`, async () => {
+        if (!await kv.get(KV.sessions, sessionId)) return false;
+        await kv.update(KV.sessions, sessionId, [
+          { type: "set", path: "endedAt", value: new Date().toISOString() },
+          { type: "set", path: "status", value: "completed" },
+        ]);
+        return true;
+      });
+      if (!ended) {
+        return { status_code: 404, body: { error: "unknown session", sessionId } };
+      }
       // Fan out session-stopped lifecycle (non-blocking).
       try {
         sdk.trigger({

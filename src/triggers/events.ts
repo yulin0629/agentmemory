@@ -1,3 +1,4 @@
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { TriggerAction, type ISdk } from "iii-sdk";
 import type { CompressedObservation, HookPayload, Session } from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
@@ -176,11 +177,16 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     "event::session::ended",
     async (data: { sessionId: string }) => {
-      await kv.update(KV.sessions, data.sessionId, [
-        { type: "set", path: "endedAt", value: new Date().toISOString() },
-        { type: "set", path: "status", value: "completed" },
-      ]);
-      return { success: true };
+      return withKeyedLock(`session:${data.sessionId}`, async () => {
+        if (!await kv.get(KV.sessions, data.sessionId)) {
+          return { success: true, skipped: "session-absent" };
+        }
+        await kv.update(KV.sessions, data.sessionId, [
+          { type: "set", path: "endedAt", value: new Date().toISOString() },
+          { type: "set", path: "status", value: "completed" },
+        ]);
+        return { success: true };
+      });
     },
   );
   sdk.registerTrigger({

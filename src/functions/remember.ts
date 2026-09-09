@@ -311,7 +311,8 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           deletedObservationIds.push(obs.id);
           deleted++;
         }
-        await kv.delete(KV.sessions, data.sessionId);
+        const sessionId = data.sessionId;
+        await withKeyedLock(`session:${sessionId}`, () => kv.delete(KV.sessions, sessionId));
         await kv.delete(KV.summaries, data.sessionId);
         deletedSession = true;
         deleted += 2;

@@ -66,6 +66,9 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
 }
 
 export function vectorIndexRemove(id: string): void {
+  for (const pending of activeAdds) {
+    if (pending.id === id) cancelledAdds.add(pending)
+  }
   vectorIndex?.remove(id);
 }
 
@@ -100,6 +103,8 @@ export function scheduleIndexSave(): void {
 // flush as a fatal error on the delete itself (the KV delete already
 // committed before this is invoked).
 export async function flushIndexSave(): Promise<void> {
+  await flushPendingAdds()
+  while (inFlightAdds.size > 0) await Promise.all([...inFlightAdds])
   await indexPersistence?.save();
 }
 
@@ -121,6 +126,50 @@ export function clipEmbedInput(text: string): string {
 //     this is the symmetric guard at the write site)
 //   - embed throwing (network, rate limit, provider down)
 // Always soft-fails so a downed embedder doesn't break the upstream save.
+// Read process.env here because config is partially mocked by callers.
+const COALESCE_WINDOW_MS = Number(process.env.EMBED_COALESCE_MS ?? "1200")
+const COALESCE_MAX_ITEMS = 100
+
+type PendingAdd = {
+  id: string
+  sessionId: string
+  text: string
+  context: { kind: "memory" | "observation" | "synthetic"; logId: string }
+  resolve: (ok: boolean) => void
+}
+
+const activeAdds = new Set<PendingAdd>()
+const cancelledAdds = new WeakSet<PendingAdd>()
+const inFlightAdds = new Set<Promise<void>>()
+let pendingAdds: PendingAdd[] = []
+let coalesceTimer: ReturnType<typeof setTimeout> | null = null
+
+async function flushPendingAdds(): Promise<void> {
+  if (coalesceTimer) {
+    clearTimeout(coalesceTimer)
+    coalesceTimer = null
+  }
+  if (pendingAdds.length === 0) return
+  const batch = pendingAdds
+  pendingAdds = []
+  const task = (async () => {
+    try {
+      const outcomes = await addVectorBatch(batch, (i) => !cancelledAdds.has(batch[i]))
+      batch.forEach((p, i) => p.resolve(outcomes[i]))
+    } catch {
+      for (const p of batch) p.resolve(false)
+    } finally {
+      for (const p of batch) activeAdds.delete(p)
+    }
+  })()
+  inFlightAdds.add(task)
+  try {
+    await task
+  } finally {
+    inFlightAdds.delete(task)
+  }
+}
+
 export async function vectorIndexAddGuarded(
   id: string,
   sessionId: string,
@@ -130,6 +179,20 @@ export async function vectorIndexAddGuarded(
   const vi = vectorIndex
   const ep = currentEmbeddingProvider
   if (!vi || !ep) return false
+  if (COALESCE_WINDOW_MS > 0) {
+    return new Promise<boolean>((resolve) => {
+      const pending = { id, sessionId, text, context, resolve }
+      activeAdds.add(pending)
+      pendingAdds.push(pending)
+      if (pendingAdds.length >= COALESCE_MAX_ITEMS) {
+        void flushPendingAdds()
+      } else if (!coalesceTimer) {
+        coalesceTimer = setTimeout(() => void flushPendingAdds(), COALESCE_WINDOW_MS)
+        // Never hold process exit open for a buffered embed.
+        if (typeof coalesceTimer.unref === "function") coalesceTimer.unref()
+      }
+    })
+  }
   try {
     const embedding = await ep.embed(clipEmbedInput(text))
     if (embedding.length !== ep.dimensions) {
@@ -173,9 +236,18 @@ export async function vectorIndexAddBatchGuarded(
     context: { kind: "memory" | "observation" | "synthetic"; logId: string }
   }>,
 ): Promise<{ ok: number; fail: number }> {
+  const outcomes = await addVectorBatch(items)
+  const ok = outcomes.filter(Boolean).length
+  return { ok, fail: outcomes.length - ok }
+}
+
+async function addVectorBatch(
+  items: Array<Omit<PendingAdd, "resolve">>,
+  shouldAdd: (index: number) => boolean = () => true,
+): Promise<boolean[]> {
   const vi = vectorIndex
   const ep = currentEmbeddingProvider
-  if (!vi || !ep || items.length === 0) return { ok: 0, fail: 0 }
+  if (!vi || !ep || items.length === 0) return items.map(() => false)
 
   let embeddings: Float32Array[]
   try {
@@ -186,7 +258,7 @@ export async function vectorIndexAddBatchGuarded(
       provider: ep.name,
       error: err instanceof Error ? err.message : String(err),
     })
-    return { ok: 0, fail: items.length }
+    return items.map(() => false)
   }
 
   if (embeddings.length !== items.length) {
@@ -198,14 +270,17 @@ export async function vectorIndexAddBatchGuarded(
         provider: ep.name,
       },
     )
-    return { ok: 0, fail: items.length }
+    return items.map(() => false)
   }
 
-  let ok = 0
-  let fail = 0
+  const outcomes: boolean[] = []
   for (let i = 0; i < items.length; i++) {
     const item = items[i]
     const embedding = embeddings[i]
+    if (!shouldAdd(i)) {
+      outcomes.push(false)
+      continue
+    }
     if (embedding.length !== ep.dimensions) {
       logger.warn("vector-index add batch: dimension mismatch — skipping item", {
         kind: item.context.kind,
@@ -214,22 +289,22 @@ export async function vectorIndexAddBatchGuarded(
         expected: ep.dimensions,
         received: embedding.length,
       })
-      fail++
+      outcomes.push(false)
       continue
     }
     try {
       vi.add(item.id, item.sessionId, embedding)
-      ok++
+      outcomes.push(true)
     } catch (err) {
       logger.warn("vector-index add batch: index write failed — skipping item", {
         kind: item.context.kind,
         id: item.context.logId,
         error: err instanceof Error ? err.message : String(err),
       })
-      fail++
+      outcomes.push(false)
     }
   }
-  return { ok, fail }
+  return outcomes
 }
 
 // Embed-batch size for rebuild. Each item is one /v1/embeddings call's

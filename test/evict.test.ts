@@ -295,3 +295,18 @@ describe("mem::evict stale sessions", () => {
     );
   });
 });
+
+describe("orphan session eviction", () => {
+  it.each(["empty", "observations", "summary", "scan-failure", "missing-id", "dry-run"])("handles %s safely", async (kind) => {
+    const id = "orphan";
+    const store = storeForObservations(id, kind === "observations" ? [makeObservation(id)] : []);
+    store.get(KV.sessions)!.set(id, { ...(kind === "missing-id" ? {} : { id }), endedAt: daysAgo(1) });
+    if (kind === "summary") store.get(KV.summaries)!.set(id, { sessionId: id });
+    const kv = mockKV(store, new Set(kind === "scan-failure" ? [KV.observations(id)] : []));
+    const { sdk } = mockSdk();
+    registerEvictFunction(sdk as never, kv as never);
+    await sdk.trigger({ function_id: "mem::evict", payload: { dryRun: kind === "dry-run" } });
+    expect(store.get(KV.sessions)!.has(id)).toBe(kind !== "empty");
+    if (kind === "empty") expect([...store.get(KV.audit)!.values()].some((a: any) => a.details?.reason === "orphan_session_without_observations" || JSON.stringify(a).includes("orphan_session_without_observations"))).toBe(true);
+  });
+});
