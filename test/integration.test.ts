@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 
-const BASE_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
+// Fail closed: the default port is a real agentmemory on machines that run
+// one, and this suite writes sessions into it. Require the target explicitly.
+const BASE_URL = process.env["AGENTMEMORY_URL"];
+if (!BASE_URL) {
+  throw new Error("integration tests need AGENTMEMORY_URL (e.g. http://localhost:3111)");
+}
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 
 const SESSION_ID = `test_${Date.now()}`;
