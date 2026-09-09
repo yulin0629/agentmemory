@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- **Per-lane LLM model (#899).** `AGENTMEMORY_SUMMARIZE_PROVIDER` (+ optional `AGENTMEMORY_SUMMARIZE_MODEL`) routes `summarize()` — session summaries, reflect, consolidation, crystallize, skill-extract — to its own provider while `compress()` stays on the primary. Fallback / summarize Anthropic providers now receive `ANTHROPIC_BASE_URL`; previously only the primary did, so `FALLBACK_PROVIDERS=anthropic` behind a proxy silently called `api.anthropic.com`.
+- **Per-lane LLM model (#899).** `AGENTMEMORY_SUMMARIZE_PROVIDER` (+ optional `AGENTMEMORY_SUMMARIZE_MODEL`) routes `summarize()` — session summaries, reflect, consolidation, crystallize, skill-extract — to its own provider while `compress()` stays on the primary. Fallback / summarize Anthropic providers now receive `ANTHROPIC_BASE_URL`; previously only the primary did, so `FALLBACK_PROVIDERS=anthropic` behind a proxy silently called `api.anthropic.com`. Each lane has its own fallback chain and circuit breaker, so a failing summarize endpoint neither blocks compression nor gets retried as its own fallback; `/health` reports the worse lane.
 
 ### Fixed
 

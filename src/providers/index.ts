@@ -2,6 +2,7 @@ import type {
   MemoryProvider,
   ProviderConfig,
   FallbackConfig,
+  CircuitBreakerState,
 } from "../types.js";
 import { AgentSDKProvider } from "./agent-sdk.js";
 import { AnthropicProvider } from "./anthropic.js";
@@ -59,23 +60,31 @@ function summarizeProviderConfig(primary: ProviderConfig): ProviderConfig | unde
   if (!lane) return undefined;
   const model = lane.model || defaultModelFor(lane.provider);
   if (lane.provider === primary.provider && model === primary.model) return undefined;
-  return { provider: lane.provider, model, maxTokens: primary.maxTokens };
+  return {
+    provider: lane.provider,
+    model,
+    maxTokens: primary.maxTokens,
+    // Same provider, different model: keep an explicitly passed base URL.
+    baseURL: lane.provider === primary.provider ? primary.baseURL : undefined,
+  };
 }
 
-export function createProvider(config: ProviderConfig): ResilientProvider {
+export type LlmProvider = MemoryProvider & { readonly circuitState: CircuitBreakerState };
+
+function chain(providers: MemoryProvider[]): MemoryProvider {
+  return providers.length > 1 ? new FallbackChainProvider(providers) : providers[0];
+}
+
+export function createProvider(config: ProviderConfig): LlmProvider {
   return createFallbackProvider(config, { providers: [] });
 }
 
 export function createFallbackProvider(
   config: ProviderConfig,
   fallbackConfig: FallbackConfig,
-): ResilientProvider {
-  const summarizeConfig = summarizeProviderConfig(config);
-  const summarizer = summarizeConfig && createBaseProvider(summarizeConfig);
+): LlmProvider {
   const base = createBaseProvider(config);
-  const providers: MemoryProvider[] = [
-    summarizer ? new SplitProvider(base, summarizer) : base,
-  ];
+  const fallbacks: { config: ProviderConfig; provider: MemoryProvider }[] = [];
   for (const providerType of fallbackConfig.providers) {
     if (providerType === config.provider) continue;
     try {
@@ -89,22 +98,32 @@ export function createFallbackProvider(
         model: defaultModelFor(providerType),
         maxTokens: config.maxTokens,
       };
-      // Reuse the summarizer instance when the fallback is the same
-      // provider+model, so a failed summarize() isn't retried verbatim.
-      const reuseSummarizer =
-        summarizer &&
-        summarizeConfig?.provider === fbConfig.provider &&
-        summarizeConfig.model === fbConfig.model;
-      providers.push(reuseSummarizer ? summarizer : createBaseProvider(fbConfig));
+      fallbacks.push({ config: fbConfig, provider: createBaseProvider(fbConfig) });
     } catch {
       // skip unavailable fallback providers
     }
   }
+  const fallbackProviders = fallbacks.map((f) => f.provider);
 
-  if (providers.length > 1) {
-    return new ResilientProvider(new FallbackChainProvider(providers));
+  const summarizeConfig = summarizeProviderConfig(config);
+  if (!summarizeConfig) {
+    return new ResilientProvider(chain([base, ...fallbackProviders]));
   }
-  return new ResilientProvider(providers[0]);
+  // Each lane gets its own chain and its own circuit breaker: a failing
+  // summarize endpoint must not open the breaker for compress, and the
+  // summarize chain must not retry the summarizer itself as a fallback.
+  const summarizer =
+    fallbacks.find(
+      (f) =>
+        f.config.provider === summarizeConfig.provider &&
+        f.config.model === summarizeConfig.model,
+    )?.provider ?? createBaseProvider(summarizeConfig);
+  return new SplitProvider(
+    new ResilientProvider(chain([base, ...fallbackProviders])),
+    new ResilientProvider(
+      chain([summarizer, ...fallbackProviders.filter((f) => f !== summarizer)]),
+    ),
+  );
 }
 
 function createBaseProvider(config: ProviderConfig): MemoryProvider {

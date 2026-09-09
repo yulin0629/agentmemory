@@ -528,7 +528,7 @@ export function loadSummarizeConfig():
   | { provider: ProviderType; model?: string }
   | undefined {
   const env = getMergedEnv();
-  const provider = (env["AGENTMEMORY_SUMMARIZE_PROVIDER"] || "").trim();
+  const provider = (env["AGENTMEMORY_SUMMARIZE_PROVIDER"] || "").trim().toLowerCase();
   if (!provider) return undefined;
   if (!VALID_PROVIDERS.has(provider) || provider === "agent-sdk") {
     process.stderr.write(
@@ -539,6 +539,6 @@ export function loadSummarizeConfig():
   }
   return {
     provider: provider as ProviderType,
-    model: env["AGENTMEMORY_SUMMARIZE_MODEL"] || undefined,
+    model: (env["AGENTMEMORY_SUMMARIZE_MODEL"] || "").trim() || undefined,
   };
 }
