@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **`FALLBACK_PROVIDERS` entries can pin a model.** `openai:gpt-5.6-luna` falls back to another model on the same provider (e.g. behind an OpenAI-compatible proxy such as sub2api); previously the primary's own provider type was always skipped, so a GLM primary could only spill onto Anthropic. A same-provider fallback inherits the primary's explicit base URL; `provider` alone still resolves that provider's `*_MODEL` default.
 - **Per-lane LLM model (#899).** `AGENTMEMORY_SUMMARIZE_PROVIDER` (+ optional `AGENTMEMORY_SUMMARIZE_MODEL`) routes `summarize()` — session summaries, reflect, consolidation, crystallize, skill-extract — to its own provider while `compress()` stays on the primary. Fallback / summarize Anthropic providers now receive `ANTHROPIC_BASE_URL`; previously only the primary did, so `FALLBACK_PROVIDERS=anthropic` behind a proxy silently called `api.anthropic.com`. Each lane has its own fallback chain and circuit breaker, so a failing summarize endpoint neither blocks compression nor gets retried as its own fallback; `/health` reports the worse lane.
 
 ### Fixed

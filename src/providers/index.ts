@@ -85,18 +85,23 @@ export function createFallbackProvider(
 ): LlmProvider {
   const base = createBaseProvider(config);
   const fallbacks: { config: ProviderConfig; provider: MemoryProvider }[] = [];
-  for (const providerType of fallbackConfig.providers) {
-    if (providerType === config.provider) continue;
+  for (const entry of fallbackConfig.providers) {
+    const providerType = typeof entry === "string" ? entry : entry.provider;
+    // #778: resolve the fallback's OWN default model (or its env
+    // override) rather than copying config.model from the primary.
+    // Without this, FALLBACK_PROVIDERS=gemini on an OpenAI primary
+    // would call Gemini with `gpt-4o-mini`, get a 404 every time,
+    // and trip the circuit breaker.
+    const model = typeof entry === "string" ? defaultModelFor(providerType) : entry.model;
+    // The primary's own provider only helps as a fallback with another model.
+    if (providerType === config.provider && model === config.model) continue;
     try {
-      // #778: resolve the fallback's OWN default model (or its env
-      // override) rather than copying config.model from the primary.
-      // Without this, FALLBACK_PROVIDERS=gemini on an OpenAI primary
-      // would call Gemini with `gpt-4o-mini`, get a 404 every time,
-      // and trip the circuit breaker.
       const fbConfig: ProviderConfig = {
         provider: providerType,
-        model: defaultModelFor(providerType),
+        model,
         maxTokens: config.maxTokens,
+        // Same provider, different model: keep an explicitly passed base URL.
+        baseURL: providerType === config.provider ? config.baseURL : undefined,
       };
       fallbacks.push({ config: fbConfig, provider: createBaseProvider(fbConfig) });
     } catch {

@@ -372,8 +372,13 @@ export interface EmbeddingConfig {
   vectorWeight: number;
 }
 
+// A bare provider name uses that provider's *_MODEL default; `{ provider, model }`
+// pins a model, which is the only way the primary's own provider can act as a
+// fallback (FALLBACK_PROVIDERS=openai:gpt-5.6-luna behind an OpenAI-compatible proxy).
+export type FallbackEntry = ProviderType | { provider: ProviderType; model: string };
+
 export interface FallbackConfig {
-  providers: ProviderType[];
+  providers: FallbackEntry[];
 }
 
 export interface ClaudeBridgeConfig {

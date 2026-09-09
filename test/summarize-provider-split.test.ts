@@ -36,7 +36,7 @@ vi.mock("../src/providers/anthropic.js", () => ({
 }));
 
 const ENV_KEYS = [
-  "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_MODEL", "FALLBACK_PROVIDERS",
   "AGENTMEMORY_SUMMARIZE_PROVIDER", "AGENTMEMORY_SUMMARIZE_MODEL", "ANTHROPIC_MODEL",
 ];
 const saved: Record<string, string | undefined> = {};
@@ -153,5 +153,41 @@ describe("summarize provider split (#899)", () => {
     calls.length = 0;
     await p.compress("s", "u");
     expect(calls).toEqual(["compress:openai:glm-5.3-flash"]);
+  });
+
+  describe("same-provider fallback with a pinned model", () => {
+    it("FALLBACK_PROVIDERS parses provider:model entries and drops unknown ones", async () => {
+      process.env.FALLBACK_PROVIDERS = " openai:gpt-5.6-luna , anthropic, bogus:x, openai:host:model";
+      const { loadFallbackConfig } = await import("../src/config.js");
+      expect(loadFallbackConfig().providers).toEqual([
+        { provider: "openai", model: "gpt-5.6-luna" },
+        "anthropic",
+        { provider: "openai", model: "host:model" },
+      ]);
+    });
+
+    it("joins both lanes after the lane's own model and before the other providers", async () => {
+      useAnthropicSummaries();
+      failing.add("openai:glm-5.3-flash");
+      failing.add("anthropic:claude-opus-5");
+      const p = await build([{ provider: "openai", model: "gpt-5.6-luna" }, "anthropic"]);
+      await p.compress("s", "u");
+      await p.summarize("s", "u");
+      expect(calls).toEqual([
+        "compress:openai:glm-5.3-flash",
+        "compress:openai:gpt-5.6-luna",
+        "summarize:anthropic:claude-opus-5",
+        "summarize:openai:gpt-5.6-luna",
+      ]);
+    });
+
+    it("inherits the primary's explicit baseURL and skips the primary's own model", async () => {
+      process.env.OPENAI_MODEL = "glm-5.3-flash";
+      await build([{ provider: "openai", model: "gpt-5.6-luna" }, "openai"], "http://explicit.local");
+      expect(openaiCtorArgs.map((a) => [a[1], a[3]])).toEqual([
+        ["glm-5.3-flash", "http://explicit.local"],
+        ["gpt-5.6-luna", "http://explicit.local"],
+      ]);
+    });
   });
 });

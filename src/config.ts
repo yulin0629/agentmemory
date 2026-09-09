@@ -493,14 +493,15 @@ export function loadFallbackConfig(): FallbackConfig {
   const env = getMergedEnv();
   const raw = env["FALLBACK_PROVIDERS"] || "";
   const allowAgentSdk = env["AGENTMEMORY_ALLOW_AGENT_SDK"] === "true";
+  // Each entry is `provider` or `provider:model` (model may itself contain ':').
   const providers = raw
     .split(",")
-    .map((p) => p.trim())
-    .filter(
-      (p): p is FallbackConfig["providers"][number] =>
-        Boolean(p) && VALID_PROVIDERS.has(p),
-    )
-    .filter((p) => {
+    .map((entry) => {
+      const [name, ...model] = entry.trim().split(":");
+      return { name: name.trim(), model: model.join(":").trim() };
+    })
+    .filter(({ name }) => Boolean(name) && VALID_PROVIDERS.has(name))
+    .filter(({ name: p }) => {
       // Honor the same safety gate as detectProvider: agent-sdk is only
       // permitted as a fallback target when the user has explicitly opted
       // in. Without this filter, a user could set FALLBACK_PROVIDERS=agent-sdk
@@ -517,7 +518,10 @@ export function loadFallbackConfig(): FallbackConfig {
         return false;
       }
       return true;
-    });
+    })
+    .map(({ name, model }): FallbackConfig["providers"][number] =>
+      model ? { provider: name as ProviderType, model } : (name as ProviderType),
+    );
   return { providers };
 }
 
