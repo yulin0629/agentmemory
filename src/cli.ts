@@ -2044,8 +2044,8 @@ async function main() {
     if (detected === IIPINNED_VERSION) {
       adoptRunningEngine();
       await startWorkerForEngineState();
-      if (!(await waitForAgentmemoryReady(15000))) {
-        p.log.error("agentmemory worker did not become ready within 15s.");
+      if (!(await waitForAgentmemoryReady(120000))) {
+        p.log.error("agentmemory worker did not become ready within 120s.");
         process.exit(1);
       }
       const consoleState = await ensureIiiConsole();
@@ -2156,8 +2156,8 @@ async function main() {
 
   s.stop(c.ok("iii-engine is ready"));
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(120000))) {
+    p.log.error("agentmemory worker did not become ready within 120s.");
     process.exit(1);
   }
   const consoleState = await ensureIiiConsole();

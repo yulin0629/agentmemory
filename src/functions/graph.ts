@@ -686,6 +686,10 @@ export function registerGraphFunction(
 ): void {
   sdk.registerFunction("mem::graph-extract",
     async (data: { observations: CompressedObservation[] }) => {
+      if (!isGraphExtractionEnabled()) {
+        return { success: true, nodesAdded: 0, edgesAdded: 0 };
+      }
+
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }

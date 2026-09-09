@@ -97,6 +97,18 @@ describe("Graph Functions", () => {
     else process.env["GRAPH_EXTRACTION_ENABLED"] = ORIG_GRAPH_FLAG;
   });
 
+  it("does not write heuristic or LLM graph data when extraction is disabled", async () => {
+    process.env.GRAPH_EXTRACTION_ENABLED = "false";
+    const write = vi.spyOn(kv, "set");
+    const calls = mockProvider.compress.mock.calls.length;
+    const result = await sdk.trigger("mem::graph-extract", {
+      observations: [{ ...testObs, files: ["src/index.ts"], concepts: ["sqlite"] }],
+    });
+    expect(result).toEqual({ success: true, nodesAdded: 0, edgesAdded: 0 });
+    expect(write).not.toHaveBeenCalled();
+    expect(mockProvider.compress).toHaveBeenCalledTimes(calls);
+  });
+
   it("graph-extract creates nodes and edges from XML response", async () => {
     const result = (await sdk.trigger("mem::graph-extract", {
       observations: [testObs],
