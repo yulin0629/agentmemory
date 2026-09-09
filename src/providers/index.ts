@@ -11,6 +11,7 @@ import { OpenAIProvider } from "./openai.js";
 import { OpenRouterProvider } from "./openrouter.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
+import { SplitProvider } from "./split.js";
 import { getEnvVar } from "../config.js";
 
 export { createEmbeddingProvider, createImageEmbeddingProvider } from "./embedding/index.js";
@@ -52,8 +53,54 @@ function defaultModelFor(providerType: ProviderConfig["provider"]): string {
   }
 }
 
+// Provider-side base URL for providers that don't read their own env
+// (AnthropicProvider takes it as a ctor arg only). Without this, a
+// fallback / summarize Anthropic provider bypasses ANTHROPIC_BASE_URL.
+function baseUrlFor(providerType: ProviderConfig["provider"]): string | undefined {
+  return providerType === "anthropic" ? getEnvVar("ANTHROPIC_BASE_URL") : undefined;
+}
+
+const SUMMARIZE_PROVIDER_TYPES = new Set<ProviderConfig["provider"]>([
+  "openai",
+  "anthropic",
+  "gemini",
+  "openrouter",
+  "minimax",
+]);
+
+// #899: AGENTMEMORY_SUMMARIZE_PROVIDER (+ optional AGENTMEMORY_SUMMARIZE_MODEL)
+// routes summarize() to its own provider; compress() stays on the primary.
+function withSummarizeProvider(
+  primary: MemoryProvider,
+  config: ProviderConfig,
+): MemoryProvider {
+  const raw = getEnvVar("AGENTMEMORY_SUMMARIZE_PROVIDER");
+  if (!raw) return primary;
+  const type = raw.toLowerCase() as ProviderConfig["provider"];
+  if (!SUMMARIZE_PROVIDER_TYPES.has(type)) {
+    process.stderr.write(
+      `[agentmemory] Ignoring AGENTMEMORY_SUMMARIZE_PROVIDER='${raw}': ` +
+        `expected one of ${[...SUMMARIZE_PROVIDER_TYPES].join(", ")}.\n`,
+    );
+    return primary;
+  }
+  const model = getEnvVar("AGENTMEMORY_SUMMARIZE_MODEL") || defaultModelFor(type);
+  if (type === config.provider && model === config.model) return primary;
+  return new SplitProvider(
+    primary,
+    createBaseProvider({
+      provider: type,
+      model,
+      maxTokens: config.maxTokens,
+      baseURL: baseUrlFor(type),
+    }),
+  );
+}
+
 export function createProvider(config: ProviderConfig): ResilientProvider {
-  return new ResilientProvider(createBaseProvider(config));
+  return new ResilientProvider(
+    withSummarizeProvider(createBaseProvider(config), config),
+  );
 }
 
 export function createFallbackProvider(
@@ -64,7 +111,9 @@ export function createFallbackProvider(
     return createProvider(config);
   }
 
-  const providers: MemoryProvider[] = [createBaseProvider(config)];
+  const providers: MemoryProvider[] = [
+    withSummarizeProvider(createBaseProvider(config), config),
+  ];
   for (const providerType of fallbackConfig.providers) {
     if (providerType === config.provider) continue;
     try {
@@ -77,6 +126,7 @@ export function createFallbackProvider(
         provider: providerType,
         model: defaultModelFor(providerType),
         maxTokens: config.maxTokens,
+        baseURL: baseUrlFor(providerType),
       };
       providers.push(createBaseProvider(fbConfig));
     } catch {

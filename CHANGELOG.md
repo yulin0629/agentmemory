@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased] — yulin fork
 
+### Added
+
+- **Per-lane LLM model (#899).** `AGENTMEMORY_SUMMARIZE_PROVIDER` (+ optional `AGENTMEMORY_SUMMARIZE_MODEL`) routes `summarize()` — session summaries, reflect, consolidation, crystallize, skill-extract — to its own provider while `compress()` stays on the primary. Fallback / summarize Anthropic providers now receive `ANTHROPIC_BASE_URL`; previously only the primary did, so `FALLBACK_PROVIDERS=anthropic` behind a proxy silently called `api.anthropic.com`.
+
 ### Fixed
 
 - **Upstream merge (`e04ba88`) integration fixes.** `event::session::stopped` keeps the graph-extract fingerprint dedup on top of upstream's unconditional `fireVoid` path; `contextPayload` regained the `hook_event_name: "SessionStart"` branch upstream dropped, which had reduced Claude Code / Codex SessionStart output to bare text instead of `hookSpecificOutput` JSON; `connect dsh --with-hooks` now reads `hooks.json` instead of `hooks.codex.json`, matching what the adapter's own protocol note and the README already claim (this fork trims `PreToolUse`/`PreCompact` from the Codex manifest on purpose).
