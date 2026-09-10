@@ -1,3 +1,4 @@
+import { logger } from "../logger.js";
 import type { MemoryProvider } from "../types.js";
 
 export class FallbackChainProvider implements MemoryProvider {
@@ -24,6 +25,10 @@ export class FallbackChainProvider implements MemoryProvider {
         return await fn(provider);
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
+        logger.warn("provider failed, trying next in chain", {
+          provider: provider.name,
+          error: lastError.message,
+        });
       }
     }
     throw lastError || new Error("No providers available");
