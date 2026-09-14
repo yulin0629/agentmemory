@@ -872,7 +872,11 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
-      const requestedLimit = parseOptionalInt(req.query_params?.["limit"]);
+      const rawLimit = req.query_params?.["limit"];
+      const requestedLimit = parseOptionalInt(rawLimit);
+      if (rawLimit !== undefined && rawLimit !== "" && requestedLimit === undefined) {
+        return { status_code: 400, body: { error: "limit must be an integer" } };
+      }
       const selected = requestedLimit === undefined
         ? filtered
         : [...filtered]

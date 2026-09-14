@@ -43,6 +43,17 @@ describe("GET /agentmemory/sessions limit", () => {
     expect(kv.get).toHaveBeenCalledTimes(2);
   });
 
+  it("rejects a non-integer limit instead of falling back to the unbounded path", async () => {
+    const { handlers, kv } = setup();
+    const result = await handlers.get("api::sessions")!({
+      headers: {},
+      query_params: { limit: "abc" },
+    });
+
+    expect(result.status_code).toBe(400);
+    expect(kv.get).not.toHaveBeenCalled();
+  });
+
   it("keeps the existing unbounded behavior when limit is omitted", async () => {
     const { handlers, kv } = setup();
     const result = await handlers.get("api::sessions")!({

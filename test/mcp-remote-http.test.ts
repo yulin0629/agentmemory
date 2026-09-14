@@ -80,6 +80,10 @@ describe("remote MCP HTTP endpoint", () => {
       seen.push(payload);
       return { lessons: [] };
     });
+    sdk.stub("mem::search", async (payload) => {
+      seen.push(payload);
+      return { results: [] };
+    });
     registerMcpEndpoints(sdk as never, mockKv() as never, undefined, "chatgpt-secret");
     const handler = sdk.getFunction("mcp::remote")!;
 
@@ -106,8 +110,21 @@ describe("remote MCP HTTP endpoint", () => {
       ),
     );
 
+    await handler(
+      req(
+        {
+          jsonrpc: "2.0",
+          id: 7,
+          method: "tools/call",
+          params: { name: "memory_recall", arguments: { query: "deploy", limit: 0 } },
+        },
+        "chatgpt-secret",
+      ),
+    );
+
     expect(seen[0]).toMatchObject({ before: 50, after: 50 });
     expect(seen[1]).toMatchObject({ limit: 100 });
+    expect(seen[2]).toMatchObject({ limit: 1 });
   });
 
   it("authenticates initialize and exposes only the curated read-only tools", async () => {
@@ -132,6 +149,22 @@ describe("remote MCP HTTP endpoint", () => {
     expect(initialized.status_code).toBe(200);
     expect(initialized.body.result.serverInfo.name).toBe("agentmemory");
     expect(initialized.body.result.protocolVersion).toBe("2025-11-25");
+
+    const current = await handler(
+      req(
+        { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2026-07-28" } },
+        "chatgpt-secret",
+      ),
+    );
+    expect(current.body.result.protocolVersion).toBe("2026-07-28");
+
+    const unknown = await handler(
+      req(
+        { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "1999-01-01" } },
+        "chatgpt-secret",
+      ),
+    );
+    expect(unknown.body.result.protocolVersion).toBe("2025-11-25");
 
     const discovered = await handler(
       req({ jsonrpc: "2.0", id: 2, method: "server/discover" }, "chatgpt-secret"),
@@ -179,7 +212,9 @@ describe("remote MCP HTTP endpoint", () => {
 
     expect(result.status_code).toBe(200);
     expect(result.body.result.isError).toBeUndefined();
-    expect(JSON.parse(result.body.result.content[0].text).sessions).toHaveLength(1);
+    const payload = JSON.parse(result.body.result.content[0].text);
+    expect(payload.sessions).toHaveLength(1);
+    expect(payload.total).toBe(1);
   });
 
   it("rejects write tools before dispatching to the internal MCP surface", async () => {

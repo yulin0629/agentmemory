@@ -174,7 +174,7 @@ export function registerMcpEndpoints(
                 : undefined;
             const result = await sdk.trigger({ function_id: "mem::search", payload: {
               query: args.query,
-              limit: typeof args.limit === "number" ? args.limit : 10,
+              limit: Math.max(1, Math.min(100, asNumber(args.limit, 10) ?? 10)),
               format,
               token_budget: tokenBudget,
               agentId: recallAgentId,
@@ -310,14 +310,18 @@ export function registerMcpEndpoints(
 
           case "memory_sessions": {
             const limit = Math.max(1, Math.min(100, asNumber(args.limit, 20) ?? 20));
-            const sessions = (await kv.list<Session>(KV.sessions))
+            const allSessions = await kv.list<Session>(KV.sessions);
+            const sessions = allSessions
               .sort((a, b) => (b.startedAt ?? "").localeCompare(a.startedAt ?? ""))
               .slice(0, limit);
             return {
               status_code: 200,
               body: {
                 content: [
-                  { type: "text", text: JSON.stringify({ sessions }, null, 2) },
+                  {
+                    type: "text",
+                    text: JSON.stringify({ total: allSessions.length, sessions }, null, 2),
+                  },
                 ],
               },
             };
@@ -1873,11 +1877,11 @@ export function registerMcpEndpoints(
           if (notification) return { status_code: 202, body: {} };
           const params = body.params as { protocolVersion?: unknown } | undefined;
           const requested = params?.protocolVersion;
-          const legacyVersions = REMOTE_MCP_PROTOCOL_VERSIONS.slice(1);
           const protocolVersion =
-            typeof requested === "string" && legacyVersions.includes(requested)
+            typeof requested === "string" &&
+            REMOTE_MCP_PROTOCOL_VERSIONS.includes(requested)
               ? requested
-              : legacyVersions[0];
+              : REMOTE_MCP_PROTOCOL_VERSIONS[1];
           return rpcResult(id, {
             protocolVersion,
             capabilities: { tools: { listChanged: false } },
