@@ -219,6 +219,7 @@ async function main() {
 
   const kv = new StateKV(sdk);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
+  const remoteMcpSecret = getEnvVar("AGENTMEMORY_MCP_BEARER_TOKEN");
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
@@ -389,7 +390,7 @@ async function main() {
 
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
-  registerMcpEndpoints(sdk, kv, secret);
+  registerMcpEndpoints(sdk, kv, secret, remoteMcpSecret);
 
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
@@ -541,6 +542,11 @@ async function main() {
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
   );
+  if (remoteMcpSecret) {
+    bootLog(
+      `Remote MCP: 8 read-only tools at http://localhost:${config.restPort}/mcp`,
+    );
+  }
 
   const viewerServer = startViewerServer(
     config.viewerPort,

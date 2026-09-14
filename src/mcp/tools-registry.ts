@@ -122,7 +122,15 @@ export const CORE_TOOLS: McpToolDef[] = [
     name: "memory_sessions",
     description:
       "List recent sessions with their status and observation counts.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: {
+          type: "number",
+          description: "Max sessions to return (default 20, max 100)",
+        },
+      },
+    },
   },
   {
     name: "memory_smart_search",
@@ -168,11 +176,11 @@ export const CORE_TOOLS: McpToolDef[] = [
         project: { type: "string", description: "Filter by project path" },
         before: {
           type: "number",
-          description: "Observations before anchor (default 5)",
+          description: "Observations before anchor (default 5, max 50)",
         },
         after: {
           type: "number",
-          description: "Observations after anchor (default 5)",
+          description: "Observations after anchor (default 5, max 50)",
         },
       },
       required: ["anchor"],
@@ -800,7 +808,7 @@ export const V070_TOOLS: McpToolDef[] = [
           type: "number",
           description: "Minimum confidence threshold (default 0.1)",
         },
-        limit: { type: "number", description: "Max results (default 10)" },
+        limit: { type: "number", description: "Max results (default 10, max 100)" },
       },
       required: ["query"],
     },

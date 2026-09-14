@@ -1133,6 +1133,18 @@ Three tool surfaces, smallest to largest: `AGENTMEMORY_TOOLS=core` trims visibil
 
 The table shows the four core skills. The full set is 9 invocable skills plus 8 reference skills; see the Native skills section above.
 
+### Remote MCP (ChatGPT and other hosted clients)
+
+Set a dedicated bearer token to enable the standard remote endpoint:
+
+```bash
+AGENTMEMORY_MCP_BEARER_TOKEN=<random-secret> agentmemory
+```
+
+The server then exposes `POST /mcp` on the same loopback REST port (`GET`/`DELETE /mcp` answer 405: the endpoint is stateless and has no SSE stream). The endpoint supports both the legacy initialize lifecycle and the stateless MCP `2026-07-28` discovery lifecycle. Result sizes are bounded at the MCP boundary (`memory_sessions` limit 1–100, `memory_timeline` before/after ≤ 50, `memory_lesson_recall` limit ≤ 100). It intentionally exposes only eight read-only tools: `memory_recall`, `memory_file_history`, `memory_sessions`, `memory_smart_search`, `memory_timeline`, `memory_commit_lookup`, `memory_graph_query`, and `memory_lesson_recall`.
+
+`AGENTMEMORY_MCP_BEARER_TOKEN` is separate from `AGENTMEMORY_SECRET`: use the former for the hosted MCP client and keep the broader REST API private. When publishing through a reverse proxy or tunnel, route only `/mcp` to port `3111` and return 404 for every other path on that public hostname. Do not expose the whole Agent Memory REST API just to support a remote MCP client.
+
 ### Standalone MCP
 
 Run without the full server, for any MCP client. Either of these works:
@@ -1542,6 +1554,7 @@ Create `~/.agentmemory/.env`:
 
 # Auth
 # AGENTMEMORY_SECRET=your-secret
+# AGENTMEMORY_MCP_BEARER_TOKEN=your-remote-mcp-token  # Optional: enables read-only POST /mcp
 
 # Ports (defaults: 3111 API, 3113 viewer)
 # III_REST_PORT=3111
@@ -1609,7 +1622,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-130 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+130 endpoints on port `3111` make up the REST API, which binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers. Setting `AGENTMEMORY_MCP_BEARER_TOKEN` additionally enables the standard read-only remote MCP route at `/mcp`; it is deliberately outside the `/agentmemory/*` REST surface.
 
 <details>
 <summary>Key endpoints</summary>

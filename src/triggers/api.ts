@@ -872,6 +872,12 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
+      const requestedLimit = parseOptionalInt(req.query_params?.["limit"]);
+      const selected = requestedLimit === undefined
+        ? filtered
+        : [...filtered]
+            .sort((a, b) => (b.startedAt ?? "").localeCompare(a.startedAt ?? ""))
+            .slice(0, Math.max(1, Math.min(100, requestedLimit)));
       // Bounded fan-out: each kv.get is a full engine invocation, so
       // Promise.all over hundreds of sessions saturates the invocation
       // pool. Batch in chunks (parallel within a chunk, sequential across
@@ -887,8 +893,8 @@ export function registerApiTriggers(
       // reads correctly.
       const SUMMARY_FANOUT = 100;
       const summaries: Array<SessionSummary | null> = [];
-      for (let batch = 0; batch < filtered.length; batch += SUMMARY_FANOUT) {
-        const chunk = filtered.slice(batch, batch + SUMMARY_FANOUT);
+      for (let batch = 0; batch < selected.length; batch += SUMMARY_FANOUT) {
+        const chunk = selected.slice(batch, batch + SUMMARY_FANOUT);
         const results = await Promise.all(
           chunk.map((s) =>
             kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
@@ -896,7 +902,7 @@ export function registerApiTriggers(
         );
         summaries.push(...results);
       }
-      const withSummary = filtered.map((s, i) =>
+      const withSummary = selected.map((s, i) =>
         summaries[i] ? { ...s, summary: summaries[i] } : s,
       );
       return { status_code: 200, body: { sessions: withSummary } };

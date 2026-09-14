@@ -8,15 +8,65 @@ import type {
   GraphNode,
   GraphEdge,
 } from "../types.js";
-import { getVisibleTools } from "./tools-registry.js";
+import { getAllTools, getVisibleTools } from "./tools-registry.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
+import { VERSION } from "../version.js";
 
 type McpResponse = {
   status_code: number;
   headers?: Record<string, string>;
   body: unknown;
 };
+
+const REMOTE_MCP_TOOL_NAMES = new Set([
+  "memory_recall",
+  "memory_file_history",
+  "memory_sessions",
+  "memory_smart_search",
+  "memory_timeline",
+  "memory_commit_lookup",
+  "memory_graph_query",
+  "memory_lesson_recall",
+]);
+
+const REMOTE_MCP_PROTOCOL_VERSIONS = [
+  "2026-07-28",
+  "2025-11-25",
+  "2025-06-18",
+  "2025-03-26",
+  "2024-11-05",
+];
+
+function remoteMcpTools() {
+  return getAllTools()
+    .filter((tool) => REMOTE_MCP_TOOL_NAMES.has(tool.name))
+    .map((tool) => ({
+      ...tool,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    }));
+}
+
+function rpcResult(id: unknown, result: unknown): McpResponse {
+  return { status_code: 200, body: { jsonrpc: "2.0", id, result } };
+}
+
+function rpcError(
+  id: unknown,
+  code: number,
+  message: string,
+  statusCode = 200,
+): McpResponse {
+  return {
+    status_code: statusCode,
+    body: { jsonrpc: "2.0", id: id ?? null, error: { code, message } },
+  };
+}
 
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -44,6 +94,7 @@ export function registerMcpEndpoints(
   sdk: ISdk,
   kv: StateKV,
   secret?: string,
+  remoteSecret?: string,
 ): void {
   function checkAuth(
     req: ApiRequest,
@@ -258,7 +309,10 @@ export function registerMcpEndpoints(
           }
 
           case "memory_sessions": {
-            const sessions = await kv.list(KV.sessions);
+            const limit = Math.max(1, Math.min(100, asNumber(args.limit, 20) ?? 20));
+            const sessions = (await kv.list<Session>(KV.sessions))
+              .sort((a, b) => (b.startedAt ?? "").localeCompare(a.startedAt ?? ""))
+              .slice(0, limit);
             return {
               status_code: 200,
               body: {
@@ -332,8 +386,8 @@ export function registerMcpEndpoints(
             const result = await sdk.trigger({ function_id: "mem::timeline", payload: {
               anchor: args.anchor,
               project: (args.project as string) || undefined,
-              before: (args.before as number) || 5,
-              after: (args.after as number) || 5,
+              before: Math.max(0, Math.min(50, asNumber(args.before, 5) ?? 5)),
+              after: Math.max(0, Math.min(50, asNumber(args.after, 5) ?? 5)),
             } });
             return {
               status_code: 200,
@@ -1122,7 +1176,7 @@ export function registerMcpEndpoints(
               query: args.query,
               project: args.project,
               minConfidence: args.minConfidence,
-              limit: args.limit,
+              limit: Math.max(1, Math.min(100, asNumber(args.limit, 10) ?? 10)),
             } });
             return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(lessonRecallResult, null, 2) }] } };
           }
@@ -1785,4 +1839,152 @@ export function registerMcpEndpoints(
     function_id: "mcp::prompts::get",
     config: { api_path: "/agentmemory/mcp/prompts/get", http_method: "POST" },
   });
+
+  if (!remoteSecret) return;
+
+  sdk.registerFunction(
+    "mcp::remote",
+    async (req: ApiRequest<Record<string, unknown>>): Promise<McpResponse> => {
+      const auth =
+        req.headers?.["authorization"] || req.headers?.["Authorization"];
+      if (
+        typeof auth !== "string" ||
+        !timingSafeCompare(auth, `Bearer ${remoteSecret}`)
+      ) {
+        return rpcError(null, -32001, "Unauthorized", 401);
+      }
+
+      const body = req.body;
+      if (
+        !body ||
+        typeof body !== "object" ||
+        Array.isArray(body) ||
+        body.jsonrpc !== "2.0" ||
+        typeof body.method !== "string"
+      ) {
+        return rpcError(body && typeof body === "object" ? body.id : null, -32600, "Invalid Request", 400);
+      }
+
+      const id = body.id;
+      const notification = id === undefined || id === null;
+
+      switch (body.method) {
+        case "initialize": {
+          if (notification) return { status_code: 202, body: {} };
+          const params = body.params as { protocolVersion?: unknown } | undefined;
+          const requested = params?.protocolVersion;
+          const legacyVersions = REMOTE_MCP_PROTOCOL_VERSIONS.slice(1);
+          const protocolVersion =
+            typeof requested === "string" && legacyVersions.includes(requested)
+              ? requested
+              : legacyVersions[0];
+          return rpcResult(id, {
+            protocolVersion,
+            capabilities: { tools: { listChanged: false } },
+            serverInfo: { name: "agentmemory", version: VERSION },
+          });
+        }
+
+        case "server/discover":
+          return notification
+            ? { status_code: 202, body: {} }
+            : rpcResult(id, {
+                supportedVersions: [REMOTE_MCP_PROTOCOL_VERSIONS[0]],
+                capabilities: { tools: { listChanged: false } },
+                ttlMs: 60_000,
+                cacheScope: "private",
+              });
+
+        case "notifications/initialized":
+          return { status_code: 202, body: {} };
+
+        case "ping":
+          return notification
+            ? { status_code: 202, body: {} }
+            : rpcResult(id, {});
+
+        case "tools/list":
+          return notification
+            ? { status_code: 202, body: {} }
+            : rpcResult(id, {
+                tools: remoteMcpTools(),
+                ttlMs: 60_000,
+                cacheScope: "private",
+              });
+
+        case "tools/call": {
+          if (notification) return { status_code: 202, body: {} };
+          const params = body.params as
+            | { name?: unknown; arguments?: unknown }
+            | undefined;
+          const name = params?.name;
+          if (typeof name !== "string" || !name) {
+            return rpcError(id, -32602, "Tool name is required");
+          }
+          if (!REMOTE_MCP_TOOL_NAMES.has(name)) {
+            return rpcResult(id, {
+              content: [
+                {
+                  type: "text",
+                  text: `Tool is not exposed by the read-only remote MCP: ${name}`,
+                },
+              ],
+              isError: true,
+            });
+          }
+
+          const args =
+            params?.arguments &&
+            typeof params.arguments === "object" &&
+            !Array.isArray(params.arguments)
+              ? (params.arguments as Record<string, unknown>)
+              : {};
+          const result = (await sdk.trigger({
+            function_id: "mcp::tools::call",
+            payload: {
+              body: { name, arguments: args },
+              headers: secret
+                ? { authorization: `Bearer ${secret}` }
+                : {},
+              query_params: {},
+            },
+          })) as McpResponse;
+
+          if (result.status_code >= 400) {
+            const errorBody = result.body as { error?: unknown } | undefined;
+            const message =
+              typeof errorBody?.error === "string"
+                ? errorBody.error
+                : `Agent Memory tool returned HTTP ${result.status_code}`;
+            return rpcResult(id, {
+              content: [{ type: "text", text: message }],
+              isError: true,
+            });
+          }
+          return rpcResult(id, result.body);
+        }
+
+        default:
+          return notification
+            ? { status_code: 202, body: {} }
+            : rpcError(id, -32601, `Method not found: ${body.method}`);
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "mcp::remote",
+    config: { api_path: "/mcp", http_method: "POST" },
+  });
+
+  sdk.registerFunction("mcp::remote::method-not-allowed", async (): Promise<McpResponse> =>
+    rpcError(null, -32000, "Method not allowed", 405),
+  );
+  for (const http_method of ["GET", "DELETE"]) {
+    sdk.registerTrigger({
+      type: "http",
+      function_id: "mcp::remote::method-not-allowed",
+      config: { api_path: "/mcp", http_method },
+    });
+  }
 }
