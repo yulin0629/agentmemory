@@ -620,7 +620,7 @@ async function main() {
   const SHUTDOWN_DEADLINE_MS = 15_000;
   const shutdown = async () => {
     console.log(`\n[agentmemory] Shutting down...`);
-    const deadline = setTimeout(() => {
+    setTimeout(() => {
       console.warn(
         `[agentmemory] Shutdown exceeded ${SHUTDOWN_DEADLINE_MS}ms (engine unreachable?); exiting without full index flush`,
       );
