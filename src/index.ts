@@ -612,8 +612,21 @@ async function main() {
     bootLog(`Auto-consolidation: enabled (every ${consolidationIntervalMs / 60000}m)`);
   }
 
+  // Every step of shutdown below can await the engine (viewer close, index
+  // save via kv.set, sdk/otel shutdown). When the engine is already gone,
+  // iii-sdk queues the writes and reconnects forever, so without a deadline
+  // the worker hangs until systemd's 90s SIGKILL (observed 2026-09-13/14 on
+  // every stop). Healthy flush is ~3s; 15s leaves headroom for a large index.
+  const SHUTDOWN_DEADLINE_MS = 15_000;
   const shutdown = async () => {
     console.log(`\n[agentmemory] Shutting down...`);
+    const deadline = setTimeout(() => {
+      console.warn(
+        `[agentmemory] Shutdown exceeded ${SHUTDOWN_DEADLINE_MS}ms (engine unreachable?); exiting without full index flush`,
+      );
+      clearWorkerPidfile();
+      process.exit(1);
+    }, SHUTDOWN_DEADLINE_MS);
     healthMonitor.stop();
     dedupMap.stop();
     indexPersistence.stop();
