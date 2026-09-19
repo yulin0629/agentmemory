@@ -13,6 +13,7 @@ import {
   isConsolidationEnabled,
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
+  getSelectiveContextConfig,
 } from "./config.js";
 import {
   createProvider,
@@ -81,6 +82,8 @@ import { registerFacetsFunction } from "./functions/facets.js";
 import { registerVerifyFunction } from "./functions/verify.js";
 import { registerCascadeFunction } from "./functions/cascade.js";
 import { registerLessonsFunctions } from "./functions/lessons.js";
+import { registerSelectiveContextFunctions } from "./functions/selective-context.js";
+import { createJevContextJudge } from "./state/selective-context.js";
 import { registerObsidianExportFunction } from "./functions/obsidian-export.js";
 import { registerReflectFunctions } from "./functions/reflect.js";
 import { registerWorkingMemoryFunctions } from "./functions/working-memory.js";
@@ -323,6 +326,14 @@ async function main() {
   registerFacetsFunction(sdk, kv);
   registerVerifyFunction(sdk, kv);
   registerLessonsFunctions(sdk, kv);
+  const selectiveContext = getSelectiveContextConfig();
+  if (selectiveContext.enabled && selectiveContext.namespace && selectiveContext.apiKey) {
+    registerSelectiveContextFunctions(sdk, kv, {
+      namespace: selectiveContext.namespace,
+      judge: createJevContextJudge(selectiveContext.apiKey),
+    });
+    bootLog(`Selective context: enabled for namespace ${selectiveContext.namespace}`);
+  }
   registerObsidianExportFunction(sdk, kv);
   registerReflectFunctions(sdk, kv, provider);
   registerWorkingMemoryFunctions(sdk, kv, config.tokenBudget);
@@ -537,7 +548,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 130 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 132 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,

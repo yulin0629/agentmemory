@@ -10,6 +10,10 @@ import type { ResilientProvider } from "../providers/resilient.js";
 import { VERSION } from "../version.js";
 import { timingSafeCompare } from "../auth.js";
 import { isSlotsEnabled, isReflectEnabled } from "../functions/slots.js";
+import {
+  contextKnowledgePutSchema,
+  selectiveContextSchema,
+} from "../functions/selective-context.js";
 import { renderViewerDocument } from "../viewer/document.js";
 import { getBoundViewerPort, getViewerSkipped } from "../viewer/server.js";
 import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
@@ -19,6 +23,7 @@ import {
   isConsolidationEnabled,
   isAutoCompressEnabled,
   isContextInjectionEnabled,
+  getSelectiveContextConfig,
   detectEmbeddingProvider,
   detectLlmProviderKind,
   getAgentId,
@@ -109,6 +114,21 @@ function reflectDisabledResponse(): Response {
     flag: "AGENTMEMORY_REFLECT",
     enableHow: "Set AGENTMEMORY_REFLECT=true (in ~/.agentmemory/.env or the shell) and restart. Requires AGENTMEMORY_SLOTS=true.",
     docsHref: "https://github.com/rohitg00/agentmemory#memory-slots",
+  });
+}
+
+function selectiveContextDisabledResponse(): Response {
+  const config = getSelectiveContextConfig();
+  const missing = [
+    !config.enabled ? "AGENTMEMORY_SELECTIVE_CONTEXT=true" : "",
+    !config.namespace ? "AGENTMEMORY_CONTEXT_NAMESPACE" : "",
+    !config.apiKey ? "TYPESAFE_API_KEY" : "",
+  ].filter(Boolean);
+  return flagDisabledResponse({
+    error: "Selective context is not configured",
+    flag: "AGENTMEMORY_SELECTIVE_CONTEXT",
+    enableHow: `Set ${missing.join(", ")} and restart.`,
+    docsHref: "https://github.com/rohitg00/agentmemory#selective-context",
   });
 }
 
@@ -3264,6 +3284,52 @@ export function registerApiTriggers(
     return { status_code: 200, body: result };
   });
   sdk.registerTrigger({ type: "http", function_id: "api::lesson-delete", config: { api_path: "/agentmemory/lessons/delete", http_method: "POST" } });
+
+  // This is intentionally a separate API from lessons: only callers that
+  // attest an exact user-confirmed source event can add recallable context.
+  sdk.registerFunction("api::context-knowledge-put", async (req: ApiRequest) => {
+    const secretErr = requireConfiguredSecret(secret, "selective context");
+    if (secretErr) return secretErr;
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    if (!getSelectiveContextConfig().enabled || !getSelectiveContextConfig().namespace
+      || !getSelectiveContextConfig().apiKey) {
+      return selectiveContextDisabledResponse();
+    }
+    const parsed = contextKnowledgePutSchema.safeParse(req.body);
+    if (!parsed.success) return { status_code: 400, body: { error: "invalid_knowledge" } };
+    const result = await sdk.trigger({
+      function_id: "mem::context-knowledge-put",
+      payload: parsed.data,
+    }) as { success?: boolean; error?: string; action?: string };
+    if (result.success === false) {
+      const statusCode = result.error === "revision_conflict" || result.error === "event_conflict"
+        ? 409
+        : result.error === "catalog_capacity" ? 429 : 400;
+      return { status_code: statusCode, body: result };
+    }
+    return { status_code: result.action === "saved" ? 201 : 200, body: result };
+  });
+  sdk.registerTrigger({ type: "http", function_id: "api::context-knowledge-put", config: { api_path: "/agentmemory/context-knowledge", http_method: "POST" } });
+
+  sdk.registerFunction("api::selective-context", async (req: ApiRequest) => {
+    const secretErr = requireConfiguredSecret(secret, "selective context");
+    if (secretErr) return secretErr;
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    if (!getSelectiveContextConfig().enabled || !getSelectiveContextConfig().namespace
+      || !getSelectiveContextConfig().apiKey) {
+      return selectiveContextDisabledResponse();
+    }
+    const parsed = selectiveContextSchema.safeParse(req.body);
+    if (!parsed.success) return { status_code: 400, body: { error: "invalid_request" } };
+    const result = await sdk.trigger({
+      function_id: "mem::selective-context",
+      payload: parsed.data,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({ type: "http", function_id: "api::selective-context", config: { api_path: "/agentmemory/selective-context", http_method: "POST" } });
 
   sdk.registerFunction("api::obsidian-export", async (req: ApiRequest) => {
     const denied = checkAuth(req, secret);

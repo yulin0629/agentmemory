@@ -1597,6 +1597,10 @@ Create `~/.agentmemory/.env`:
                                    #   log only per Claude Code docs)
                                    # Observations are still captured via
                                    # PostToolUse regardless of this flag.
+# AGENTMEMORY_SELECTIVE_CONTEXT=false  # OFF by default. Enables evidence-scoped recall only; requires all three values below and a restart.
+# AGENTMEMORY_CONTEXT_NAMESPACE=personal # Fixed server namespace; callers cannot choose it per request.
+# TYPESAFE_API_KEY=...                  # Fast Jev judge key. Keep it out of source control.
+# AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=false # OFF by default. Prompt-submit injects at most two Jev-selected, source-exact spans.
 # GRAPH_EXTRACTION_ENABLED=false
 # AGENTMEMORY_LLM_NOTHINK=1        # Local reasoning models only: ask the
                                    # model to skip its hidden thinking pass
@@ -1622,7 +1626,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-130 endpoints on port `3111` make up the REST API, which binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers. Setting `AGENTMEMORY_MCP_BEARER_TOKEN` additionally enables the standard read-only remote MCP route at `/mcp`; it is deliberately outside the `/agentmemory/*` REST surface.
+132 endpoints on port `3111` make up the REST API, which binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers. Setting `AGENTMEMORY_MCP_BEARER_TOKEN` additionally enables the standard read-only remote MCP route at `/mcp`; it is deliberately outside the `/agentmemory/*` REST surface.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1638,6 +1642,8 @@ Create `~/.agentmemory/.env`:
 | `POST` | `/agentmemory/remember` | Save to long-term memory |
 | `POST` | `/agentmemory/forget` | Delete observations |
 | `POST` | `/agentmemory/enrich` | File context + memories + bugs |
+| `POST` | `/agentmemory/context-knowledge` | Save a user-confirmed, evidence-backed context record |
+| `POST` | `/agentmemory/selective-context` | Return at most two applicable source-exact context spans |
 | `GET` | `/agentmemory/profile` | Project profile |
 | `GET` | `/agentmemory/export` | Export all data |
 | `POST` | `/agentmemory/import` | Import from JSON |

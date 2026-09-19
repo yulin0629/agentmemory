@@ -10,6 +10,7 @@ async function runHook(
   payload: Record<string, unknown>,
   env: Record<string, string> = {},
   responseDelayMs = 0,
+  responseByPath: Record<string, unknown> = {},
 ) {
   const requests: { path: string; body: Record<string, unknown> }[] = [];
   const server = createServer((req, res) => {
@@ -25,7 +26,7 @@ async function runHook(
           body: raw ? (JSON.parse(raw) as Record<string, unknown>) : {},
         });
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ context: "remembered context" }));
+        res.end(JSON.stringify(responseByPath[req.url ?? ""] ?? { context: "remembered context" }));
       }, responseDelayMs);
     });
   });
@@ -120,6 +121,28 @@ describe("Codex hook runtime contract", () => {
     );
     expect(result.requests[0]?.path).toBe("/agentmemory/observe");
     expect(result.stdout).toBe("");
+  });
+
+  it("UserPromptSubmit injects only an explicitly selected context result", async () => {
+    const result = await runHook(
+      "prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { turn_id: "turn-1", prompt: "draw the flow" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" },
+      0,
+      {
+        "/agentmemory/selective-context": {
+          status: "selected",
+          spans: [{ text: "Use ASCII diagrams in TUI." }],
+        },
+      },
+    );
+    expect(result.requests.some(request => request.path === "/agentmemory/selective-context")).toBe(true);
+    expect(JSON.parse(result.stdout)).toEqual({
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
+        additionalContext: "[Verified background relevant to this request]\n- Use ASCII diagrams in TUI.",
+      },
+    });
   });
 
   it("PostToolUse waits for a remote observation response", async () => {

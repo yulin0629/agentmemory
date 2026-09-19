@@ -449,6 +449,27 @@ export function isContextInjectionEnabled(): boolean {
   return getMergedEnv()["AGENTMEMORY_INJECT_CONTEXT"] === "true";
 }
 
+/**
+ * Selective context is deliberately separate from the legacy broad context
+ * injection switch. It needs a fixed namespace and a dedicated fast judge so
+ * an accidental environment toggle cannot feed an unbounded lesson corpus
+ * into every turn.
+ */
+export function getSelectiveContextConfig(): {
+  enabled: boolean;
+  namespace?: string;
+  apiKey?: string;
+} {
+  const env = getMergedEnv();
+  const namespace = env["AGENTMEMORY_CONTEXT_NAMESPACE"]?.trim() || undefined;
+  const apiKey = env["TYPESAFE_API_KEY"]?.trim() || undefined;
+  return {
+    enabled: env["AGENTMEMORY_SELECTIVE_CONTEXT"] === "true",
+    namespace,
+    apiKey,
+  };
+}
+
 export function getConsolidationDecayDays(): number {
   return safeParseInt(getMergedEnv()["CONSOLIDATION_DECAY_DAYS"], 30);
 }

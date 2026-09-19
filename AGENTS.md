@@ -93,8 +93,8 @@ case "memory_your_tool": {
 ### Hook Scripts
 Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import). They read JSON from stdin, make HTTP calls to the REST API, and exit. There are two patterns depending on whether Claude Code consumes the script's stdout:
 
-- **Context-injecting hooks** (`pre-tool-use`, `pre-compact`, `session-start`) write recalled context to stdout for Claude Code to inject. These MUST use `try/catch` with `await fetch(..., { signal: AbortSignal.timeout(N) })` — the script has to wait for the response before exiting, and the timeout is the only bound on hang time.
-- **Telemetry-only hooks** (`notification`, `post-tool-failure`, `prompt-submit`, `stop`, `session-end`, `subagent-start`, `subagent-stop`, `task-completed`) write nothing to stdout. These use fire-and-forget `fetch(..., { signal: AbortSignal.timeout(N) }).catch(() => {})` paired with an unref'd `setTimeout(() => process.exit(0), timeout)`. Use 1500ms whenever losing the request matters and the path may be slow: `prompt-submit`, `stop`, and `session-end` all qualify, because a remote `AGENTMEMORY_URL` can take more than 500ms to acknowledge. **Request count is not the criterion — delivery-path latency is.** A hook that sends one request to a slow host drops it just as readily as one that sends three; 500ms is only safe for hooks whose loss is inconsequential (`notification`, `post-tool-failure`, `subagent-start`, `subagent-stop`, `task-completed`). **`post-tool-use` is the delivery-guaranteed exception:** it MUST await its single observation request with the existing 3-second abort bound because exiting after a short timer can drop tool observations on higher-latency relays.
+- **Context-injecting hooks** (`pre-tool-use`, `pre-compact`, `session-start`) write recalled context to stdout for Claude Code to inject. `prompt-submit` joins this group only when `AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=true`; it must await the bounded selective-context response and otherwise remain silent. These paths MUST use `try/catch` with `await fetch(..., { signal: AbortSignal.timeout(N) })` — the timeout is the only bound on hang time.
+- **Telemetry-only hooks** (`notification`, `post-tool-failure`, `prompt-submit` by default, `stop`, `session-end`, `subagent-start`, `subagent-stop`, `task-completed`) write nothing to stdout. These use fire-and-forget `fetch(..., { signal: AbortSignal.timeout(N) }).catch(() => {})` paired with an unref'd `setTimeout(() => process.exit(0), timeout)`. Use 1500ms whenever losing the request matters and the path may be slow: `prompt-submit`, `stop`, and `session-end` all qualify, because a remote `AGENTMEMORY_URL` can take more than 500ms to acknowledge. **Request count is not the criterion — delivery-path latency is.** A hook that sends one request to a slow host drops it just as readily as one that sends three; 500ms is only safe for hooks whose loss is inconsequential (`notification`, `post-tool-failure`, `subagent-start`, `subagent-stop`, `task-completed`). **`post-tool-use` is the delivery-guaranteed exception:** it MUST await its single observation request with the existing 3-second abort bound because exiting after a short timer can drop tool observations on higher-latency relays.
 
 ## Coding Standards
 
@@ -117,7 +117,7 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 ## Current Stats (v0.9.29)
 
 - 54 MCP tools (8 visible by default, `AGENTMEMORY_TOOLS=all` for all)
-- 130 REST endpoints
+- 132 REST endpoints
 - 6 MCP resources, 3 MCP prompts
 - 12 hooks, 17 skills
 - 260+ iii functions

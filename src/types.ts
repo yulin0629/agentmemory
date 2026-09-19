@@ -628,6 +628,7 @@ export interface AuditEntry {
     | "lesson_recall"
     | "lesson_strengthen"
     | "lesson_delete"
+    | "context_knowledge_put"
     | "obsidian_export"
     | "reflect"
     | "insight_search"
@@ -846,6 +847,12 @@ export interface Lesson {
   lastDecayedAt?: string;
   decayRate: number;
   deleted?: boolean;
+}
+
+export interface ContextKnowledgeCatalog {
+  revision: number;
+  records: import("./state/selective-context.js").ContextKnowledge[];
+  events: Record<string, string>;
 }
 
 export interface Insight {
