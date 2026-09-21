@@ -38,9 +38,9 @@ export PATH="$HOME/.local/bin:$PATH"  # add to ~/.zshrc or ~/.bashrc for persist
 
 ## Quickstart
 
-### Selective recall (synthetic fixtures, paid Jev calls)
+### Selective recall (isolated fixtures, paid Jev calls)
 
-The 24 cases in `test/selective-context-live.test.ts` require explicit opt-in and use no running agentmemory server or persistent memory store. Normal `npm test` skips these calls. They cover answer-only formatting, missing-information fallbacks, explicit overrides, restricted sources, continuations, and irrelevant or repeated background. Compatibility is a categorical decision: only `compatible` passes; `overridden`, `source_restricted`, and `unclear` remain silent. Relevance still requires 0.7.
+The 32 cases in `test/selective-context-live.test.ts` require explicit opt-in and use no running agentmemory server or persistent memory store. They use synthetic facts and a separate catalog of verbatim user-confirmed rules, with fixture-only IDs and timestamps. Normal `npm test` skips these calls. They cover answer-only formatting, missing-information fallbacks, explicit overrides, restricted sources, continuations, deliverable-format rules, and irrelevant or repeated background. Compatibility is a categorical decision: only `compatible` passes; `overridden`, `source_restricted`, and `unclear` remain silent. Relevance still requires 0.7. When a prompt both restricts sources and overrides a format, either applicable blocking category is accepted by the test; neither permits injection.
 
 ```sh
 AGENTMEMORY_LIVE_JEV_EVAL=true \
