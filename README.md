@@ -1636,7 +1636,17 @@ With selective context enabled on the server and the prompt hook opted in, a liv
 
 The producer reads the stored user event before observation compression, preserves the full prompt, session ID and observation ID, and uses only an exact source span (up to 1,200 characters). Scope comes from the existing session's project label; shared labels share scope. It does not create a global preference. Ordinary confirmations such as `好`, `1`, and `照做`, quoted commands, and tool output do not enter this path.
 
-Jev classifies an explicit request before activation. Task-only, unclear, quoted-but-unadopted, and conflicting requests remain non-recallable candidates. Existing-rule replacement still requires review through the context-knowledge API; capture does not automatically supersede a rule. Repeats do not duplicate knowledge or reactivate withdrawn records. A candidate caused by an unavailable judge can be retried by another explicit save request; other candidates are not automatically promoted.
+Jev classifies an explicit request before activation. Task-only, unclear, quoted-but-unadopted, and conflicting save requests remain non-recallable candidates. Repeats do not duplicate knowledge or reactivate withdrawn records. A candidate caused by an unavailable judge can be retried by another explicit save request; other candidates are not automatically promoted.
+
+To explicitly replace a rule, submit this three-line form, with each rule on one line:
+
+```text
+確認取代：
+舊規則：報告使用英文。
+新規則：報告使用繁體中文。
+```
+
+The old text must exactly match the sole span of exactly one active rule in the current project. Jev checks the new rule against the remaining active rules; only a clear project rule proceeds. One catalog write retains the old record as `superseded` and adds the new active record, preserving both sources and `supersedes`/`supersededBy` links. An intact direct replacement can be replayed without another write. Ambiguous, missing, changed, cross-project, or non-active targets, full catalogs, failed judgments, and concurrent catalog changes leave the old rule untouched. This creates a new history record and consumes one of the pilot's 12 record slots; it does not automatically reconcile arbitrary prose or prune old records.
 
 An opted-in prompt hook waits up to five seconds for an explicit-save acknowledgement and distinguishes active, candidate, inactive, and unconfirmed writes. Ordinary recall keeps its two-second API deadline. The underlying iii file store writes asynchronously: an acknowledgement confirms the store accepted the write, not crash-safe disk persistence. A persistence test must wait for the record to reach disk before restarting the engine. The pilot catalog still permits at most 12 records and 256 change events per namespace.
 

@@ -3,6 +3,8 @@ export interface ContextKnowledge {
   revision: string;
   status: "candidate" | "active" | "superseded" | "retracted";
   captureDisposition?: "project_rule" | "task_only" | "unclear" | "unavailable";
+  supersedes?: { id: string; revision: string };
+  supersededBy?: string;
   scope: { namespace: string; project?: string; task?: string };
   evidence: { eventId: string; text: string; adoptedAt: string; sessionId?: string };
   spans: Array<{ id: string; text: string }>;

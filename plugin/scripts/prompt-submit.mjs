@@ -121,7 +121,7 @@ function previousContext(path, sessionId, prompt) {
 //#region src/state/explicit-memory.ts
 /** Only an explicit, top-level save command enters the knowledge-writing path. */
 function isRememberRequest(prompt) {
-	return typeof prompt === "string" && /^(?:請)?記住[：:]/u.test(prompt.trim());
+	return typeof prompt === "string" && /^(?:(?:請)?記住|確認取代)[：:]/u.test(prompt.trim());
 }
 //#endregion
 //#region src/hooks/prompt-submit.ts
@@ -190,7 +190,8 @@ async function main() {
 		try {
 			const response = await observation;
 			const saved = (response.ok ? await response.json() : null)?.knowledgeCapture;
-			if (saved?.success && saved.status === "active") notice = "[Memory update] This rule is stored for this project, with its source event. Future recall is relevance-filtered; this is not a global rule.";
+			if (saved?.success && saved.action === "replaced" && saved.status === "active") notice = "[Memory update] The exact old project rule was superseded by the new rule. Both sources and their replacement link are retained. Only the new rule is eligible for future recall.";
+			else if (saved?.success && saved.status === "active") notice = "[Memory update] This rule is stored for this project, with its source event. Future recall is relevance-filtered; this is not a global rule.";
 			else if (saved?.success && saved.status === "candidate") notice = "[Memory update] This rule is a candidate only. It is not active and will not be automatically recalled.";
 			else if (saved?.success) notice = "[Memory update] An existing inactive record was left unchanged. This request did not reactivate it.";
 		} catch {}

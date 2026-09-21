@@ -5,7 +5,7 @@ import type { ContextKnowledgeCatalog, RawObservation } from "../types.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { selectContext, type ContextJudge, type ContextKnowledge } from "../state/selective-context.js";
-import { explicitMemoryText, type CaptureJudge } from "../state/explicit-memory.js";
+import { explicitMemoryText, explicitReplacement, type CaptureJudge } from "../state/explicit-memory.js";
 import { safeAudit } from "./audit.js";
 
 const id = z.string().trim().min(1).max(200);
@@ -13,6 +13,8 @@ const knowledgeSchema = z.object({
   id, revision: id,
   status: z.enum(["candidate", "active", "superseded", "retracted"]),
   captureDisposition: z.enum(["project_rule", "task_only", "unclear", "unavailable"]).optional(),
+  supersedes: z.object({ id, revision: id }).strict().optional(),
+  supersededBy: id.optional(),
   scope: z.object({ namespace: id, project: id.optional(), task: id.optional() }).strict(),
   evidence: z.object({ eventId: id, text: z.string().min(1).max(12000),
     adoptedAt: z.iso.datetime(), sessionId: id.optional() }).strict(),
@@ -106,6 +108,70 @@ export function registerSelectiveContextFunctions(
     return save(parsed.data.knowledge, parsed.data.expectedRevision);
   });
 
+  const replace = async (source: RawObservation, project: string, change: { oldText: string; newText: string }) => {
+    const catalog = await read();
+    const inScope = (r: ContextKnowledge) => r.scope.namespace === namespace && r.scope.project === project && !r.scope.task;
+    const exact = (r: ContextKnowledge, text: string) => r.spans.length === 1 && r.spans[0]!.text === text;
+    const matches = catalog.records.filter(r => inScope(r) && r.status === "active" && exact(r, change.oldText));
+    if (matches.length !== 1) {
+      // Replay only an intact, direct replacement pair, never an older link in a chain.
+      const pairs = catalog.records.filter(r => inScope(r) && r.status === "superseded" && exact(r, change.oldText))
+        .flatMap(old => catalog.records.filter(next => inScope(next) && next.status === "active"
+          && exact(next, change.newText) && old.supersededBy === next.id
+          && next.supersedes?.id === old.id && next.supersedes.revision === old.revision));
+      if (matches.length === 0 && pairs.length === 1) {
+        return { success: true, action: "existing", status: "active", knowledgeId: pairs[0]!.id };
+      }
+      return { success: false, error: matches.length ? "ambiguous_old_rule" : "old_rule_not_found" };
+    }
+    const old = matches[0]!;
+    if (catalog.records.some(r => inScope(r) && r.id !== old.id && r.status === "active" && exact(r, change.newText))) {
+      return { success: false, error: "new_rule_already_active" };
+    }
+    const otherRules = catalog.records.filter(r => r.id !== old.id && r.status === "active"
+      && r.scope.namespace === namespace && (!r.scope.project || r.scope.project === project))
+      .flatMap(r => r.spans.map(span => span.text));
+    if (otherRules.join("\n").length > 6000) return { success: false, error: "comparison_budget" };
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // The exact old rule was resolved mechanically. Judge only the new rule
+      // against remaining rules; the original confirmation is preserved below.
+      const disposition = await Promise.race([
+        options.captureJudge!(`記住：${change.newText}`, otherRules, controller.signal),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => { controller.abort(); reject(new Error("Replacement deadline")); }, 2500);
+        }),
+      ]);
+      if (disposition !== "project_rule") return { success: false, error: "replacement_needs_review", disposition };
+    } catch { return { success: false, error: "replacement_unavailable" }; }
+    finally { if (timer) clearTimeout(timer); }
+    const next = knowledgeSchema.safeParse({
+      id: fingerprintId("replacement", JSON.stringify([namespace, project, old.id, old.revision, source.id])),
+      revision: fingerprintId("capture", source.id), status: "active", captureDisposition: "project_rule",
+      scope: { namespace, project }, supersedes: { id: old.id, revision: old.revision },
+      evidence: { eventId: source.id, sessionId: source.sessionId, text: source.userPrompt, adoptedAt: now() },
+      spans: [{ id: "user-text", text: change.newText }],
+    });
+    if (!next.success) return { success: false, error: "invalid_save_request" };
+    return withKeyedLock(`context-knowledge:${key}`, async () => {
+      const latest = await read();
+      if (latest.revision !== catalog.revision) return { success: false, error: "revision_conflict" };
+      const eventKey = fingerprintId("evt", source.id);
+      if (latest.events[eventKey]) return { success: false, error: "event_conflict" };
+      if (latest.records.length >= 12 || Object.keys(latest.events).length >= 256) return { success: false, error: "catalog_capacity" };
+      await kv.set(KV.contextKnowledge, key, {
+        revision: latest.revision + 1,
+        records: [...latest.records.map(r => r.id === old.id ? { ...r, status: "superseded" as const, supersededBy: next.data.id } : r), next.data],
+        events: { ...latest.events, [eventKey]: fingerprintId("change", JSON.stringify(next.data)) },
+      } satisfies ContextKnowledgeCatalog);
+      await safeAudit(kv, "context_knowledge_put", "mem::context-knowledge-capture", [old.id, next.data.id], {
+        action: "replaced", evidenceEventId: source.id, previousRevision: old.revision, catalogRevision: latest.revision + 1,
+      });
+      return { success: true, action: "replaced", status: "active", knowledgeId: next.data.id, previousKnowledgeId: old.id };
+    });
+  };
+
   sdk.registerFunction("mem::context-knowledge-capture", async (input: unknown) => {
     const parsed = z.object({ sessionId: id, observationId: id, ...workerMetadata }).strict().safeParse(input);
     if (!parsed.success || !options.captureJudge) return { success: false, error: "capture_unavailable" };
@@ -117,9 +183,12 @@ export function registerSelectiveContextFunctions(
       || (source.raw as { explicitMemoryRequest?: unknown } | null)?.explicitMemoryRequest !== true) {
       return { success: false, error: "unverified_source" };
     }
-    const text = explicitMemoryText(source.userPrompt);
     const project = id.safeParse(session?.project);
-    if (!text || !project.success) return { success: false, error: "invalid_save_request" };
+    if (!project.success) return { success: false, error: "invalid_save_request" };
+    const replacement = explicitReplacement(source.userPrompt);
+    if (replacement) return replace(source, project.data, replacement);
+    const text = explicitMemoryText(source.userPrompt);
+    if (!text) return { success: false, error: "invalid_save_request" };
     const knowledgeId = fingerprintId("user-rule", JSON.stringify([namespace, project.data, text]));
     const catalog = await read();
     const existing = catalog.records.find(r => r.id === knowledgeId);

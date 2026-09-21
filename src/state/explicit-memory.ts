@@ -1,10 +1,19 @@
 /** Only an explicit, top-level save command enters the knowledge-writing path. */
 export function isRememberRequest(prompt: unknown): prompt is string {
-  return typeof prompt === "string" && /^(?:請)?記住[：:]/u.test(prompt.trim());
+  return typeof prompt === "string" && /^(?:(?:請)?記住|確認取代)[：:]/u.test(prompt.trim());
+}
+
+export function explicitReplacement(prompt: unknown): { oldText: string; newText: string } | null {
+  if (typeof prompt !== "string" || prompt.length > 12000 || /\[REDACTED(?:_SECRET)?\]/.test(prompt)) return null;
+  const match = /^確認取代[：:]\s*\n舊規則[：:]([^\r\n]+)\r?\n新規則[：:]([^\r\n]+)$/u.exec(prompt.trim());
+  if (!match) return null;
+  const oldText = match[1]!.trim(), newText = match[2]!.trim();
+  if (!oldText || !newText || oldText === newText || oldText.length > 1200 || newText.length > 1200) return null;
+  return { oldText, newText };
 }
 
 export function explicitMemoryText(prompt: unknown): string | null {
-  if (!isRememberRequest(prompt) || prompt.length > 12000) return null;
+  if (!isRememberRequest(prompt) || !/^(?:請)?記住[：:]/u.test(prompt.trim()) || prompt.length > 12000) return null;
   const text = prompt.trim().replace(/^(?:請)?記住[：:]/u, "").trim();
   if (!text || text.length > 1200 || /\[REDACTED(?:_SECRET)?\]/.test(prompt)) return null;
   return text;

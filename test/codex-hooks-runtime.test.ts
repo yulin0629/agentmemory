@@ -213,6 +213,16 @@ describe("Codex hook runtime contract", () => {
     expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("Storage could not be confirmed");
   });
 
+  it("UserPromptSubmit marks explicit replacements and reports only confirmed success", async () => {
+    const result = await runHook("prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { prompt: "確認取代：\n舊規則：報告用英文。\n新規則：報告用中文。" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 0,
+      { "/agentmemory/observe": { knowledgeCapture: { success: true, status: "active", action: "replaced" } } });
+    expect(result.requests.map(r => r.path)).toEqual(["/agentmemory/observe"]);
+    expect(result.requests[0]!.body.data).toMatchObject({ explicitMemoryRequest: true });
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("old project rule was superseded");
+  });
+
   it.each([
     ["post-tool-use.mjs", "PostToolUse", { turn_id: "turn-1", tool_use_id: "tool-1", tool_name: "Bash", tool_input: { command: "pwd" }, tool_response: "ok" }, "/agentmemory/observe"],
     ["stop.mjs", "Stop", { turn_id: "turn-1", stop_hook_active: false, last_assistant_message: "done" }, "/agentmemory/session/end"],

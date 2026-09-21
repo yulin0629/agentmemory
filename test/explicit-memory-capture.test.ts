@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerSelectiveContextFunctions } from "../src/functions/selective-context.js";
 import { registerObserveFunction } from "../src/functions/observe.js";
-import { explicitMemoryText, isRememberRequest, type CaptureJudge } from "../src/state/explicit-memory.js";
+import { explicitMemoryText, explicitReplacement, isRememberRequest, type CaptureJudge } from "../src/state/explicit-memory.js";
 import { KV } from "../src/state/schema.js";
 import { DedupMap } from "../src/functions/dedup.js";
 import type { ContextJudge } from "../src/state/selective-context.js";
@@ -51,6 +51,85 @@ function setup(captureJudge: CaptureJudge = async () => "project_rule", enabled 
 
 describe("explicit memory capture", () => {
   beforeEach(() => vi.clearAllMocks());
+
+  const replacement = "確認取代：\n舊規則：報告使用英文。\n新規則：報告使用繁體中文。";
+
+  it("replaces an exact active rule atomically and preserves both sources", async () => {
+    const judge = vi.fn<CaptureJudge>(async () => "project_rule");
+    const app = setup(judge);
+    const first = await app.observe("記住：報告使用英文。");
+    const result = await app.observe(replacement);
+    expect(result.knowledgeCapture).toMatchObject({ success: true, action: "replaced", status: "active" });
+    const catalog = (await app.catalog())!;
+    const old = catalog.records.find(r => r.status === "superseded")!;
+    const next = catalog.records.find(r => r.status === "active")!;
+    expect(old.evidence.eventId).toBe(first.observationId);
+    expect(old.evidence.text).toBe("記住：報告使用英文。");
+    expect(old.supersededBy).toBe(next.id);
+    expect(next.supersedes).toEqual({ id: old.id, revision: old.revision });
+    expect(next.evidence).toMatchObject({ text: replacement, eventId: result.observationId, sessionId: "session-a" });
+    expect(judge.mock.calls[1]![1]).toEqual([]);
+    const recall = await app.call("mem::selective-context", { prompt: "寫報告", project: "project-a" });
+    expect(recall.spans.map((s: { text: string }) => s.text)).toEqual(["報告使用繁體中文。"]);
+    expect((await app.observe(replacement)).knowledgeCapture.action).toBe("existing");
+    expect(judge).toHaveBeenCalledTimes(2);
+    expect((await app.observe("記住：報告使用英文。")).knowledgeCapture.status).toBe("superseded");
+    expect((await app.catalog())!.records).toHaveLength(2);
+  });
+
+  it.each(["task_only", "unclear", "unavailable"] as const)("leaves the old rule unchanged when replacement is %s", async verdict => {
+    const judge = vi.fn<CaptureJudge>().mockResolvedValueOnce("project_rule");
+    if (verdict === "unavailable") judge.mockRejectedValueOnce(new Error("offline"));
+    else judge.mockResolvedValueOnce(verdict);
+    const app = setup(judge);
+    await app.observe("記住：報告使用英文。");
+    const before = JSON.stringify(await app.catalog());
+    expect((await app.observe(replacement)).knowledgeCapture.success).toBe(false);
+    expect(JSON.stringify(await app.catalog())).toBe(before);
+  });
+
+  it("rejects missing, cross-project, ambiguous, and malformed replacement targets", async () => {
+    const app = setup();
+    await app.observe("記住：報告使用英文。");
+    expect((await app.observe(replacement, "session-other", "other-project")).knowledgeCapture.error).toBe("old_rule_not_found");
+    expect(explicitReplacement("確認取代：\n舊規則：報告使用英文。\n新規則：")).toBeNull();
+    expect(explicitReplacement("> " + replacement)).toBeNull();
+    expect(explicitMemoryText(replacement)).toBeNull();
+    const catalog = (await app.catalog())!;
+    const old = catalog.records[0]!;
+    await app.call("mem::context-knowledge-put", { expectedRevision: catalog.revision, confirmedByUser: true,
+      knowledge: { ...old, id: "duplicate", evidence: { ...old.evidence, eventId: "another-source" } } });
+    expect((await app.observe(replacement)).knowledgeCapture.error).toBe("ambiguous_old_rule");
+    expect((await app.catalog())!.records.every(r => r.status === "active")).toBe(true);
+  });
+
+  it("does not apply a replacement classified against an outdated catalog", async () => {
+    let app: ReturnType<typeof setup>;
+    app = setup(async prompt => {
+      if (prompt.includes("繁體中文")) {
+        const catalog = (await app.catalog())!;
+        const old = catalog.records[0]!;
+        await app.call("mem::context-knowledge-put", { expectedRevision: catalog.revision, confirmedByUser: true,
+          knowledge: { ...old, revision: "edited", evidence: { ...old.evidence, eventId: "edit" } } });
+      }
+      return "project_rule";
+    });
+    await app.observe("記住：報告使用英文。");
+    expect((await app.observe(replacement)).knowledgeCapture.error).toBe("revision_conflict");
+    expect((await app.catalog())!.records).toHaveLength(1);
+    expect((await app.catalog())!.records[0]!.status).toBe("active");
+  });
+
+  it("checks the replacement against remaining rules and refuses a full catalog", async () => {
+    const seen: string[][] = [];
+    const app = setup(async (_prompt, rules) => { seen.push(rules); return "project_rule"; });
+    await app.observe("記住：報告使用英文。");
+    for (let n = 0; n < 11; n++) await app.observe(`記住：規則 ${n}。`);
+    expect((await app.observe(replacement)).knowledgeCapture.error).toBe("catalog_capacity");
+    expect(seen.at(-1)).toHaveLength(11);
+    expect(seen.at(-1)).not.toContain("報告使用英文。");
+    expect((await app.catalog())!.records.every(r => r.status === "active")).toBe(true);
+  });
 
   it.each(["好", "1", "照做", "請記得處理這個 bug", "> 記住：別人的規則", "```\n記住：引用文字\n```"])("does not turn %s into a save command", prompt => {
     expect(isRememberRequest(prompt)).toBe(false);
