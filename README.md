@@ -1597,10 +1597,10 @@ Create `~/.agentmemory/.env`:
                                    #   log only per Claude Code docs)
                                    # Observations are still captured via
                                    # PostToolUse regardless of this flag.
-# AGENTMEMORY_SELECTIVE_CONTEXT=false  # OFF by default. Enables evidence-scoped recall only; requires all three values below and a restart.
+# AGENTMEMORY_SELECTIVE_CONTEXT=false  # OFF by default. Enables scoped recall and explicit prompt capture; requires AGENTMEMORY_SECRET, namespace, key, and restart.
 # AGENTMEMORY_CONTEXT_NAMESPACE=personal # Fixed server namespace; callers cannot choose it per request.
 # TYPESAFE_API_KEY=...                  # Fast Jev judge key. Keep it out of source control.
-# AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=false # OFF by default. Prompt-submit injects at most two Jev-selected, source-exact spans; waits at most 2s for the API.
+# AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=false # OFF by default. Ordinary recall waits at most 2s; explicit saves wait at most 5s for acknowledgement.
 # When enabled, the hook sends up to four recent dialogue messages (8,000 characters)
 # from a same-session Codex/Claude JSONL transcript to the server and Jev. Tool output
 # is excluded; private tags and recognized secrets are redacted, not all personal data.
@@ -1625,6 +1625,20 @@ Create `~/.agentmemory/.env`:
 # Tool visibility: "all" (54 tools, default) or "core" (8 tools, lean)
 # AGENTMEMORY_TOOLS=core
 ```
+
+### Explicit project memory
+
+With selective context enabled on the server and the prompt hook opted in, a live `UserPromptSubmit` prompt beginning with `記住：` or `請記住：` enters the capture path. The hook marks the observation with `explicitMemoryRequest: true`; historical transcript backfills and unmarked observations do not activate knowledge. For example:
+
+```text
+記住：本專案的回歸測試命令是 npm run test:regression。
+```
+
+The producer reads the stored user event before observation compression, preserves the full prompt, session ID and observation ID, and uses only an exact source span (up to 1,200 characters). Scope comes from the existing session's project label; shared labels share scope. It does not create a global preference. Ordinary confirmations such as `好`, `1`, and `照做`, quoted commands, and tool output do not enter this path.
+
+Jev classifies an explicit request before activation. Task-only, unclear, quoted-but-unadopted, and conflicting requests remain non-recallable candidates. Existing-rule replacement still requires review through the context-knowledge API; capture does not automatically supersede a rule. Repeats do not duplicate knowledge or reactivate withdrawn records. A candidate caused by an unavailable judge can be retried by another explicit save request; other candidates are not automatically promoted.
+
+An opted-in prompt hook waits up to five seconds for an explicit-save acknowledgement and distinguishes active, candidate, inactive, and unconfirmed writes. Ordinary recall keeps its two-second API deadline. The underlying iii file store writes asynchronously: an acknowledgement confirms the store accepted the write, not crash-safe disk persistence. A persistence test must wait for the record to reach disk before restarting the engine. The pilot catalog still permits at most 12 records and 256 change events per namespace.
 
 ---
 

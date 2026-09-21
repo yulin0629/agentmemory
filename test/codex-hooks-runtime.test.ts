@@ -192,6 +192,28 @@ describe("Codex hook runtime contract", () => {
   });
 
   it.each([
+    ["active", "stored for this project"],
+    ["candidate", "candidate only"],
+    ["retracted", "did not reactivate"],
+  ])("UserPromptSubmit reports %s capture without claiming more", async (status, message) => {
+    const result = await runHook("prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { prompt: "記住：報告要附來源。" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 50,
+      { "/agentmemory/observe": { knowledgeCapture: { success: true, status, action: "saved" } } });
+    expect(result.requests.map(r => r.path)).toEqual(["/agentmemory/observe"]);
+    expect(result.requests[0]!.body.data).toMatchObject({ explicitMemoryRequest: true });
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain(message);
+  });
+
+  it("UserPromptSubmit does not claim storage when capture is missing or failed", async () => {
+    const result = await runHook("prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { prompt: "記住：報告要附來源。" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 0,
+      { "/agentmemory/observe": { observationId: "obs-only" } });
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("Storage could not be confirmed");
+  });
+
+  it.each([
     ["post-tool-use.mjs", "PostToolUse", { turn_id: "turn-1", tool_use_id: "tool-1", tool_name: "Bash", tool_input: { command: "pwd" }, tool_response: "ok" }, "/agentmemory/observe"],
     ["stop.mjs", "Stop", { turn_id: "turn-1", stop_hook_active: false, last_assistant_message: "done" }, "/agentmemory/session/end"],
   ])("%s accepts Codex payload, sends telemetry, and stays silent", async (script, event, extra, path) => {

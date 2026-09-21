@@ -5,7 +5,7 @@
 agentmemory is a persistent memory system for AI coding agents, built on iii-engine's three primitives (Worker/Function/Trigger). Everything goes through `registerFunction`/`registerTrigger`/`sdk.trigger()` — never bypass iii-engine with standalone SQLite or in-process alternatives.
 
 - **Engine**: iii-sdk (WebSocket to iii-engine on port 49134)
-- **State**: File-based SQLite via iii-engine's StateModule (`./data/state_store.db`)
+- **State**: iii-engine StateWorker KV; `file_based` uses a directory at `./data/state_store.db/` with asynchronous snapshot writes, not a SQLite file.
 - **Build**: TypeScript → ESM via tsdown, output to `dist/`
 - **Test**: vitest (`npm test` excludes integration tests)
 
@@ -94,6 +94,7 @@ case "memory_your_tool": {
 Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import). They read JSON from stdin, make HTTP calls to the REST API, and exit. There are two patterns depending on whether Claude Code consumes the script's stdout:
 
 - **Context-injecting hooks** (`pre-tool-use`, `pre-compact`, `session-start`) write recalled context to stdout for Claude Code to inject. `prompt-submit` joins this group only when `AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=true`; it must await the bounded selective-context response and otherwise remain silent. These paths MUST use `try/catch` with `await fetch(..., { signal: AbortSignal.timeout(N) })` — the timeout is the only bound on hang time.
+- **Explicit saves**: An opted-in `prompt-submit` beginning with `記住：` or `請記住：` awaits `/observe` for at most 5 seconds and emits only its capture acknowledgement. `mem::context-knowledge-capture` must read the stored user event before compression. Internal iii invocations include `_caller_worker_id`; allow that metadata only in internal schemas, never loosen the public HTTP schemas.
 - **Telemetry-only hooks** (`notification`, `post-tool-failure`, `prompt-submit` by default, `stop`, `session-end`, `subagent-start`, `subagent-stop`, `task-completed`) write nothing to stdout. These use fire-and-forget `fetch(..., { signal: AbortSignal.timeout(N) }).catch(() => {})` paired with an unref'd `setTimeout(() => process.exit(0), timeout)`. Use 1500ms whenever losing the request matters and the path may be slow: `prompt-submit`, `stop`, and `session-end` all qualify, because a remote `AGENTMEMORY_URL` can take more than 500ms to acknowledge. **Request count is not the criterion — delivery-path latency is.** A hook that sends one request to a slow host drops it just as readily as one that sends three; 500ms is only safe for hooks whose loss is inconsequential (`notification`, `post-tool-failure`, `subagent-start`, `subagent-stop`, `task-completed`). **`post-tool-use` is the delivery-guaranteed exception:** it MUST await its single observation request with the existing 3-second abort bound because exiting after a short timer can drop tool observations on higher-latency relays.
 
 ## Coding Standards

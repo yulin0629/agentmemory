@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { resolveProject, hookCwd } from "./_project.js";
 import { previousContext } from "./_previous-context.js";
+import { isRememberRequest } from "../state/explicit-memory.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -68,7 +69,7 @@ async function main() {
   const prompt = typeof data.prompt === "string" ? data.prompt
     : typeof data.userPrompt === "string" ? data.userPrompt : "";
 
-  fetch(`${REST_URL}/agentmemory/observe`, {
+  const observation = fetch(`${REST_URL}/agentmemory/observe`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({
@@ -77,10 +78,32 @@ async function main() {
       project,
       cwd,
       timestamp: new Date().toISOString(),
-      data: { prompt },
+      data: { prompt, ...(SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt)
+        ? { explicitMemoryRequest: true } : {}) },
     }),
-    signal: AbortSignal.timeout(3000),
-  }).catch(() => {});
+    signal: AbortSignal.timeout(SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt) ? 5000 : 3000),
+  });
+
+  if (SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt)) {
+    let notice = "[Memory update] Storage could not be confirmed. Do not claim this request was saved.";
+    try {
+      const response = await observation;
+      const result = response.ok ? await response.json() as {
+        knowledgeCapture?: { success?: boolean; status?: string; action?: string; knowledgeId?: string };
+      } : null;
+      const saved = result?.knowledgeCapture;
+      if (saved?.success && saved.status === "active") {
+        notice = "[Memory update] This rule is stored for this project, with its source event. Future recall is relevance-filtered; this is not a global rule.";
+      } else if (saved?.success && saved.status === "candidate") {
+        notice = "[Memory update] This rule is a candidate only. It is not active and will not be automatically recalled.";
+      } else if (saved?.success) {
+        notice = "[Memory update] An existing inactive record was left unchanged. This request did not reactivate it.";
+      }
+    } catch { /* A missing response is not evidence that storage succeeded. */ }
+    process.stdout.write(contextPayload(data, notice));
+    return;
+  }
+  observation.catch(() => {});
 
   if (SELECTIVE_CONTEXT_INJECT && prompt.trim()) {
     try {

@@ -84,6 +84,7 @@ import { registerCascadeFunction } from "./functions/cascade.js";
 import { registerLessonsFunctions } from "./functions/lessons.js";
 import { registerSelectiveContextFunctions } from "./functions/selective-context.js";
 import { createJevContextJudge } from "./state/selective-context.js";
+import { createJevCaptureJudge } from "./state/explicit-memory.js";
 import { registerObsidianExportFunction } from "./functions/obsidian-export.js";
 import { registerReflectFunctions } from "./functions/reflect.js";
 import { registerWorkingMemoryFunctions } from "./functions/working-memory.js";
@@ -222,6 +223,7 @@ async function main() {
 
   const kv = new StateKV(sdk);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
+  const selectiveContext = getSelectiveContextConfig();
   const remoteMcpSecret = getEnvVar("AGENTMEMORY_MCP_BEARER_TOKEN");
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
@@ -238,7 +240,8 @@ async function main() {
   initMetrics(meterAccessor as ((name: string) => import("@opentelemetry/api").Meter) | undefined);
 
   registerPrivacyFunction(sdk);
-  registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession);
+  registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession,
+    Boolean(secret && selectiveContext.enabled && selectiveContext.namespace && selectiveContext.apiKey));
   registerImageQuotaCleanup(sdk, kv);
   registerVisionSearchFunctions(sdk, kv, imageEmbeddingProvider);
   if (isSlotsEnabled()) {
@@ -326,11 +329,11 @@ async function main() {
   registerFacetsFunction(sdk, kv);
   registerVerifyFunction(sdk, kv);
   registerLessonsFunctions(sdk, kv);
-  const selectiveContext = getSelectiveContextConfig();
   if (selectiveContext.enabled && selectiveContext.namespace && selectiveContext.apiKey) {
     registerSelectiveContextFunctions(sdk, kv, {
       namespace: selectiveContext.namespace,
       judge: createJevContextJudge(selectiveContext.apiKey),
+      captureJudge: secret ? createJevCaptureJudge(selectiveContext.apiKey) : undefined,
     });
     bootLog(`Selective context: enabled for namespace ${selectiveContext.namespace}`);
   }

@@ -118,6 +118,12 @@ function previousContext(path, sessionId, prompt) {
 	}
 }
 //#endregion
+//#region src/state/explicit-memory.ts
+/** Only an explicit, top-level save command enters the knowledge-writing path. */
+function isRememberRequest(prompt) {
+	return typeof prompt === "string" && /^(?:請)?記住[：:]/u.test(prompt.trim());
+}
+//#endregion
 //#region src/hooks/prompt-submit.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -163,7 +169,7 @@ async function main() {
 	const cwd = hookCwd(data) || process.cwd();
 	const project = resolveProject(cwd);
 	const prompt = typeof data.prompt === "string" ? data.prompt : typeof data.userPrompt === "string" ? data.userPrompt : "";
-	fetch(`${REST_URL}/agentmemory/observe`, {
+	const observation = fetch(`${REST_URL}/agentmemory/observe`, {
 		method: "POST",
 		headers: authHeaders(),
 		body: JSON.stringify({
@@ -172,10 +178,26 @@ async function main() {
 			project,
 			cwd,
 			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-			data: { prompt }
+			data: {
+				prompt,
+				...SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt) ? { explicitMemoryRequest: true } : {}
+			}
 		}),
-		signal: AbortSignal.timeout(3e3)
-	}).catch(() => {});
+		signal: AbortSignal.timeout(SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt) ? 5e3 : 3e3)
+	});
+	if (SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt)) {
+		let notice = "[Memory update] Storage could not be confirmed. Do not claim this request was saved.";
+		try {
+			const response = await observation;
+			const saved = (response.ok ? await response.json() : null)?.knowledgeCapture;
+			if (saved?.success && saved.status === "active") notice = "[Memory update] This rule is stored for this project, with its source event. Future recall is relevance-filtered; this is not a global rule.";
+			else if (saved?.success && saved.status === "candidate") notice = "[Memory update] This rule is a candidate only. It is not active and will not be automatically recalled.";
+			else if (saved?.success) notice = "[Memory update] An existing inactive record was left unchanged. This request did not reactivate it.";
+		} catch {}
+		process.stdout.write(contextPayload(data, notice));
+		return;
+	}
+	observation.catch(() => {});
 	if (SELECTIVE_CONTEXT_INJECT && prompt.trim()) try {
 		const response = await fetch(`${REST_URL}/agentmemory/selective-context`, {
 			method: "POST",

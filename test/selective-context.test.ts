@@ -99,6 +99,15 @@ describe("selective context", () => {
     }]);
   });
 
+  it("accepts iii worker metadata internally but still rejects unrelated fields", async () => {
+    expect(await sdk.trigger("mem::context-knowledge-put", { expectedRevision: 0, confirmedByUser: true,
+      knowledge: knowledge(), _caller_worker_id: "iii-worker" })).toMatchObject({ success: true });
+    expect(await sdk.trigger("mem::selective-context", { prompt: "draw a diagram", project: "agentmemory",
+      _caller_worker_id: "iii-worker" })).toMatchObject({ status: "selected" });
+    expect(await sdk.trigger("mem::selective-context", { prompt: "draw a diagram", project: "agentmemory",
+      _caller_worker_id: "iii-worker", namespace: "other" })).toMatchObject({ error: "invalid_request" });
+  });
+
   it("rejects a reused source event with changed contents and stale catalog writes", async () => {
     await sdk.trigger("mem::context-knowledge-put", {
       expectedRevision: 0, confirmedByUser: true, knowledge: knowledge(),
