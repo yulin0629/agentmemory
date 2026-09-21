@@ -66,7 +66,7 @@ const usefulJudge: ContextJudge = async (_request, candidates) =>
     revision: record.revision,
     spanId: span.id,
     useful: 0.95,
-    conflict: 0.05,
+    compatibility: "compatible" as const,
     addition: "adds" as const,
   })));
 
@@ -151,6 +151,22 @@ describe("selective context", () => {
     const timedOut = await selectContext(request, records, async () =>
       await new Promise<never>(() => {}), { timeoutMs: 10 });
     expect(timedOut).toEqual({ status: "unavailable", spans: [] });
+  });
+
+  it.each(["overridden", "source_restricted", "unclear"] as const)("keeps %s background out even with high relevance", async compatibility => {
+    const result = await selectContext({ prompt: "draw a diagram", previous: "",
+      namespace: "personal", project: "agentmemory", asOf: NOW }, [knowledge()], async (...args) =>
+      (await usefulJudge(...args)).map(decision => ({ ...decision, compatibility })));
+    expect(result).toEqual({ status: "empty", spans: [] });
+  });
+
+  it("rejects missing or unknown compatibility rather than trusting relevance alone", async () => {
+    for (const compatibility of [undefined, "probably", 0.05]) {
+      const result = await selectContext({ prompt: "draw a diagram", previous: "",
+        namespace: "personal", project: "agentmemory", asOf: NOW }, [knowledge()], async (...args) =>
+        (await usefulJudge(...args)).map(decision => ({ ...decision, compatibility })) as never);
+      expect(result).toEqual({ status: "unavailable", spans: [] });
+    }
   });
 
   it("keeps stale, different-project, and excluded knowledge out of the judge request", async () => {

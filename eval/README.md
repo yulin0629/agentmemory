@@ -2,10 +2,12 @@
 
 Public benchmarks for agentmemory's hybrid memory stack (BM25 + embeddings + consolidation + graph).
 
-Two families, both reproducible:
+Two retrieval benchmark families, both reproducible:
 
 - **LongMemEval** — public 500-question retrieval benchmark over multi-session chat
 - **coding-agent-life-v1** — in-house corpus of 15 fictional Claude Code sessions for a Rust CLI project (`shipctl`), with 15 hand-graded queries covering bug fixes, refactors, preferences, and multi-session causal reasoning
+
+An opt-in selective-recall check separately tests whether Jev chooses useful, permitted background without repeating information or overriding the current request.
 
 ## Adapters
 
@@ -35,6 +37,19 @@ export PATH="$HOME/.local/bin:$PATH"  # add to ~/.zshrc or ~/.bashrc for persist
 ```
 
 ## Quickstart
+
+### Selective recall (synthetic fixtures, paid Jev calls)
+
+The 24 cases in `test/selective-context-live.test.ts` require explicit opt-in and use no running agentmemory server or persistent memory store. Normal `npm test` skips these calls. They cover answer-only formatting, missing-information fallbacks, explicit overrides, restricted sources, continuations, and irrelevant or repeated background. Compatibility is a categorical decision: only `compatible` passes; `overridden`, `source_restricted`, and `unclear` remain silent. Relevance still requires 0.7.
+
+```sh
+AGENTMEMORY_LIVE_JEV_EVAL=true \
+TYPESAFE_API_KEY_FILE=/path/to/key \
+AGENTMEMORY_EVAL_REPORT=/tmp/selective-recall-results.json \
+npm test -- --run test/selective-context-live.test.ts
+```
+
+An existing `TYPESAFE_API_KEY` can replace the key-file setting. The optional report includes decisions, latency, API token usage, and expected versus actual selections. Passing this small corpus does not establish production reliability or prove that a harness delivers the selected context to its model.
 
 ### coding-agent-life-v1 (in-house, no download)
 
