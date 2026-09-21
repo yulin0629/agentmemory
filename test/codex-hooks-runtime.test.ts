@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -159,6 +161,33 @@ describe("Codex hook runtime contract", () => {
       750,
     );
     expect(result.requests[0]?.path).toBe("/agentmemory/observe");
+    expect(result.stdout).toBe("");
+  });
+
+  it("UserPromptSubmit forwards same-session dialogue and accepts a response after 1.2 seconds", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "memory-hook-"));
+    const path = join(dir, "transcript.jsonl");
+    try {
+      writeFileSync(path, [
+        { type: "session_meta", payload: { id: "codex-session" } },
+        { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Draw the flow" }] } },
+      ].map(row => JSON.stringify(row)).join("\n") + "\n");
+      const result = await runHook("prompt-submit.mjs",
+        codexPayload("UserPromptSubmit", { prompt: "continue", transcript_path: path }),
+        { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 1600,
+        { "/agentmemory/selective-context": { status: "selected", spans: [{ text: "Use ASCII." }] } });
+      expect(result.requests.find(r => r.path === "/agentmemory/selective-context")?.body).toMatchObject({
+        prompt: "continue", previous: JSON.stringify([{ role: "user", text: "Draw the flow" }]),
+      });
+      expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("Use ASCII.");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("UserPromptSubmit stays silent past its response deadline", async () => {
+    const result = await runHook("prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { prompt: "draw the flow" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 2300,
+      { "/agentmemory/selective-context": { status: "selected", spans: [{ text: "Use ASCII." }] } });
     expect(result.stdout).toBe("");
   });
 

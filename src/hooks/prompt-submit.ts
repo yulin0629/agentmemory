@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { resolveProject, hookCwd } from "./_project.js";
+import { previousContext } from "./_previous-context.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -10,7 +11,7 @@ function isSdkChildContext(payload: unknown): boolean {
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 const SELECTIVE_CONTEXT_INJECT = process.env["AGENTMEMORY_SELECTIVE_CONTEXT_INJECT"] === "true";
-const SELECTIVE_CONTEXT_TIMEOUT_MS = 1200;
+const SELECTIVE_CONTEXT_TIMEOUT_MS = 2000;
 
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
@@ -86,7 +87,8 @@ async function main() {
       const response = await fetch(`${REST_URL}/agentmemory/selective-context`, {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ prompt, project }),
+        body: JSON.stringify({ prompt, project,
+          previous: previousContext(data.transcript_path, sessionId, prompt) }),
         signal: AbortSignal.timeout(SELECTIVE_CONTEXT_TIMEOUT_MS),
       });
       if (response.ok) {

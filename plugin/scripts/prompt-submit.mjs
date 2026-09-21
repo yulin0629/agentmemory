@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
 import { basename } from "node:path";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 //#region src/hooks/_project.ts
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
@@ -31,6 +32,92 @@ function hookCwd(data) {
 	if (projectDir && projectDir.trim()) return projectDir;
 }
 //#endregion
+//#region src/functions/privacy.ts
+const PRIVATE_TAG_RE = /<private>[\s\S]*?<\/private>/gi;
+const SECRET_PATTERN_SOURCES = [
+	/(?:api[_-]?key|secret|token|password|credential|auth)[\s]*[=:]\s*["']?[A-Za-z0-9_\-/.+]{20,}["']?/gi,
+	/Bearer\s+[A-Za-z0-9._\-+/=]{20,}/gi,
+	/sk-proj-[A-Za-z0-9\-_]{20,}/g,
+	/(?:sk|pk|rk|ak)-[A-Za-z0-9][A-Za-z0-9\-_]{19,}/g,
+	/sk-ant-[A-Za-z0-9\-_]{20,}/g,
+	/gh[pus]_[A-Za-z0-9]{36,}/g,
+	/github_pat_[A-Za-z0-9_]{22,}/g,
+	/xoxb-[A-Za-z0-9\-]+/g,
+	/AKIA[0-9A-Z]{16}/g,
+	/AIza[A-Za-z0-9\-_]{35}/g,
+	/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+	/npm_[A-Za-z0-9]{36}/g,
+	/glpat-[A-Za-z0-9\-_]{20,}/g,
+	/dop_v1_[A-Za-z0-9]{64}/g
+];
+function stripPrivateData(input) {
+	let result = input.replace(PRIVATE_TAG_RE, "[REDACTED]");
+	for (const source of SECRET_PATTERN_SOURCES) {
+		const pattern = new RegExp(source.source, source.flags);
+		result = result.replace(pattern, "[REDACTED_SECRET]");
+	}
+	return result;
+}
+//#endregion
+//#region src/hooks/_previous-context.ts
+/** Only same-session dialogue is eligible; tool results and reasoning are excluded. */
+function previousContext(path, sessionId, prompt) {
+	if (typeof path !== "string" || !path.endsWith(".jsonl") || sessionId === "unknown") return "";
+	let fd;
+	try {
+		fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+		const stat = fstatSync(fd);
+		if (!stat.isFile()) return "";
+		const head = Buffer.alloc(Math.min(stat.size, 8192));
+		readSync(fd, head, 0, head.length, 0);
+		let codexSession = false;
+		try {
+			const meta = JSON.parse(head.toString("utf8").split("\n")[0]);
+			if (meta.type === "session_meta") {
+				if (meta.payload?.id !== sessionId) return "";
+				codexSession = true;
+			}
+		} catch {}
+		const tail = Buffer.alloc(Math.min(stat.size, 65536));
+		const offset = stat.size - tail.length;
+		readSync(fd, tail, 0, tail.length, offset);
+		const lines = tail.toString("utf8").split("\n");
+		if (offset > 0) lines.shift();
+		const messages = [];
+		for (const line of lines) {
+			let row;
+			try {
+				row = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			const message = codexSession ? row.type === "response_item" && row.payload?.type === "message" ? row.payload : null : row.sessionId === sessionId && ["user", "assistant"].includes(row.type) ? row.message : null;
+			if (!message || !["user", "assistant"].includes(message.role)) continue;
+			const text = typeof message.content === "string" ? message.content : Array.isArray(message.content) ? message.content.filter((block) => [
+				"text",
+				"input_text",
+				"output_text"
+			].includes(block.type ?? "") && typeof block.text === "string").map((block) => block.text).join("\n") : "";
+			if (text.trim()) messages.push({
+				role: message.role,
+				text: stripPrivateData(text)
+			});
+		}
+		const last = messages.at(-1);
+		if (last?.role === "user" && last.text.trim() === stripPrivateData(prompt).trim()) messages.pop();
+		const selected = [];
+		for (const message of messages.slice(-4).reverse()) {
+			if (JSON.stringify([message, ...selected]).length > 8e3) break;
+			selected.unshift(message);
+		}
+		return selected.length ? JSON.stringify(selected) : "";
+	} catch {
+		return "";
+	} finally {
+		if (fd !== void 0) closeSync(fd);
+	}
+}
+//#endregion
 //#region src/hooks/prompt-submit.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -40,7 +127,7 @@ function isSdkChildContext(payload) {
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 const SELECTIVE_CONTEXT_INJECT = process.env["AGENTMEMORY_SELECTIVE_CONTEXT_INJECT"] === "true";
-const SELECTIVE_CONTEXT_TIMEOUT_MS = 1200;
+const SELECTIVE_CONTEXT_TIMEOUT_MS = 2e3;
 function authHeaders() {
 	const h = { "Content-Type": "application/json" };
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
@@ -95,7 +182,8 @@ async function main() {
 			headers: authHeaders(),
 			body: JSON.stringify({
 				prompt,
-				project
+				project,
+				previous: previousContext(data.transcript_path, sessionId, prompt)
 			}),
 			signal: AbortSignal.timeout(SELECTIVE_CONTEXT_TIMEOUT_MS)
 		});

@@ -1600,7 +1600,11 @@ Create `~/.agentmemory/.env`:
 # AGENTMEMORY_SELECTIVE_CONTEXT=false  # OFF by default. Enables evidence-scoped recall only; requires all three values below and a restart.
 # AGENTMEMORY_CONTEXT_NAMESPACE=personal # Fixed server namespace; callers cannot choose it per request.
 # TYPESAFE_API_KEY=...                  # Fast Jev judge key. Keep it out of source control.
-# AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=false # OFF by default. Prompt-submit injects at most two Jev-selected, source-exact spans.
+# AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=false # OFF by default. Prompt-submit injects at most two Jev-selected, source-exact spans; waits at most 2s for the API.
+# When enabled, the hook sends up to four recent dialogue messages (8,000 characters)
+# from a same-session Codex/Claude JSONL transcript to the server and Jev. Tool output
+# is excluded; private tags and recognized secrets are redacted, not all personal data.
+# Reads an 8 KiB identity header plus the last 64 KiB. Missing/unrecognized transcripts produce no previous context.
 # GRAPH_EXTRACTION_ENABLED=false
 # AGENTMEMORY_LLM_NOTHINK=1        # Local reasoning models only: ask the
                                    # model to skip its hidden thinking pass
