@@ -51,7 +51,7 @@ function knowledge(overrides: Partial<ContextKnowledge> = {}): ContextKnowledge 
     id: overrides.id ?? "knowledge-ascii-diagrams",
     revision: overrides.revision ?? "rev-1",
     status: overrides.status ?? "active",
-    scope: overrides.scope ?? { namespace: "personal", project: "agentmemory" },
+    scope: overrides.scope ?? { namespace: "personal", project: "agentmemory", projectId: "repo-agentmemory" },
     evidence,
     spans: overrides.spans ?? [{
       id: "span-format",
@@ -102,9 +102,9 @@ describe("selective context", () => {
   it("accepts iii worker metadata internally but still rejects unrelated fields", async () => {
     expect(await sdk.trigger("mem::context-knowledge-put", { expectedRevision: 0, confirmedByUser: true,
       knowledge: knowledge(), _caller_worker_id: "iii-worker" })).toMatchObject({ success: true });
-    expect(await sdk.trigger("mem::selective-context", { prompt: "draw a diagram", project: "agentmemory",
+    expect(await sdk.trigger("mem::selective-context", { prompt: "draw a diagram", project: "agentmemory", projectId: "repo-agentmemory",
       _caller_worker_id: "iii-worker" })).toMatchObject({ status: "selected" });
-    expect(await sdk.trigger("mem::selective-context", { prompt: "draw a diagram", project: "agentmemory",
+    expect(await sdk.trigger("mem::selective-context", { prompt: "draw a diagram", project: "agentmemory", projectId: "repo-agentmemory",
       _caller_worker_id: "iii-worker", namespace: "other" })).toMatchObject({ error: "invalid_request" });
   });
 
@@ -141,7 +141,7 @@ describe("selective context", () => {
       }),
     });
     const result = await sdk.trigger("mem::selective-context", {
-      prompt: "請重新畫流程圖", project: "agentmemory",
+      prompt: "請重新畫流程圖", project: "agentmemory", projectId: "repo-agentmemory",
     }) as { status: string; spans: Array<{ text: string; evidenceEventId: string }> };
     expect(result.status).toBe("selected");
     expect(result.spans).toMatchObject([{
@@ -152,7 +152,7 @@ describe("selective context", () => {
 
   it("fails closed for malformed judge output and a missed deadline", async () => {
     const request = {
-      prompt: "draw a diagram", previous: "", namespace: "personal", project: "agentmemory", asOf: NOW,
+      prompt: "draw a diagram", previous: "", namespace: "personal", project: "agentmemory", projectId: "repo-agentmemory", asOf: NOW,
     };
     const records = [knowledge()];
     const malformed = await selectContext(request, records, async () => []);
@@ -164,7 +164,7 @@ describe("selective context", () => {
 
   it.each(["overridden", "source_restricted", "unclear"] as const)("keeps %s background out even with high relevance", async compatibility => {
     const result = await selectContext({ prompt: "draw a diagram", previous: "",
-      namespace: "personal", project: "agentmemory", asOf: NOW }, [knowledge()], async (...args) =>
+      namespace: "personal", project: "agentmemory", projectId: "repo-agentmemory", asOf: NOW }, [knowledge()], async (...args) =>
       (await usefulJudge(...args)).map(decision => ({ ...decision, compatibility })));
     expect(result).toEqual({ status: "empty", spans: [] });
   });
@@ -172,7 +172,7 @@ describe("selective context", () => {
   it("rejects missing or unknown compatibility rather than trusting relevance alone", async () => {
     for (const compatibility of [undefined, "probably", 0.05]) {
       const result = await selectContext({ prompt: "draw a diagram", previous: "",
-        namespace: "personal", project: "agentmemory", asOf: NOW }, [knowledge()], async (...args) =>
+        namespace: "personal", project: "agentmemory", projectId: "repo-agentmemory", asOf: NOW }, [knowledge()], async (...args) =>
         (await usefulJudge(...args)).map(decision => ({ ...decision, compatibility })) as never);
       expect(result).toEqual({ status: "unavailable", spans: [] });
     }
@@ -181,7 +181,7 @@ describe("selective context", () => {
   it("keeps stale, different-project, and excluded knowledge out of the judge request", async () => {
     const seen: string[][] = [];
     const request = {
-      prompt: "draw a diagram", previous: "", namespace: "personal", project: "agentmemory", asOf: NOW,
+      prompt: "draw a diagram", previous: "", namespace: "personal", project: "agentmemory", projectId: "repo-agentmemory", asOf: NOW,
       excludedIds: ["excluded"],
     };
     const result = await selectContext(request, [
@@ -213,7 +213,7 @@ describe("selective context", () => {
     }, spans: [{ id: "old", text: oldText }] });
     let supplied: ContextKnowledge[] = [];
     await selectContext({
-      prompt: "draw a diagram", previous: "", namespace: "personal", project: "agentmemory", asOf: NOW,
+      prompt: "draw a diagram", previous: "", namespace: "personal", project: "agentmemory", projectId: "repo-agentmemory", asOf: NOW,
     }, [first, second], async (_request, candidates) => {
       supplied = candidates;
       return usefulJudge(_request, candidates, new AbortController().signal);
@@ -221,5 +221,14 @@ describe("selective context", () => {
     expect(supplied).toHaveLength(1);
     expect(supplied[0]!.spans).toEqual(first.spans);
     expect(supplied.flatMap(record => record.spans).some(span => span.text !== first.spans[0]!.text)).toBe(false);
+  });
+
+  it("does not attach legacy name-only knowledge to a newly identified repository", async () => {
+    const judge = vi.fn(usefulJudge);
+    const result = await selectContext({ prompt: "draw a diagram", previous: "", namespace: "personal",
+      project: "agentmemory", projectId: "repo-identity", asOf: NOW },
+    [knowledge({ scope: { namespace: "personal", project: "agentmemory" } })], judge);
+    expect(result.status).toBe("empty");
+    expect(judge).not.toHaveBeenCalled();
   });
 });

@@ -1601,6 +1601,7 @@ Create `~/.agentmemory/.env`:
 # AGENTMEMORY_CONTEXT_NAMESPACE=personal # Fixed server namespace; callers cannot choose it per request.
 # TYPESAFE_API_KEY=...                  # Fast Jev judge key. Keep it out of source control.
 # AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=false # OFF by default. Ordinary recall waits at most 2s; explicit saves wait at most 5s for acknowledgement.
+# AGENTMEMORY_CONTEXT_PROJECT=shared-repo-alias # Optional CLIENT/hook environment setting for deliberately sharing one repo identity.
 # When enabled, the hook sends up to four recent dialogue messages (8,000 characters)
 # from a same-session Codex/Claude JSONL transcript to the server and Jev. Tool output
 # is excluded; private tags and recognized secrets are redacted, not all personal data.
@@ -1634,7 +1635,7 @@ With selective context enabled on the server and the prompt hook opted in, a liv
 記住：本專案的回歸測試命令是 npm run test:regression。
 ```
 
-The producer reads the stored user event before observation compression, preserves the full prompt, session ID and observation ID, and uses only an exact source span (up to 1,200 characters). Scope comes from the existing session's project label; shared labels share scope. It does not create a global preference. Ordinary confirmations such as `好`, `1`, and `照做`, quoted commands, and tool output do not enter this path.
+The producer reads the stored user event before observation compression, preserves the full prompt, session ID and observation ID, and uses only an exact source span (up to 1,200 characters). Selective memory uses a separate project identity: normalized HTTP(S)/SSH Git origin when available, otherwise the machine and canonical local path/common Git directory. Legacy project display names remain unchanged. Client-only settings must be present in the harness/hook environment; setting them only on the server does not configure clients. `AGENTMEMORY_CONTEXT_PROJECT` deliberately shares an identity across checkouts and should be configured per project, not globally. A session's bound identity cannot silently switch repositories. Name-only legacy knowledge remains preserved but is not automatically recalled; reconfirm it in the intended repository to establish its scope. Ordinary confirmations such as `好`, `1`, and `照做`, quoted commands, and tool output do not enter the capture path.
 
 Jev classifies an explicit request before activation. Task-only, unclear, quoted-but-unadopted, and conflicting save requests remain non-recallable candidates. Repeats do not duplicate knowledge or reactivate withdrawn records. A candidate caused by an unavailable judge can be retried by another explicit save request; other candidates are not automatically promoted.
 
@@ -1647,6 +1648,8 @@ To explicitly replace a rule, submit this three-line form, with each rule on one
 ```
 
 The old text must exactly match the sole span of exactly one active rule in the current project. Jev checks the new rule against the remaining active rules; only a clear project rule proceeds. One catalog write retains the old record as `superseded` and adds the new active record, preserving both sources and `supersedes`/`supersededBy` links. An intact direct replacement can be replayed without another write. Ambiguous, missing, changed, cross-project, or non-active targets, full catalogs, failed judgments, and concurrent catalog changes leave the old rule untouched. This creates a new history record and consumes one of the pilot's 12 record slots; it does not automatically reconcile arbitrary prose or prune old records.
+
+Exports and Git snapshots include `contextKnowledge` catalogs with namespace, source evidence, project identities, statuses, replacement links, and deduplication history. Restore validates these links before writing. Import `merge` rejects a differing existing namespace instead of merging competing rules; `skip` preserves it, and `replace` replaces only included namespaces. Missing collections in older backups leave current knowledge unchanged. Restores advance the live catalog revision so in-flight decisions become stale. Catalog writes are atomic per namespace; the overall multi-collection import is not transactional.
 
 An opted-in prompt hook waits up to five seconds for an explicit-save acknowledgement and distinguishes active, candidate, inactive, and unconfirmed writes. Ordinary recall keeps its two-second API deadline. The underlying iii file store writes asynchronously: an acknowledgement confirms the store accepted the write, not crash-safe disk persistence. A persistence test must wait for the record to reach disk before restarting the engine. The pilot catalog still permits at most 12 records and 256 change events per namespace.
 

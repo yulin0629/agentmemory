@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { resolveProject, hookCwd } from "./_project.js";
+import { resolveProject, resolveContextProjectId, hookCwd } from "./_project.js";
 import { previousContext } from "./_previous-context.js";
 import { isRememberRequest } from "../state/explicit-memory.js";
 
@@ -66,6 +66,7 @@ async function main() {
 
   const cwd = hookCwd(data) || process.cwd();
   const project = resolveProject(cwd);
+  const projectId = SELECTIVE_CONTEXT_INJECT ? resolveContextProjectId(cwd) : undefined;
   const prompt = typeof data.prompt === "string" ? data.prompt
     : typeof data.userPrompt === "string" ? data.userPrompt : "";
 
@@ -78,7 +79,7 @@ async function main() {
       project,
       cwd,
       timestamp: new Date().toISOString(),
-      data: { prompt, ...(SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt)
+      data: { prompt, ...(projectId ? { contextProjectId: projectId } : {}), ...(SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt)
         ? { explicitMemoryRequest: true } : {}) },
     }),
     signal: AbortSignal.timeout(SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt) ? 5000 : 3000),
@@ -112,7 +113,7 @@ async function main() {
       const response = await fetch(`${REST_URL}/agentmemory/selective-context`, {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ prompt, project,
+        body: JSON.stringify({ prompt, project, projectId,
           previous: previousContext(data.transcript_path, sessionId, prompt) }),
         signal: AbortSignal.timeout(SELECTIVE_CONTEXT_TIMEOUT_MS),
       });

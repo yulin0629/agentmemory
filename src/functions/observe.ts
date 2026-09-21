@@ -64,6 +64,9 @@ export function registerObserveFunction(
       }
 
       const obsId = generateId("obs");
+      const incomingProjectId = (payload.data as { contextProjectId?: unknown } | null)?.contextProjectId;
+      const contextProjectId = typeof incomingProjectId === "string" && incomingProjectId.trim().length > 0
+        && incomingProjectId.length <= 200 ? incomingProjectId.trim() : undefined;
       const explicitRequest = captureExplicitKnowledge && payload.hookType === "prompt_submit"
         && (payload.data as { explicitMemoryRequest?: unknown } | null)?.explicitMemoryRequest === true
         && isRememberRequest((payload.data as { prompt?: unknown } | null)?.prompt);
@@ -167,6 +170,8 @@ export function registerObserveFunction(
           agentId?: string;
           observationCount?: number;
           firstPrompt?: string;
+          project?: string;
+          contextProjectId?: string;
         }>(KV.sessions, payload.sessionId);
         const inheritedAgentId = existingSession
           ? existingSession.agentId
@@ -259,6 +264,9 @@ export function registerObserveFunction(
               value: (session.observationCount || 0) + 1,
             },
           ];
+          if (!session.contextProjectId && contextProjectId && session.project === payload.project) {
+            updates.push({ type: "set", path: "contextProjectId", value: contextProjectId });
+          }
           if (!session.firstPrompt && typeof raw.userPrompt === "string") {
             const trimmed = raw.userPrompt.replace(/\s+/g, " ").trim();
             if (trimmed.length > 0) {
@@ -296,6 +304,7 @@ export function registerObserveFunction(
             startedAt: payload.timestamp ?? ts,
             updatedAt: ts,
             status: "active",
+            ...(contextProjectId ? { contextProjectId } : {}),
             observationCount: 1,
             ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
             ...(trimmedPrompt && trimmedPrompt.length > 0

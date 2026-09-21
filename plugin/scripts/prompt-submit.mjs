@@ -1,8 +1,54 @@
 #!/usr/bin/env node
-import { execSync } from "node:child_process";
-import { basename } from "node:path";
-import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { basename, resolve } from "node:path";
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "node:fs";
+import { hostname } from "node:os";
+import { createHash } from "node:crypto";
 //#region src/hooks/_project.ts
+/** Selective memory identity is separate from legacy human-readable project labels. */
+function resolveContextProjectId(cwd) {
+	const hash = (value) => `project:${createHash("sha256").update(value).digest("hex")}`;
+	const explicit = process.env["AGENTMEMORY_CONTEXT_PROJECT"]?.trim();
+	if (explicit) return hash(`explicit:${explicit}`);
+	const git = (args) => execFileSync("git", args, {
+		cwd,
+		stdio: [
+			"ignore",
+			"pipe",
+			"ignore"
+		],
+		timeout: 500,
+		encoding: "utf8"
+	}).trim();
+	try {
+		const remote = git([
+			"remote",
+			"get-url",
+			"origin"
+		]);
+		const scp = /^[A-Za-z]:[\\/]/.test(remote) || remote.includes("::") ? null : /^(?:[^@/:]+@)?([^/:]+):(.+)$/.exec(remote);
+		const url = new URL(remote.includes("://") ? remote : scp ? `ssh://${scp[1]}/${scp[2]}` : "file:///unshared");
+		if ([
+			"https:",
+			"http:",
+			"ssh:"
+		].includes(url.protocol) && url.hostname) {
+			const port = url.protocol === "ssh:" && url.port === "22" ? "" : url.port;
+			const path = url.pathname.replace(/\/$/, "").replace(/\.git$/, "");
+			return hash(`remote:${url.hostname.toLowerCase()}${port ? `:${port}` : ""}${path}`);
+		}
+	} catch {}
+	let path = cwd;
+	try {
+		path = resolve(cwd, git(["rev-parse", "--git-common-dir"]));
+	} catch {}
+	try {
+		path = realpathSync(path);
+	} catch {
+		path = resolve(path);
+	}
+	return hash(`local:${hostname()}:${path}`);
+}
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
 	if (explicit && explicit.trim()) return explicit.trim();
@@ -168,6 +214,7 @@ async function main() {
 	const sessionId = data.session_id || data.sessionId || data.conversation_id || "unknown";
 	const cwd = hookCwd(data) || process.cwd();
 	const project = resolveProject(cwd);
+	const projectId = SELECTIVE_CONTEXT_INJECT ? resolveContextProjectId(cwd) : void 0;
 	const prompt = typeof data.prompt === "string" ? data.prompt : typeof data.userPrompt === "string" ? data.userPrompt : "";
 	const observation = fetch(`${REST_URL}/agentmemory/observe`, {
 		method: "POST",
@@ -180,6 +227,7 @@ async function main() {
 			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
 			data: {
 				prompt,
+				...projectId ? { contextProjectId: projectId } : {},
 				...SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt) ? { explicitMemoryRequest: true } : {}
 			}
 		}),
@@ -206,6 +254,7 @@ async function main() {
 			body: JSON.stringify({
 				prompt,
 				project,
+				projectId,
 				previous: previousContext(data.transcript_path, sessionId, prompt)
 			}),
 			signal: AbortSignal.timeout(SELECTIVE_CONTEXT_TIMEOUT_MS)

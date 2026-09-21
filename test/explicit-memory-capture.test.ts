@@ -39,10 +39,11 @@ function setup(captureJudge: CaptureJudge = async () => "project_rule", enabled 
   };
   registerObserveFunction(sdk as never, kv as never, new DedupMap(), undefined, enabled);
   registerSelectiveContextFunctions(sdk as never, kv as never, { namespace: "capture-test", judge: useful, captureJudge });
-  const call = async (id: string, payload: unknown): Promise<any> => sdk.trigger({ function_id: id, payload });
-  const observe = (prompt: string, sessionId = "session-a", project = "project-a", hookType = "prompt_submit", explicit = true) => call("mem::observe", {
+  const call = async (id: string, payload: any): Promise<any> => sdk.trigger({ function_id: id, payload:
+    id === "mem::selective-context" && payload.project ? { projectId: `test:${payload.project}`, ...payload } : payload });
+  const observe = (prompt: string, sessionId = "session-a", project = "project-a", hookType = "prompt_submit", explicit = true, projectId = `test:${project}`) => call("mem::observe", {
     sessionId, project, cwd: "/tmp/fixture", hookType, timestamp: new Date().toISOString(), data: {
-      prompt, ...(explicit && isRememberRequest(prompt) ? { explicitMemoryRequest: true } : {}),
+      prompt, contextProjectId: projectId, ...(explicit && isRememberRequest(prompt) ? { explicitMemoryRequest: true } : {}),
     },
   });
   const catalog = async () => (await kv.list<ContextKnowledgeCatalog>(KV.contextKnowledge))[0];
@@ -72,9 +73,13 @@ describe("explicit memory capture", () => {
     const recall = await app.call("mem::selective-context", { prompt: "寫報告", project: "project-a" });
     expect(recall.spans.map((s: { text: string }) => s.text)).toEqual(["報告使用繁體中文。"]);
     expect((await app.observe(replacement)).knowledgeCapture.action).toBe("existing");
+    expect((await app.observe("記住：報告使用繁體中文。")).knowledgeCapture).toMatchObject({
+      action: "existing", knowledgeId: next.id, status: "active",
+    });
     expect(judge).toHaveBeenCalledTimes(2);
     expect((await app.observe("記住：報告使用英文。")).knowledgeCapture.status).toBe("superseded");
     expect((await app.catalog())!.records).toHaveLength(2);
+    expect((await app.observe("確認取代：\n舊規則：報告使用繁體中文。\n新規則：報告使用日文。")).knowledgeCapture.action).toBe("replaced");
   });
 
   it.each(["task_only", "unclear", "unavailable"] as const)("leaves the old rule unchanged when replacement is %s", async verdict => {
@@ -145,7 +150,7 @@ describe("explicit memory capture", () => {
     const saved = (await app.catalog())!.records[0]!;
     expect(saved.evidence).toMatchObject({ text: prompt, sessionId: "session-a", eventId: result.observationId });
     expect(saved.spans).toEqual([{ id: "user-text", text }]);
-    expect(saved.scope).toEqual({ namespace: "capture-test", project: "project-a" });
+    expect(saved.scope).toEqual({ namespace: "capture-test", project: "project-a", projectId: "test:project-a" });
     const observation = await app.kv.get<{ narrative: string }>(KV.observations("session-a"), result.observationId);
     expect(observation.narrative.length).toBeLessThan(prompt.length);
     expect(await app.call("mem::selective-context", { prompt: "寫報告", project: "project-a" })).toMatchObject({
@@ -216,7 +221,8 @@ describe("explicit memory capture", () => {
     const seen: string[][] = [];
     const app = setup(async (_prompt, rules) => { seen.push(rules); return "project_rule"; });
     await app.observe("記住：報告要附來源。");
-    await app.observe("記住：報告用純文字。", "session-a", "spoofed-project");
+    expect((await app.observe("記住：報告用純文字。", "session-a", "spoofed-project")).knowledgeCapture.error).toBe("project_scope_mismatch");
+    await app.observe("記住：報告用純文字。");
     expect(seen[1]).toEqual(["報告要附來源。"]);
     expect((await app.catalog())!.records.every(r => r.scope.project === "project-a")).toBe(true);
   });
@@ -230,6 +236,16 @@ describe("explicit memory capture", () => {
       knowledge: { ...old, revision: "withdrawn", status: "retracted", evidence: { ...old.evidence, eventId: "withdrawal" } } });
     expect((await app.observe("記住：報告要附來源。")).knowledgeCapture).toMatchObject({ status: "retracted", action: "existing" });
     expect(await app.call("mem::selective-context", { prompt: "報告", project: "project-a" })).toMatchObject({ status: "empty" });
+  });
+
+  it("isolates different repositories with the same display name", async () => {
+    const app = setup();
+    await app.observe("記住：報告用英文。", "session-a", "same-name", "prompt_submit", true, "repo-a");
+    await app.observe("記住：報告用中文。", "session-b", "same-name", "prompt_submit", true, "repo-b");
+    const a = await app.call("mem::selective-context", { prompt: "報告", project: "same-name", projectId: "repo-a" });
+    const b = await app.call("mem::selective-context", { prompt: "報告", project: "same-name", projectId: "repo-b" });
+    expect(a.spans.map((s: { text: string }) => s.text)).toEqual(["報告用英文。"]);
+    expect(b.spans.map((s: { text: string }) => s.text)).toEqual(["報告用中文。"]);
   });
 
   it("rejects a stale classification when another capture changes the catalog", async () => {

@@ -4,25 +4,12 @@ import type { StateKV } from "../state/kv.js";
 import type { ContextKnowledgeCatalog, RawObservation } from "../types.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { selectContext, type ContextJudge, type ContextKnowledge } from "../state/selective-context.js";
+import { selectContext, sameProjectScope, type ContextJudge, type ContextKnowledge } from "../state/selective-context.js";
 import { explicitMemoryText, explicitReplacement, type CaptureJudge } from "../state/explicit-memory.js";
 import { safeAudit } from "./audit.js";
+import { knowledgeSchema } from "../state/context-knowledge-backup.js";
 
 const id = z.string().trim().min(1).max(200);
-const knowledgeSchema = z.object({
-  id, revision: id,
-  status: z.enum(["candidate", "active", "superseded", "retracted"]),
-  captureDisposition: z.enum(["project_rule", "task_only", "unclear", "unavailable"]).optional(),
-  supersedes: z.object({ id, revision: id }).strict().optional(),
-  supersededBy: id.optional(),
-  scope: z.object({ namespace: id, project: id.optional(), task: id.optional() }).strict(),
-  evidence: z.object({ eventId: id, text: z.string().min(1).max(12000),
-    adoptedAt: z.iso.datetime(), sessionId: id.optional() }).strict(),
-  spans: z.array(z.object({ id, text: z.string().trim().min(1).max(1200) }).strict()).min(1).max(4),
-}).strict().refine(record => record.spans.every(s => record.evidence.text.includes(s.text)),
-  "Spans must be exact substrings of the supplied evidence")
-  .refine(record => new Set(record.spans.map(s => s.id)).size === record.spans.length,
-    "Span IDs must be unique");
 
 export const contextKnowledgePutSchema = z.object({
   expectedRevision: z.number().int().nonnegative(),
@@ -33,7 +20,7 @@ export const contextKnowledgePutSchema = z.object({
 export const selectiveContextSchema = z.object({
   prompt: z.string().trim().min(1).max(12000),
   previous: z.string().max(8000).default(""),
-  project: id.optional(), task: id.optional(),
+  project: id.optional(), projectId: id.optional(), task: id.optional(),
   excludedIds: z.array(id).max(100).default([]),
 }).strict();
 
@@ -52,7 +39,7 @@ export function registerSelectiveContextFunctions(
       ?? { revision: 0, records: [], events: {} };
 
   const sameCapturedRule = (a: ContextKnowledge, b: ContextKnowledge) =>
-    a.scope.namespace === b.scope.namespace && a.scope.project === b.scope.project
+    a.scope.namespace === b.scope.namespace && sameProjectScope(a.scope, b.scope)
     && a.scope.task === b.scope.task && a.spans.length === 1 && b.spans.length === 1
     && a.spans[0]!.text === b.spans[0]!.text;
   const save = async (knowledge: ContextKnowledge, expectedRevision: number, fromCapture = false) => {
@@ -87,6 +74,7 @@ export function registerSelectiveContextFunctions(
         return { success: false, error: "catalog_capacity" };
       }
       const next: ContextKnowledgeCatalog = {
+        namespace,
         revision: catalog.revision + 1,
         records: [...catalog.records.filter(r => r.id !== knowledge.id), knowledge],
         events: { ...catalog.events, [eventKey]: digest },
@@ -108,9 +96,9 @@ export function registerSelectiveContextFunctions(
     return save(parsed.data.knowledge, parsed.data.expectedRevision);
   });
 
-  const replace = async (source: RawObservation, project: string, change: { oldText: string; newText: string }) => {
+  const replace = async (source: RawObservation, project: string, projectId: string, change: { oldText: string; newText: string }) => {
     const catalog = await read();
-    const inScope = (r: ContextKnowledge) => r.scope.namespace === namespace && r.scope.project === project && !r.scope.task;
+    const inScope = (r: ContextKnowledge) => r.scope.namespace === namespace && sameProjectScope(r.scope, { project, projectId }) && !r.scope.task;
     const exact = (r: ContextKnowledge, text: string) => r.spans.length === 1 && r.spans[0]!.text === text;
     const matches = catalog.records.filter(r => inScope(r) && r.status === "active" && exact(r, change.oldText));
     if (matches.length !== 1) {
@@ -129,7 +117,7 @@ export function registerSelectiveContextFunctions(
       return { success: false, error: "new_rule_already_active" };
     }
     const otherRules = catalog.records.filter(r => r.id !== old.id && r.status === "active"
-      && r.scope.namespace === namespace && (!r.scope.project || r.scope.project === project))
+      && r.scope.namespace === namespace && ((!r.scope.project && !r.scope.projectId) || sameProjectScope(r.scope, { project, projectId })))
       .flatMap(r => r.spans.map(span => span.text));
     if (otherRules.join("\n").length > 6000) return { success: false, error: "comparison_budget" };
     const controller = new AbortController();
@@ -149,7 +137,7 @@ export function registerSelectiveContextFunctions(
     const next = knowledgeSchema.safeParse({
       id: fingerprintId("replacement", JSON.stringify([namespace, project, old.id, old.revision, source.id])),
       revision: fingerprintId("capture", source.id), status: "active", captureDisposition: "project_rule",
-      scope: { namespace, project }, supersedes: { id: old.id, revision: old.revision },
+      scope: { ...old.scope }, supersedes: { id: old.id, revision: old.revision },
       evidence: { eventId: source.id, sessionId: source.sessionId, text: source.userPrompt, adoptedAt: now() },
       spans: [{ id: "user-text", text: change.newText }],
     });
@@ -161,6 +149,7 @@ export function registerSelectiveContextFunctions(
       if (latest.events[eventKey]) return { success: false, error: "event_conflict" };
       if (latest.records.length >= 12 || Object.keys(latest.events).length >= 256) return { success: false, error: "catalog_capacity" };
       await kv.set(KV.contextKnowledge, key, {
+        namespace,
         revision: latest.revision + 1,
         records: [...latest.records.map(r => r.id === old.id ? { ...r, status: "superseded" as const, supersededBy: next.data.id } : r), next.data],
         events: { ...latest.events, [eventKey]: fingerprintId("change", JSON.stringify(next.data)) },
@@ -177,7 +166,7 @@ export function registerSelectiveContextFunctions(
     if (!parsed.success || !options.captureJudge) return { success: false, error: "capture_unavailable" };
     const { sessionId, observationId } = parsed.data;
     const source = await kv.get<RawObservation>(KV.observations(sessionId), observationId);
-    const session = await kv.get<{ project?: string }>(KV.sessions, sessionId);
+    const session = await kv.get<{ project?: string; contextProjectId?: string }>(KV.sessions, sessionId);
     if (!source || source.id !== observationId || source.sessionId !== sessionId
       || source.hookType !== "prompt_submit" || source.origin?.channel !== "user"
       || (source.raw as { explicitMemoryRequest?: unknown } | null)?.explicitMemoryRequest !== true) {
@@ -185,24 +174,31 @@ export function registerSelectiveContextFunctions(
     }
     const project = id.safeParse(session?.project);
     if (!project.success) return { success: false, error: "invalid_save_request" };
+    const projectId = id.safeParse(session?.contextProjectId);
+    if (!projectId.success || (source.raw as { contextProjectId?: unknown }).contextProjectId !== projectId.data) {
+      return { success: false, error: "project_scope_mismatch" };
+    }
     const replacement = explicitReplacement(source.userPrompt);
-    if (replacement) return replace(source, project.data, replacement);
+    if (replacement) return replace(source, project.data, projectId.data, replacement);
     const text = explicitMemoryText(source.userPrompt);
     if (!text) return { success: false, error: "invalid_save_request" };
-    const knowledgeId = fingerprintId("user-rule", JSON.stringify([namespace, project.data, text]));
+    const knowledgeId = fingerprintId("user-rule", JSON.stringify([namespace, projectId.data, text]));
     const catalog = await read();
-    const existing = catalog.records.find(r => r.id === knowledgeId);
+    const activeMatches = catalog.records.filter(r => r.status === "active" && r.scope.namespace === namespace
+      && sameProjectScope(r.scope, { project: project.data, projectId: projectId.data }) && !r.scope.task && r.spans.length === 1 && r.spans[0]!.text === text);
+    if (activeMatches.length > 1) return { success: false, error: "ambiguous_existing_rule" };
+    const existing = activeMatches[0] ?? catalog.records.find(r => r.id === knowledgeId);
     if (existing) {
-      if (existing.scope.namespace !== namespace || existing.scope.project !== project.data || existing.scope.task
+      if (existing.scope.namespace !== namespace || !sameProjectScope(existing.scope, { project: project.data, projectId: projectId.data }) || existing.scope.task
         || existing.spans.length !== 1 || existing.spans[0]!.text !== text) {
         return { success: false, error: "knowledge_changed" };
       }
       if (existing.status !== "candidate" || existing.captureDisposition !== "unavailable") {
-        return { success: true, action: "existing", knowledgeId, status: existing.status };
+        return { success: true, action: "existing", knowledgeId: existing.id, status: existing.status };
       }
     }
     const existingRules = catalog.records.filter(r => r.status === "active"
-      && r.scope.namespace === namespace && (!r.scope.project || r.scope.project === project.data))
+      && r.scope.namespace === namespace && ((!r.scope.project && !r.scope.projectId) || sameProjectScope(r.scope, { project: project.data, projectId: projectId.data })))
       .flatMap(r => r.spans.map(span => span.text));
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -221,7 +217,7 @@ export function registerSelectiveContextFunctions(
       id: knowledgeId, revision: fingerprintId("capture", observationId),
       status: disposition === "project_rule" ? "active" : "candidate",
       captureDisposition: disposition,
-      scope: { namespace, project: project.data },
+      scope: { namespace, project: project.data, projectId: projectId.data },
       evidence: { eventId: observationId, sessionId, text: source.userPrompt, adoptedAt: now() },
       spans: [{ id: "user-text", text }],
     });

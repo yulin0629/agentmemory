@@ -5,7 +5,7 @@ export interface ContextKnowledge {
   captureDisposition?: "project_rule" | "task_only" | "unclear" | "unavailable";
   supersedes?: { id: string; revision: string };
   supersededBy?: string;
-  scope: { namespace: string; project?: string; task?: string };
+  scope: { namespace: string; project?: string; projectId?: string; task?: string };
   evidence: { eventId: string; text: string; adoptedAt: string; sessionId?: string };
   spans: Array<{ id: string; text: string }>;
 }
@@ -15,6 +15,7 @@ export interface ContextRequest {
   previous: string;
   namespace: string;
   project?: string;
+  projectId?: string;
   task?: string;
   asOf: string;
   excludedIds?: string[];
@@ -62,12 +63,18 @@ function boundCandidates(
   return bounded;
 }
 
+export function sameProjectScope(a: { project?: string; projectId?: string }, b: { project?: string; projectId?: string }): boolean {
+  if (a.projectId || b.projectId) return Boolean(a.projectId && b.projectId && a.projectId === b.projectId);
+  return a.project === b.project;
+}
+
 function eligible(record: ContextKnowledge, request: ContextRequest): boolean {
   const time = Date.parse(request.asOf);
   const adopted = Date.parse(record.evidence.adoptedAt);
   return record.status === "active"
     && record.scope.namespace === request.namespace
-    && (!record.scope.project || record.scope.project === request.project)
+    && ((!record.scope.project && !record.scope.projectId)
+      || Boolean(record.scope.projectId && record.scope.projectId === request.projectId))
     && (!record.scope.task || record.scope.task === request.task)
     && !request.excludedIds?.includes(record.id)
     && Boolean(record.id && record.revision && record.evidence.eventId)

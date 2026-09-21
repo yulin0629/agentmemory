@@ -35,6 +35,7 @@ import { recordAudit } from "./audit.js";
 import { indexRecords } from "./search.js";
 import { resetLessonIndex } from "./lessons.js";
 import { logger } from "../logger.js";
+import { exportContextKnowledge, parseContextKnowledgeBackups, restoreContextKnowledge } from "../state/context-knowledge-backup.js";
 
 // Bounded-concurrency chunk size for the import delete/write loops. A
 // "replace" or "merge" of a large export (up to MAX_TOTAL_OBSERVATIONS,
@@ -137,6 +138,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       ]);
 
       const exportData: ExportData = {
+        contextKnowledge: await exportContextKnowledge(kv),
         version: VERSION,
         exportedAt: new Date().toISOString(),
         sessions: paginatedSessions,
@@ -294,6 +296,13 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           success: false,
           error: `Too many total observations (max ${MAX_TOTAL_OBSERVATIONS})`,
         };
+      }
+
+      try {
+        const contexts = parseContextKnowledgeBackups(importData.contextKnowledge);
+        await restoreContextKnowledge(kv, contexts, strategy);
+      } catch (error) {
+        return { success: false, error: `Context knowledge import rejected: ${error instanceof Error ? error.message : String(error)}` };
       }
 
       const stats = {

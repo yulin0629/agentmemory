@@ -9,12 +9,14 @@ import type {
   Memory,
   GraphNode,
   AccessLogExport,
+  ContextKnowledgeBackup,
 } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { VERSION } from "../version.js";
 import { logger } from "../logger.js";
+import { exportContextKnowledge, parseContextKnowledgeBackups, restoreContextKnowledge } from "../state/context-knowledge-backup.js";
 
 const COMMIT_HASH_RE = /^[0-9a-f]{7,40}$/i;
 
@@ -76,6 +78,7 @@ export function registerSnapshotFunction(
         }
 
         const state = {
+          contextKnowledge: await exportContextKnowledge(kv),
           version: VERSION,
           timestamp: ts,
           sessions,
@@ -183,6 +186,7 @@ export function registerSnapshotFunction(
         ]);
         const content = readFileSync(join(snapshotDir, "state.json"), "utf-8");
         const state = JSON.parse(content) as {
+          contextKnowledge?: ContextKnowledgeBackup[];
           sessions?: Array<{ id: string } & Record<string, unknown>>;
           memories?: Array<{ id: string } & Record<string, unknown>>;
           graphNodes?: Array<{ id: string } & Record<string, unknown>>;
@@ -192,6 +196,8 @@ export function registerSnapshotFunction(
           >;
           accessLogs?: AccessLogExport[];
         };
+
+        await restoreContextKnowledge(kv, parseContextKnowledgeBackups(state.contextKnowledge), "replace");
 
         if (state.sessions) {
           for (const session of state.sessions) {
