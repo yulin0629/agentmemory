@@ -459,6 +459,7 @@ export function getSelectiveContextConfig(): {
   enabled: boolean;
   namespace?: string;
   apiKey?: string;
+  secret?: string;
 } {
   const env = getMergedEnv();
   const namespace = env["AGENTMEMORY_CONTEXT_NAMESPACE"]?.trim() || undefined;
@@ -467,6 +468,7 @@ export function getSelectiveContextConfig(): {
     enabled: env["AGENTMEMORY_SELECTIVE_CONTEXT"] === "true",
     namespace,
     apiKey,
+    secret: env["AGENTMEMORY_SELECTIVE_CONTEXT_SECRET"]?.trim() || undefined,
   };
 }
 

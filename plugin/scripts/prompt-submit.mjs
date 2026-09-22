@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { execFileSync, execSync } from "node:child_process";
-import { basename, resolve } from "node:path";
-import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "node:fs";
-import { hostname } from "node:os";
+import { basename, join, resolve } from "node:path";
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { homedir, hostname } from "node:os";
 import { createHash } from "node:crypto";
 //#region src/hooks/_project.ts
 /** Selective memory identity is separate from legacy human-readable project labels. */
@@ -170,15 +170,31 @@ function isRememberRequest(prompt) {
 	return typeof prompt === "string" && /^(?:(?:請)?記住|確認取代)[：:]/u.test(prompt.trim());
 }
 //#endregion
+//#region src/hooks/_selective-settings.ts
+function selectiveSettings() {
+	let local = {};
+	try {
+		local = JSON.parse(readFileSync(join(homedir(), ".config", "agentmemory", "selective-context.json"), "utf8"));
+	} catch {}
+	return {
+		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
+		url: process.env.AGENTMEMORY_URL || local?.url || "http://localhost:3111",
+		secret: process.env.AGENTMEMORY_SECRET || local?.secret || "",
+		owner: local?.owner
+	};
+}
+//#endregion
 //#region src/hooks/prompt-submit.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
 	if (!payload || typeof payload !== "object") return false;
 	return payload.entrypoint === "sdk-ts";
 }
-const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
-const SELECTIVE_CONTEXT_INJECT = process.env["AGENTMEMORY_SELECTIVE_CONTEXT_INJECT"] === "true";
+const settings = selectiveSettings();
+const REST_URL = settings.url;
+const SECRET = settings.secret;
+const SHARED_CLIENT = process.env.AGENTMEMORY_SHARED_CLIENT === "1";
+const SELECTIVE_CONTEXT_INJECT = settings.enabled && (settings.owner !== "agent-hooks" || SHARED_CLIENT);
 const SELECTIVE_CONTEXT_TIMEOUT_MS = 2e3;
 function authHeaders() {
 	const h = { "Content-Type": "application/json" };
@@ -216,7 +232,7 @@ async function main() {
 	const project = resolveProject(cwd);
 	const projectId = SELECTIVE_CONTEXT_INJECT ? resolveContextProjectId(cwd) : void 0;
 	const prompt = typeof data.prompt === "string" ? data.prompt : typeof data.userPrompt === "string" ? data.userPrompt : "";
-	const observation = fetch(`${REST_URL}/agentmemory/observe`, {
+	const observation = SHARED_CLIENT && !isRememberRequest(prompt) ? Promise.resolve(null) : fetch(`${REST_URL}/agentmemory/observe`, {
 		method: "POST",
 		headers: authHeaders(),
 		body: JSON.stringify({
@@ -237,7 +253,7 @@ async function main() {
 		let notice = "[Memory update] Storage could not be confirmed. Do not claim this request was saved.";
 		try {
 			const response = await observation;
-			const saved = (response.ok ? await response.json() : null)?.knowledgeCapture;
+			const saved = (response?.ok ? await response.json() : null)?.knowledgeCapture;
 			if (saved?.success && saved.action === "replaced" && saved.status === "active") notice = "[Memory update] The exact old project rule was superseded by the new rule. Both sources and their replacement link are retained. Only the new rule is eligible for future recall.";
 			else if (saved?.success && saved.status === "active") notice = "[Memory update] This rule is stored for this project, with its source event. Future recall is relevance-filtered; this is not a global rule.";
 			else if (saved?.success && saved.status === "candidate") notice = "[Memory update] This rule is a candidate only. It is not active and will not be automatically recalled.";

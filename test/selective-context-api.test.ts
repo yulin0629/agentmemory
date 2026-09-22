@@ -5,6 +5,7 @@ const ENV_KEYS = [
   "AGENTMEMORY_SELECTIVE_CONTEXT",
   "AGENTMEMORY_CONTEXT_NAMESPACE",
   "TYPESAFE_API_KEY",
+  "AGENTMEMORY_SELECTIVE_CONTEXT_SECRET",
 ] as const;
 const originalEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
 
@@ -50,6 +51,7 @@ describe("selective context REST endpoints", () => {
     process.env.AGENTMEMORY_SELECTIVE_CONTEXT = "true";
     process.env.AGENTMEMORY_CONTEXT_NAMESPACE = "personal";
     process.env.TYPESAFE_API_KEY = "test-key";
+    delete process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET;
   });
 
   afterEach(() => {
@@ -65,7 +67,7 @@ describe("selective context REST endpoints", () => {
     const result = await handlers.get("api::context-knowledge-put")!({ body: knowledgeBody() }) as {
       status_code: number; body: { error: string };
     };
-    expect(result).toMatchObject({ status_code: 503, body: { error: "selective context requires AGENTMEMORY_SECRET" } });
+    expect(result).toMatchObject({ status_code: 503, body: { error: "selective context requires AGENTMEMORY_SECRET or AGENTMEMORY_SELECTIVE_CONTEXT_SECRET" } });
     expect(trigger).not.toHaveBeenCalled();
   });
 
@@ -87,6 +89,32 @@ describe("selective context REST endpoints", () => {
       function_id: "mem::context-knowledge-put",
       payload: knowledgeBody(),
     });
+  });
+
+  it("protects recall and explicit capture without changing legacy observation access", async () => {
+    process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET = "context-only";
+    const { handlers, trigger } = setup("");
+    const body = { hookType: "prompt_submit", sessionId: "session", project: "repo", cwd: "/repo",
+      timestamp: new Date().toISOString(), data: { prompt: "hello" } };
+    expect(await handlers.get("api::observe")!({ body })).toMatchObject({ status_code: 201 });
+    trigger.mockClear();
+    const explicit = { ...body, data: { prompt: "記住：使用 ASCII。", explicitMemoryRequest: true } };
+    for (const [name, input] of [["api::observe", explicit], ["api::selective-context", { prompt: "draw" }],
+      ["api::context-knowledge-put", knowledgeBody()]] as const) {
+      expect(await handlers.get(name)!({ body: input })).toMatchObject({ status_code: 401 });
+    }
+    expect(trigger).not.toHaveBeenCalled();
+    expect(await handlers.get("api::observe")!({ body: explicit,
+      headers: { authorization: "Bearer context-only" } })).toMatchObject({ status_code: 201 });
+    expect(await handlers.get("api::selective-context")!({ body: { prompt: "draw" },
+      headers: { authorization: "Bearer context-only" } })).toMatchObject({ status_code: 200 });
+  });
+
+  it("does not bypass a configured global secret with the selective secret", async () => {
+    process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET = "context-only";
+    const { handlers } = setup();
+    expect(await handlers.get("api::selective-context")!({ body: { prompt: "draw" },
+      headers: { authorization: "Bearer context-only" } })).toMatchObject({ status_code: 401 });
   });
 
   it("does not expose recall while the feature configuration is incomplete", async () => {

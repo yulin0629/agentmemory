@@ -164,6 +164,11 @@ export function registerApiTriggers(
   metricsStore?: MetricsStore,
   provider?: ResilientProvider | { circuitState?: unknown },
 ): void {
+  const selectiveSecret = secret || getSelectiveContextConfig().secret;
+  const authorizeSelective = (req: ApiRequest): Response | null =>
+    !selectiveSecret
+      ? { status_code: 503, body: { error: "selective context requires AGENTMEMORY_SECRET or AGENTMEMORY_SELECTIVE_CONTEXT_SECRET" } }
+      : checkAuth(req, selectiveSecret);
   sdk.registerFunction(
     "middleware::api-auth",
     async (input: {
@@ -320,6 +325,10 @@ export function registerApiTriggers(
   sdk.registerFunction("api::observe",
     async (req: ApiRequest<HookPayload>): Promise<Response> => {
       const body = (req.body ?? {}) as Record<string, unknown>;
+      if ((body.data as { explicitMemoryRequest?: unknown } | null)?.explicitMemoryRequest === true) {
+        const denied = authorizeSelective(req);
+        if (denied) return denied;
+      }
       const hookType = asNonEmptyString(body.hookType);
       const sessionId = asNonEmptyString(body.sessionId);
       const project = asNonEmptyString(body.project);
@@ -3288,9 +3297,7 @@ export function registerApiTriggers(
   // This is intentionally a separate API from lessons: only callers that
   // attest an exact user-confirmed source event can add recallable context.
   sdk.registerFunction("api::context-knowledge-put", async (req: ApiRequest) => {
-    const secretErr = requireConfiguredSecret(secret, "selective context");
-    if (secretErr) return secretErr;
-    const denied = checkAuth(req, secret);
+    const denied = authorizeSelective(req);
     if (denied) return denied;
     if (!getSelectiveContextConfig().enabled || !getSelectiveContextConfig().namespace
       || !getSelectiveContextConfig().apiKey) {
@@ -3313,9 +3320,7 @@ export function registerApiTriggers(
   sdk.registerTrigger({ type: "http", function_id: "api::context-knowledge-put", config: { api_path: "/agentmemory/context-knowledge", http_method: "POST" } });
 
   sdk.registerFunction("api::selective-context", async (req: ApiRequest) => {
-    const secretErr = requireConfiguredSecret(secret, "selective context");
-    if (secretErr) return secretErr;
-    const denied = checkAuth(req, secret);
+    const denied = authorizeSelective(req);
     if (denied) return denied;
     if (!getSelectiveContextConfig().enabled || !getSelectiveContextConfig().namespace
       || !getSelectiveContextConfig().apiKey) {

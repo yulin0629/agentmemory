@@ -224,6 +224,7 @@ async function main() {
   const kv = new StateKV(sdk);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
   const selectiveContext = getSelectiveContextConfig();
+  const selectiveSecret = secret || selectiveContext.secret;
   const remoteMcpSecret = getEnvVar("AGENTMEMORY_MCP_BEARER_TOKEN");
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
@@ -241,7 +242,7 @@ async function main() {
 
   registerPrivacyFunction(sdk);
   registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession,
-    Boolean(secret && selectiveContext.enabled && selectiveContext.namespace && selectiveContext.apiKey));
+    Boolean(selectiveSecret && selectiveContext.enabled && selectiveContext.namespace && selectiveContext.apiKey));
   registerImageQuotaCleanup(sdk, kv);
   registerVisionSearchFunctions(sdk, kv, imageEmbeddingProvider);
   if (isSlotsEnabled()) {
@@ -333,7 +334,7 @@ async function main() {
     registerSelectiveContextFunctions(sdk, kv, {
       namespace: selectiveContext.namespace,
       judge: createJevContextJudge(selectiveContext.apiKey),
-      captureJudge: secret ? createJevCaptureJudge(selectiveContext.apiKey) : undefined,
+      captureJudge: selectiveSecret ? createJevCaptureJudge(selectiveContext.apiKey) : undefined,
     });
     bootLog(`Selective context: enabled for namespace ${selectiveContext.namespace}`);
   }

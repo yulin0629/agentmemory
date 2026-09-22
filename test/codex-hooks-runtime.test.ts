@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { join, resolve } from "node:path";
@@ -45,6 +45,7 @@ async function runHook(
         ...process.env,
         AGENTMEMORY_URL: `http://127.0.0.1:${address.port}`,
         AGENTMEMORY_SECRET: "",
+        AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "false",
         ...env,
       },
       stdio: ["pipe", "pipe", "pipe"],
@@ -87,6 +88,27 @@ function codexPayload(event: string, extra: Record<string, unknown> = {}) {
 }
 
 describe("Codex hook runtime contract", () => {
+  it("shared ownership silences standalone recall but keeps prompt telemetry", async () => {
+    const home = mkdtempSync(join(tmpdir(), "shared-memory-owner-"));
+    try {
+      mkdirSync(join(home, ".config", "agentmemory"), { recursive: true });
+      writeFileSync(join(home, ".config", "agentmemory", "selective-context.json"),
+        JSON.stringify({ enabled: true, owner: "agent-hooks" }));
+      const result = await runHook("prompt-submit.mjs", codexPayload("UserPromptSubmit", { prompt: "draw the flow" }),
+        { HOME: home, USERPROFILE: home, AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" });
+      expect(result.stdout).toBe("");
+      expect(result.requests.map(r => r.path)).toEqual(["/agentmemory/observe"]);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it("the shared client recalls without duplicating ordinary prompt telemetry", async () => {
+    const result = await runHook("prompt-submit.mjs", codexPayload("UserPromptSubmit", { prompt: "draw the flow" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true", AGENTMEMORY_SHARED_CLIENT: "1" }, 0,
+      { "/agentmemory/selective-context": { status: "selected", spans: [{ text: "Use ASCII diagrams." }] } });
+    expect(result.requests.map(r => r.path)).toEqual(["/agentmemory/selective-context"]);
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("Use ASCII diagrams.");
+  });
+
   it("SessionStart registers the session and emits Codex JSON context", async () => {
     const result = await runHook(
       "session-start.mjs",

@@ -2,6 +2,7 @@
 import { resolveProject, resolveContextProjectId, hookCwd } from "./_project.js";
 import { previousContext } from "./_previous-context.js";
 import { isRememberRequest } from "../state/explicit-memory.js";
+import { selectiveSettings } from "./_selective-settings.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -9,9 +10,11 @@ function isSdkChildContext(payload: unknown): boolean {
   return (payload as { entrypoint?: unknown }).entrypoint === "sdk-ts";
 }
 
-const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
-const SELECTIVE_CONTEXT_INJECT = process.env["AGENTMEMORY_SELECTIVE_CONTEXT_INJECT"] === "true";
+const settings = selectiveSettings();
+const REST_URL = settings.url;
+const SECRET = settings.secret;
+const SHARED_CLIENT = process.env.AGENTMEMORY_SHARED_CLIENT === "1";
+const SELECTIVE_CONTEXT_INJECT = settings.enabled && (settings.owner !== "agent-hooks" || SHARED_CLIENT);
 const SELECTIVE_CONTEXT_TIMEOUT_MS = 2000;
 
 function authHeaders(): Record<string, string> {
@@ -70,7 +73,7 @@ async function main() {
   const prompt = typeof data.prompt === "string" ? data.prompt
     : typeof data.userPrompt === "string" ? data.userPrompt : "";
 
-  const observation = fetch(`${REST_URL}/agentmemory/observe`, {
+  const observation = SHARED_CLIENT && !isRememberRequest(prompt) ? Promise.resolve(null) : fetch(`${REST_URL}/agentmemory/observe`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({
@@ -89,7 +92,7 @@ async function main() {
     let notice = "[Memory update] Storage could not be confirmed. Do not claim this request was saved.";
     try {
       const response = await observation;
-      const result = response.ok ? await response.json() as {
+      const result = response?.ok ? await response.json() as {
         knowledgeCapture?: { success?: boolean; status?: string; action?: string; knowledgeId?: string };
       } : null;
       const saved = result?.knowledgeCapture;
