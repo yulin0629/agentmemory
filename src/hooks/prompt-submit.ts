@@ -17,6 +17,13 @@ const SHARED_CLIENT = process.env.AGENTMEMORY_SHARED_CLIENT === "1";
 const SELECTIVE_CONTEXT_INJECT = settings.enabled && (settings.owner !== "agent-hooks" || SHARED_CLIENT);
 const SELECTIVE_CONTEXT_TIMEOUT_MS = 2000;
 
+// Diagnostic metadata travels separately from model-facing stdout. Never log content or errors verbatim.
+function diagnostic(reason: string, fields: Record<string, string | number> = {}) {
+  if (process.env.AGENTMEMORY_RECALL_DIAGNOSTICS === "1") {
+    process.stderr.write(`AGENTMEMORY_RECALL ${JSON.stringify({ reason, ...fields })}\n`);
+  }
+}
+
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
   if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
@@ -99,6 +106,7 @@ async function main() {
         knowledgeCapture?: { success?: boolean; status?: string; action?: string; knowledgeId?: string };
       } : null;
       const saved = result?.knowledgeCapture;
+      diagnostic(saved?.success ? "capture_acknowledged" : "capture_unconfirmed");
       if (saved?.success && saved.action === "replaced" && saved.status === "active") {
         notice = "[Memory update] The exact old project rule was superseded by the new rule. Both sources and their replacement link are retained. Only the new rule is eligible for future recall.";
       } else if (saved?.success && saved.status === "active") {
@@ -108,13 +116,14 @@ async function main() {
       } else if (saved?.success) {
         notice = "[Memory update] An existing inactive record was left unchanged. This request did not reactivate it.";
       }
-    } catch { /* A missing response is not evidence that storage succeeded. */ }
+    } catch { diagnostic("capture_unconfirmed"); }
     process.stdout.write(contextPayload(data, notice));
     return;
   }
   observation.catch(() => {});
 
   if (SELECTIVE_CONTEXT_INJECT && prompt.trim()) {
+    const started = performance.now();
     try {
       const response = await fetch(`${REST_URL}/agentmemory/selective-context`, {
         method: "POST",
@@ -124,13 +133,24 @@ async function main() {
         signal: AbortSignal.timeout(SELECTIVE_CONTEXT_TIMEOUT_MS),
       });
       if (response.ok) {
-        const context = renderSelectedContext(await response.json());
+        const result = await response.json();
+        const context = renderSelectedContext(result);
+        diagnostic(context ? "selected" : result?.status === "empty" ? "api_empty"
+          : result?.status === "unavailable" ? "api_unavailable" : "invalid_response", {
+          http_status: response.status,
+          api_ms: Math.round(performance.now() - started),
+          selected_spans: context ? result.spans.length : 0,
+          ...(Number.isSafeInteger(result?.catalogRevision) ? { catalog_revision: result.catalogRevision } : {}),
+        });
         if (context) process.stdout.write(contextPayload(data, context));
-      }
-    } catch {
+      } else diagnostic("http_error", { http_status: response.status, api_ms: Math.round(performance.now() - started) });
+    } catch (error) {
+      diagnostic(error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name)
+        ? "api_timeout" : error instanceof SyntaxError ? "invalid_response" : "network_error",
+      { api_ms: Math.round(performance.now() - started) });
       // A slow or unavailable judge must never block a user prompt.
     }
-  }
+  } else diagnostic("disabled_or_empty_prompt");
   setTimeout(() => process.exit(0), 1500).unref();
 }
 

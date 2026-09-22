@@ -29,7 +29,11 @@ async function recallForPrompt(prompt, sessionId, cwd, transcriptPath) {
 				...process.env,
 				AGENTMEMORY_SHARED_CLIENT: "1"
 			}
-		}, (error, stdout) => {
+		}, (error, stdout, stderr) => {
+			if (process.env.AGENTMEMORY_RECALL_DIAGNOSTICS === "1") {
+				for (const line of stderr.split("\n")) if (line.startsWith("AGENTMEMORY_RECALL ")) process.stderr.write(line + "\n");
+				if (error) process.stderr.write(`AGENTMEMORY_RECALL ${JSON.stringify({ reason: error.killed ? "client_timeout" : "client_error" })}\n`);
+			}
 			if (error) return resolve("");
 			try {
 				const text = JSON.parse(stdout).hookSpecificOutput?.additionalContext;

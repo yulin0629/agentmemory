@@ -8,7 +8,13 @@ export async function recallForPrompt(prompt: string, sessionId: string, cwd: st
   if (!selectiveSettings().enabled || !prompt.trim()) return "";
   return new Promise(resolve => {
     const child = execFile(process.execPath, [fileURLToPath(new URL("./prompt-submit.mjs", import.meta.url))],
-      { timeout: 6500, maxBuffer: 16384, env: { ...process.env, AGENTMEMORY_SHARED_CLIENT: "1" } }, (error, stdout) => {
+      { timeout: 6500, maxBuffer: 16384, env: { ...process.env, AGENTMEMORY_SHARED_CLIENT: "1" } }, (error, stdout, stderr) => {
+        if (process.env.AGENTMEMORY_RECALL_DIAGNOSTICS === "1") {
+          for (const line of stderr.split("\n")) {
+            if (line.startsWith("AGENTMEMORY_RECALL ")) process.stderr.write(line + "\n");
+          }
+          if (error) process.stderr.write(`AGENTMEMORY_RECALL ${JSON.stringify({ reason: error.killed ? "client_timeout" : "client_error" })}\n`);
+        }
         if (error) return resolve("");
         try {
           const text = JSON.parse(stdout).hookSpecificOutput?.additionalContext;

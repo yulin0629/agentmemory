@@ -197,6 +197,12 @@ const SECRET = settings.secret;
 const SHARED_CLIENT = process.env.AGENTMEMORY_SHARED_CLIENT === "1";
 const SELECTIVE_CONTEXT_INJECT = settings.enabled && (settings.owner !== "agent-hooks" || SHARED_CLIENT);
 const SELECTIVE_CONTEXT_TIMEOUT_MS = 2e3;
+function diagnostic(reason, fields = {}) {
+	if (process.env.AGENTMEMORY_RECALL_DIAGNOSTICS === "1") process.stderr.write(`AGENTMEMORY_RECALL ${JSON.stringify({
+		reason,
+		...fields
+	})}\n`);
+}
 function authHeaders() {
 	const h = { "Content-Type": "application/json" };
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
@@ -258,32 +264,50 @@ async function main() {
 		try {
 			const response = await observation;
 			const saved = (response?.ok ? await response.json() : null)?.knowledgeCapture;
+			diagnostic(saved?.success ? "capture_acknowledged" : "capture_unconfirmed");
 			if (saved?.success && saved.action === "replaced" && saved.status === "active") notice = "[Memory update] The exact old project rule was superseded by the new rule. Both sources and their replacement link are retained. Only the new rule is eligible for future recall.";
 			else if (saved?.success && saved.status === "active") notice = "[Memory update] This rule is stored for this project, with its source event. Future recall is relevance-filtered; this is not a global rule.";
 			else if (saved?.success && saved.status === "candidate") notice = "[Memory update] This rule is a candidate only. It is not active and will not be automatically recalled.";
 			else if (saved?.success) notice = "[Memory update] An existing inactive record was left unchanged. This request did not reactivate it.";
-		} catch {}
+		} catch {
+			diagnostic("capture_unconfirmed");
+		}
 		process.stdout.write(contextPayload(data, notice));
 		return;
 	}
 	observation.catch(() => {});
-	if (SELECTIVE_CONTEXT_INJECT && prompt.trim()) try {
-		const response = await fetch(`${REST_URL}/agentmemory/selective-context`, {
-			method: "POST",
-			headers: authHeaders(),
-			body: JSON.stringify({
-				prompt,
-				project,
-				projectId,
-				previous: previousContext(data.transcript_path, sessionId, prompt)
-			}),
-			signal: AbortSignal.timeout(SELECTIVE_CONTEXT_TIMEOUT_MS)
-		});
-		if (response.ok) {
-			const context = renderSelectedContext(await response.json());
-			if (context) process.stdout.write(contextPayload(data, context));
+	if (SELECTIVE_CONTEXT_INJECT && prompt.trim()) {
+		const started = performance.now();
+		try {
+			const response = await fetch(`${REST_URL}/agentmemory/selective-context`, {
+				method: "POST",
+				headers: authHeaders(),
+				body: JSON.stringify({
+					prompt,
+					project,
+					projectId,
+					previous: previousContext(data.transcript_path, sessionId, prompt)
+				}),
+				signal: AbortSignal.timeout(SELECTIVE_CONTEXT_TIMEOUT_MS)
+			});
+			if (response.ok) {
+				const result = await response.json();
+				const context = renderSelectedContext(result);
+				diagnostic(context ? "selected" : result?.status === "empty" ? "api_empty" : result?.status === "unavailable" ? "api_unavailable" : "invalid_response", {
+					http_status: response.status,
+					api_ms: Math.round(performance.now() - started),
+					selected_spans: context ? result.spans.length : 0,
+					...Number.isSafeInteger(result?.catalogRevision) ? { catalog_revision: result.catalogRevision } : {}
+				});
+				if (context) process.stdout.write(contextPayload(data, context));
+			} else diagnostic("http_error", {
+				http_status: response.status,
+				api_ms: Math.round(performance.now() - started)
+			});
+		} catch (error) {
+			diagnostic(error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name) ? "api_timeout" : error instanceof SyntaxError ? "invalid_response" : "network_error", { api_ms: Math.round(performance.now() - started) });
 		}
-	} catch {}
+	} else diagnostic("disabled_or_empty_prompt");
 	setTimeout(() => process.exit(0), 1500).unref();
 }
 main().catch(() => process.exit(0));
