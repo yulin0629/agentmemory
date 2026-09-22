@@ -56,11 +56,15 @@ function setup(captureJudge: CaptureJudge = async () => "project_rule", enabled 
 describe("explicit memory capture", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("searches historical lessons only after source-backed adoption and disables changed sources", async () => {
+  it("recalls historical lessons without adoption, then lets the catalog govern adopted ones", async () => {
     const app = setup();
     const text = "Database migrations require rollback verification.";
     const saved = await app.call("mem::lesson-save", { content: text, project: "project-a" });
-    expect(await app.call("mem::selective-context", { prompt: "database migrations", project: "project-a" })).toMatchObject({ status: "empty" });
+    expect(await app.call("mem::selective-context", { prompt: "database migrations", project: "project-a" }))
+      .toMatchObject({ status: "selected", spans: [{ text }], candidates: { catalog: 0, lessons: 1 } });
+    expect(await app.call("mem::selective-context", { prompt: "database migrations", project: "other" }))
+      .toMatchObject({ status: "selected", spans: [{ text }] });
+    expect(await app.call("mem::selective-context", { prompt: "weather tomorrow", project: "project-a" })).toMatchObject({ status: "empty" });
     await app.observe(`記住：${text}`);
     expect((await app.catalog())!.records[0]!.lessonId).toBe(saved.lesson.id);
     expect(await app.call("mem::selective-context", { prompt: "database migrations", project: "project-a" })).toMatchObject({ status: "selected", spans: [{ text }] });

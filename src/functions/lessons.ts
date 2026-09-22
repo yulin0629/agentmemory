@@ -69,6 +69,23 @@ export async function searchContextLessons(kv: StateKV, query: string, eligibleI
     });
 }
 
+// Relevance-ranked recall over the whole lesson corpus. Selective recall
+// hands these to the judge as candidates; adoption through the catalog
+// is not required. Records whose KV copy drifted from the index are
+// dropped rather than served stale.
+export async function searchAllLessons(kv: StateKV, query: string, limit = 10): Promise<Lesson[]> {
+  const index = await ensureLessonIndex(kv);
+  const out: Lesson[] = [];
+  for (const hit of index.search(query, limit)) {
+    const indexed = lessonRecords.get(hit.obsId);
+    if (!indexed || indexed.deleted) continue;
+    const current = await kv.get<Lesson>(KV.lessons, hit.obsId);
+    if (!current || current.deleted || current.content !== indexed.content) continue;
+    out.push(current);
+  }
+  return out;
+}
+
 function reinforceLesson(lesson: Lesson): void {
   const now = new Date().toISOString();
   lesson.reinforcements++;

@@ -8,7 +8,7 @@ import { selectContext, sameProjectScope, type ContextJudge, type ContextKnowled
 import { explicitMemoryText, explicitReplacement, type CaptureJudge } from "../state/explicit-memory.js";
 import { safeAudit } from "./audit.js";
 import { knowledgeSchema } from "../state/context-knowledge-backup.js";
-import { findContextLesson, searchContextLessons } from "./lessons.js";
+import { findContextLesson, searchContextLessons, searchAllLessons } from "./lessons.js";
 
 const id = z.string().trim().min(1).max(200);
 
@@ -269,8 +269,28 @@ export function registerSelectiveContextFunctions(
       }
       validRecords.push(record);
     }
+    // Lessons the catalog already governs keep the catalog's scope; every
+    // other lesson is a candidate regardless of project, and the judge
+    // decides relevance. Same-project lessons are ordered first so the
+    // candidate budget favours them.
+    const governed = new Set(catalog.records.flatMap(r => r.lessonId ? [r.lessonId] : []));
+    const corpus = (await searchAllLessons(kv, `${parsed.data.prompt}\n${parsed.data.previous}`))
+      .filter(l => !governed.has(l.id));
+    const sameProject = (l: Lesson) => l.project === parsed.data.project || l.project === parsed.data.projectId;
+    const lessonRecordsForJudge: ContextKnowledge[] = [
+      ...corpus.filter(sameProject), ...corpus.filter(l => !sameProject(l)),
+    ].map(l => ({
+      id: `lesson:${l.id}`, revision: fingerprintId("lesson", JSON.stringify([l.id, l.updatedAt])),
+      lessonId: l.id, status: "active",
+      scope: { namespace },
+      evidence: { eventId: l.id, text: l.content, adoptedAt: l.createdAt },
+      spans: [{ id: "lesson", text: l.content.slice(0, 1200) }],
+    }));
+    for (const l of corpus) sourceVersions.set(l.id, JSON.stringify(l));
+    const candidates = [...validRecords, ...lessonRecordsForJudge];
     const result = await selectContext({ ...parsed.data, namespace, asOf: now() },
-      validRecords, options.judge);
+      candidates, options.judge);
+    const candidateCounts = { catalog: validRecords.length, lessons: lessonRecordsForJudge.length };
     const latest = await read();
     if (latest.revision !== catalog.revision) {
       return { status: "unavailable", spans: [], error: "knowledge_changed" };
@@ -280,6 +300,6 @@ export function registerSelectiveContextFunctions(
         return { status: "unavailable", spans: [], error: "knowledge_changed" };
       }
     }
-    return { ...result, catalogRevision: catalog.revision };
+    return { ...result, catalogRevision: catalog.revision, candidates: candidateCounts };
   });
 }

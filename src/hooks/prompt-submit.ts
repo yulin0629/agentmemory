@@ -141,6 +141,8 @@ async function main() {
           api_ms: Math.round(performance.now() - started),
           selected_spans: context ? result.spans.length : 0,
           ...(Number.isSafeInteger(result?.catalogRevision) ? { catalog_revision: result.catalogRevision } : {}),
+          ...(Number.isSafeInteger(result?.candidates?.catalog) && Number.isSafeInteger(result?.candidates?.lessons)
+            ? { candidates: result.candidates.catalog + result.candidates.lessons } : {}),
         });
         if (context) process.stdout.write(contextPayload(data, context));
       } else diagnostic("http_error", { http_status: response.status, api_ms: Math.round(performance.now() - started) });
