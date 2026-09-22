@@ -1,13 +1,14 @@
 import type { ISdk } from "iii-sdk";
 import { z } from "zod";
 import type { StateKV } from "../state/kv.js";
-import type { ContextKnowledgeCatalog, RawObservation } from "../types.js";
+import type { ContextKnowledgeCatalog, RawObservation, Lesson } from "../types.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { selectContext, sameProjectScope, type ContextJudge, type ContextKnowledge } from "../state/selective-context.js";
 import { explicitMemoryText, explicitReplacement, type CaptureJudge } from "../state/explicit-memory.js";
 import { safeAudit } from "./audit.js";
 import { knowledgeSchema } from "../state/context-knowledge-backup.js";
+import { findContextLesson, searchContextLessons } from "./lessons.js";
 
 const id = z.string().trim().min(1).max(200);
 
@@ -93,6 +94,25 @@ export function registerSelectiveContextFunctions(
   sdk.registerFunction("mem::context-knowledge-put", async (input: unknown) => {
     const parsed = contextKnowledgePutSchema.extend(workerMetadata).safeParse(input);
     if (!parsed.success) return { success: false, error: "invalid_knowledge" };
+    const knowledge = parsed.data.knowledge;
+    if (knowledge.lessonId) {
+      const source = knowledge.evidence.sessionId
+        ? await kv.get<RawObservation>(KV.observations(knowledge.evidence.sessionId), knowledge.evidence.eventId) : null;
+      const session = knowledge.evidence.sessionId
+        ? await kv.get<{ contextProjectId?: string }>(KV.sessions, knowledge.evidence.sessionId) : null;
+      const lesson = await kv.get<Lesson>(KV.lessons, knowledge.lessonId);
+      if (!source || source.id !== knowledge.evidence.eventId || source.sessionId !== knowledge.evidence.sessionId
+        || source.origin?.channel !== "user" || source.hookType !== "prompt_submit"
+        || (source.raw as { explicitMemoryRequest?: unknown } | null)?.explicitMemoryRequest !== true
+        || source.userPrompt !== knowledge.evidence.text || !knowledge.scope.projectId
+        || session?.contextProjectId !== knowledge.scope.projectId
+        || (source.raw as { contextProjectId?: unknown }).contextProjectId !== knowledge.scope.projectId
+        || explicitMemoryText(source.userPrompt) !== lesson?.content
+        || !lesson || lesson.deleted || lesson.project !== knowledge.scope.project
+        || knowledge.spans.length !== 1 || knowledge.spans[0]!.text !== lesson.content) {
+        return { success: false, error: "unverified_lesson_source" };
+      }
+    }
     return save(parsed.data.knowledge, parsed.data.expectedRevision);
   });
 
@@ -213,8 +233,10 @@ export function registerSelectiveContextFunctions(
       ]);
     } catch { /* Preserve source as a candidate; unavailable judgment never activates it. */ }
     finally { if (timer) clearTimeout(timer); }
+    const lesson = await findContextLesson(kv, text, project.data);
     const knowledge = knowledgeSchema.safeParse({
       id: knowledgeId, revision: fingerprintId("capture", observationId),
+      ...(lesson ? { lessonId: lesson.id } : {}),
       status: disposition === "project_rule" ? "active" : "candidate",
       captureDisposition: disposition,
       scope: { namespace, project: project.data, projectId: projectId.data },
@@ -229,11 +251,34 @@ export function registerSelectiveContextFunctions(
     const parsed = selectiveContextSchema.extend(workerMetadata).safeParse(input);
     if (!parsed.success) return { status: "unavailable", spans: [], error: "invalid_request" };
     const catalog = await read();
+    const scoped = catalog.records.filter(r => r.status === "active" && r.scope.namespace === namespace
+      && ((!r.scope.project && !r.scope.projectId) || (r.scope.projectId && r.scope.projectId === parsed.data.projectId))
+      && (!r.scope.task || r.scope.task === parsed.data.task));
+    const lessons = await searchContextLessons(kv, `${parsed.data.prompt}\n${parsed.data.previous}`,
+      new Set(scoped.flatMap(r => r.lessonId ? [r.lessonId] : [])));
+    const lessonIds = new Set(lessons.map(l => l.id));
+    const records = catalog.records.filter(r => !r.lessonId || lessonIds.has(r.lessonId));
+    const validRecords: ContextKnowledge[] = [];
+    const sourceVersions = new Map<string, string>();
+    for (const record of records) {
+      if (record.lessonId) {
+        const lesson = await kv.get<Lesson>(KV.lessons, record.lessonId);
+        if (!lesson || lesson.deleted || lesson.project !== record.scope.project
+          || record.spans.length !== 1 || record.spans[0]!.text !== lesson.content) continue;
+        sourceVersions.set(lesson.id, JSON.stringify(lesson));
+      }
+      validRecords.push(record);
+    }
     const result = await selectContext({ ...parsed.data, namespace, asOf: now() },
-      catalog.records, options.judge);
+      validRecords, options.judge);
     const latest = await read();
     if (latest.revision !== catalog.revision) {
       return { status: "unavailable", spans: [], error: "knowledge_changed" };
+    }
+    for (const [lessonId, version] of sourceVersions) {
+      if (JSON.stringify(await kv.get<Lesson>(KV.lessons, lessonId)) !== version) {
+        return { status: "unavailable", spans: [], error: "knowledge_changed" };
+      }
     }
     return { ...result, catalogRevision: catalog.revision };
   });

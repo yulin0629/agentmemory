@@ -1,6 +1,7 @@
 export interface ContextKnowledge {
   id: string;
   revision: string;
+  lessonId?: string;
   status: "candidate" | "active" | "superseded" | "retracted";
   captureDisposition?: "project_rule" | "task_only" | "unclear" | "unavailable";
   supersedes?: { id: string; revision: string };
@@ -47,6 +48,7 @@ export type ContextJudge = (
 function boundCandidates(
   records: ContextKnowledge[],
   maxCharacters: number,
+  maxCandidates: number,
 ): ContextKnowledge[] {
   let characters = 0;
   const bounded: ContextKnowledge[] = [];
@@ -59,6 +61,7 @@ function boundCandidates(
       return true;
     });
     if (spans.length) bounded.push({ ...record, spans });
+    if (bounded.length >= maxCandidates) break;
   }
   return bounded;
 }
@@ -95,13 +98,15 @@ export async function selectContext(
     maxCharacters?: number;
     maxSpans?: number;
     maxCandidateCharacters?: number;
+    maxCandidates?: number;
   } = {},
 ): Promise<{ status: "selected" | "empty" | "unavailable"; spans: ContextSpan[] }> {
   const maxCharacters = options.maxCharacters ?? 1200;
   const maxSpans = options.maxSpans ?? 2;
   const timeoutMs = options.timeoutMs ?? 1500;
   const maxCandidateCharacters = options.maxCandidateCharacters ?? 6000;
-  if (![maxCharacters, maxSpans, timeoutMs, maxCandidateCharacters]
+  const maxCandidates = options.maxCandidates ?? 10;
+  if (![maxCharacters, maxSpans, timeoutMs, maxCandidateCharacters, maxCandidates]
     .every(n => Number.isInteger(n) && n > 0)) {
     throw new Error("Context limits must be positive integers");
   }
@@ -110,7 +115,7 @@ export async function selectContext(
   if (new Set(eligibleCandidates.map(c => c.id)).size !== eligibleCandidates.length) {
     return { status: "unavailable", spans: [] };
   }
-  const candidates = boundCandidates(eligibleCandidates, maxCandidateCharacters);
+  const candidates = boundCandidates(eligibleCandidates, maxCandidateCharacters, maxCandidates);
   if (!request.prompt.trim() || !candidates.length) return { status: "empty", spans: [] };
 
   const controller = new AbortController();

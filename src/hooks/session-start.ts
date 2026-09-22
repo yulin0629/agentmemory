@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { resolveProject, hookCwd } from "./_project.js";
+import { sharedSelectiveRecall } from "./_selective-settings.js";
 
 // Inlined from ./sdk-guard so each hook bundles to a single self-contained
 // .mjs (matches the pattern used by every other hook entry in tsdown.config).
@@ -16,7 +17,7 @@ function isSdkChildContext(payload: unknown): boolean {
 // project context to stdout — which Claude Code prepends to the very first
 // turn — when AGENTMEMORY_INJECT_CONTEXT=true. Default off as of 0.8.10
 // (#143); see pre-tool-use.ts for the full explanation.
-const INJECT_CONTEXT = process.env["AGENTMEMORY_INJECT_CONTEXT"] === "true";
+const INJECT_CONTEXT = process.env["AGENTMEMORY_INJECT_CONTEXT"] === "true" && !sharedSelectiveRecall();
 
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";

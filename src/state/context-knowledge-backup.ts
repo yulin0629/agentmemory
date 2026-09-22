@@ -9,6 +9,7 @@ import { sameProjectScope } from "./selective-context.js";
 const id = z.string().trim().min(1).max(200);
 export const knowledgeSchema = z.object({
   id, revision: id,
+  lessonId: id.optional(),
   status: z.enum(["candidate", "active", "superseded", "retracted"]),
   captureDisposition: z.enum(["project_rule", "task_only", "unclear", "unavailable"]).optional(),
   supersedes: z.object({ id, revision: id }).strict().optional(), supersededBy: id.optional(),

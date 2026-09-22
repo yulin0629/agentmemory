@@ -168,7 +168,9 @@ export function registerApiTriggers(
   const authorizeSelective = (req: ApiRequest): Response | null =>
     !selectiveSecret
       ? { status_code: 503, body: { error: "selective context requires AGENTMEMORY_SECRET or AGENTMEMORY_SELECTIVE_CONTEXT_SECRET" } }
-      : checkAuth(req, selectiveSecret);
+      : checkAuth(!secret && (req.headers?.["x-agentmemory-selective-secret"] || req.headers?.["X-AgentMemory-Selective-Secret"])
+        ? { ...req, headers: { ...req.headers, authorization: `Bearer ${req.headers?.["x-agentmemory-selective-secret"] || req.headers?.["X-AgentMemory-Selective-Secret"]}` } }
+        : req, selectiveSecret);
   sdk.registerFunction(
     "middleware::api-auth",
     async (input: {

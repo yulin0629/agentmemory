@@ -13,6 +13,7 @@ function selectiveSettings() {
 		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
 		url: process.env.AGENTMEMORY_URL || local?.url || "http://localhost:3111",
 		secret: process.env.AGENTMEMORY_SECRET || local?.secret || "",
+		selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
 		owner: local?.owner
 	};
 }

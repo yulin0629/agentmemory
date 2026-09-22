@@ -20,6 +20,7 @@ const SELECTIVE_CONTEXT_TIMEOUT_MS = 2000;
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
   if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
+  if (settings.selectiveSecret) h["X-AgentMemory-Selective-Secret"] = settings.selectiveSecret;
   return h;
 }
 

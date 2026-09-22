@@ -180,6 +180,7 @@ function selectiveSettings() {
 		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
 		url: process.env.AGENTMEMORY_URL || local?.url || "http://localhost:3111",
 		secret: process.env.AGENTMEMORY_SECRET || local?.secret || "",
+		selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
 		owner: local?.owner
 	};
 }
@@ -199,6 +200,7 @@ const SELECTIVE_CONTEXT_TIMEOUT_MS = 2e3;
 function authHeaders() {
 	const h = { "Content-Type": "application/json" };
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
+	if (settings.selectiveSecret) h["X-AgentMemory-Selective-Secret"] = settings.selectiveSecret;
 	return h;
 }
 function contextPayload(data, context) {

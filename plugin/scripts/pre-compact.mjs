@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 //#region src/hooks/_project.ts
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
@@ -31,6 +33,25 @@ function hookCwd(data) {
 	if (projectDir && projectDir.trim()) return projectDir;
 }
 //#endregion
+//#region src/hooks/_selective-settings.ts
+function selectiveSettings() {
+	let local = {};
+	try {
+		local = JSON.parse(readFileSync(join(homedir(), ".config", "agentmemory", "selective-context.json"), "utf8"));
+	} catch {}
+	return {
+		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
+		url: process.env.AGENTMEMORY_URL || local?.url || "http://localhost:3111",
+		secret: process.env.AGENTMEMORY_SECRET || local?.secret || "",
+		selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
+		owner: local?.owner
+	};
+}
+function sharedSelectiveRecall() {
+	const settings = selectiveSettings();
+	return settings.enabled && settings.owner === "agent-hooks";
+}
+//#endregion
 //#region src/hooks/pre-compact.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -55,6 +76,7 @@ async function main() {
 	}
 	if (!data || typeof data !== "object") return;
 	if (isSdkChildContext(data)) return;
+	if (sharedSelectiveRecall()) return;
 	const sessionId = data.session_id || data.sessionId || data.conversation_id || "unknown";
 	const project = resolveProject(hookCwd(data));
 	if (process.env["CLAUDE_MEMORY_BRIDGE"] === "true") try {

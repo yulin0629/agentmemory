@@ -109,6 +109,20 @@ describe("Codex hook runtime contract", () => {
     expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("Use ASCII diagrams.");
   });
 
+  it("shared ownership disables broad startup, tool, and precompact injection", async () => {
+    const home = mkdtempSync(join(tmpdir(), "shared-memory-broad-"));
+    try {
+      mkdirSync(join(home, ".config", "agentmemory"), { recursive: true });
+      writeFileSync(join(home, ".config", "agentmemory", "selective-context.json"), JSON.stringify({ enabled: true, owner: "agent-hooks" }));
+      for (const [script, event] of [["session-start.mjs", "SessionStart"], ["pre-tool-use.mjs", "PreToolUse"], ["pre-compact.mjs", "PreCompact"]]) {
+        const result = await runHook(script, codexPayload(event, { tool_name: "Read", tool_input: { file_path: "/tmp/test" } }),
+          { HOME: home, USERPROFILE: home, AGENTMEMORY_INJECT_CONTEXT: "true", AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" });
+        expect(result.stdout).toBe("");
+        expect(result.requests.some(r => r.path.endsWith("/context") || r.path.endsWith("/enrich"))).toBe(false);
+      }
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
   it.each([
     [{ text: "valid" }, { text: 123 }],
     [{ text: "one" }, { text: "two" }, { text: "three" }],

@@ -108,6 +108,8 @@ describe("selective context REST endpoints", () => {
       headers: { authorization: "Bearer context-only" } })).toMatchObject({ status_code: 201 });
     expect(await handlers.get("api::selective-context")!({ body: { prompt: "draw" },
       headers: { authorization: "Bearer context-only" } })).toMatchObject({ status_code: 200 });
+    expect(await handlers.get("api::selective-context")!({ body: { prompt: "draw" },
+      headers: { authorization: "Bearer relay-only", "x-agentmemory-selective-secret": "context-only" } })).toMatchObject({ status_code: 200 });
   });
 
   it("does not bypass a configured global secret with the selective secret", async () => {
@@ -115,6 +117,8 @@ describe("selective context REST endpoints", () => {
     const { handlers } = setup();
     expect(await handlers.get("api::selective-context")!({ body: { prompt: "draw" },
       headers: { authorization: "Bearer context-only" } })).toMatchObject({ status_code: 401 });
+    expect(await handlers.get("api::selective-context")!({ body: { prompt: "draw" },
+      headers: { "x-agentmemory-selective-secret": "context-only" } })).toMatchObject({ status_code: 401 });
   });
 
   it("does not expose recall while the feature configuration is incomplete", async () => {

@@ -52,6 +52,23 @@ async function ensureLessonIndex(kv: StateKV): Promise<SearchIndex> {
   return lessonIndex ?? ensureLessonIndex(kv);
 }
 
+export async function findContextLesson(kv: StateKV, text: string, project: string): Promise<Lesson | undefined> {
+  for (const key of [JSON.stringify([project, text.toLowerCase()]), text.toLowerCase()]) {
+    const lesson = await kv.get<Lesson>(KV.lessons, fingerprintId("lsn", key));
+    if (lesson && !lesson.deleted && lesson.project === project && lesson.content === text) return lesson;
+  }
+}
+
+export async function searchContextLessons(kv: StateKV, query: string, eligibleIds: Set<string>, limit = 10): Promise<Lesson[]> {
+  if (!eligibleIds.size) return [];
+  const index = await ensureLessonIndex(kv);
+  return index.search(query, limit, id => eligibleIds.has(id))
+    .flatMap(hit => {
+      const lesson = lessonRecords.get(hit.obsId);
+      return lesson && !lesson.deleted ? [lesson] : [];
+    });
+}
+
 function reinforceLesson(lesson: Lesson): void {
   const now = new Date().toISOString();
   lesson.reinforcements++;

@@ -6,6 +6,7 @@ import { KV } from "../src/state/schema.js";
 import { DedupMap } from "../src/functions/dedup.js";
 import type { ContextJudge } from "../src/state/selective-context.js";
 import type { ContextKnowledgeCatalog } from "../src/types.js";
+import { registerLessonsFunctions, resetLessonIndex } from "../src/functions/lessons.js";
 
 vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 vi.mock("../src/config.js", () => ({ isAutoCompressEnabled: () => false, getAgentId: () => undefined }));
@@ -17,6 +18,7 @@ const useful: ContextJudge = async (_request, records) => records.flatMap(record
 })));
 
 function setup(captureJudge: CaptureJudge = async () => "project_rule", enabled = true) {
+  resetLessonIndex();
   const store = new Map<string, Map<string, unknown>>();
   const kv = {
     get: async <T>(scope: string, key: string) => (store.get(scope)?.get(key) as T) ?? null,
@@ -38,6 +40,7 @@ function setup(captureJudge: CaptureJudge = async () => "project_rule", enabled 
     }) ?? null,
   };
   registerObserveFunction(sdk as never, kv as never, new DedupMap(), undefined, enabled);
+  registerLessonsFunctions(sdk as never, kv as never);
   registerSelectiveContextFunctions(sdk as never, kv as never, { namespace: "capture-test", judge: useful, captureJudge });
   const call = async (id: string, payload: any): Promise<any> => sdk.trigger({ function_id: id, payload:
     id === "mem::selective-context" && payload.project ? { projectId: `test:${payload.project}`, ...payload } : payload });
@@ -52,6 +55,30 @@ function setup(captureJudge: CaptureJudge = async () => "project_rule", enabled 
 
 describe("explicit memory capture", () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it("searches historical lessons only after source-backed adoption and disables changed sources", async () => {
+    const app = setup();
+    const text = "Database migrations require rollback verification.";
+    const saved = await app.call("mem::lesson-save", { content: text, project: "project-a" });
+    expect(await app.call("mem::selective-context", { prompt: "database migrations", project: "project-a" })).toMatchObject({ status: "empty" });
+    await app.observe(`記住：${text}`);
+    expect((await app.catalog())!.records[0]!.lessonId).toBe(saved.lesson.id);
+    expect(await app.call("mem::selective-context", { prompt: "database migrations", project: "project-a" })).toMatchObject({ status: "selected", spans: [{ text }] });
+    expect(await app.call("mem::selective-context", { prompt: "database migrations", project: "other" })).toMatchObject({ status: "empty" });
+    expect(await app.call("mem::selective-context", { prompt: "weather tomorrow", project: "project-a" })).toMatchObject({ status: "empty" });
+    await app.kv.set(KV.lessons, saved.lesson.id, { ...saved.lesson, content: "Unapproved changed content" });
+    expect(await app.call("mem::selective-context", { prompt: "database migrations", project: "project-a" })).toMatchObject({ status: "empty" });
+  });
+
+  it("does not accept a lesson link backed only by caller-supplied evidence", async () => {
+    const app = setup();
+    await app.observe("記住：報告要附來源。");
+    const catalog = (await app.catalog())!;
+    expect(await app.call("mem::context-knowledge-put", { expectedRevision: catalog.revision, confirmedByUser: true,
+      knowledge: { ...catalog.records[0], lessonId: "forged", revision: "new", evidence: {
+        ...catalog.records[0]!.evidence, eventId: "forged-event",
+      } } })).toMatchObject({ success: false, error: "unverified_lesson_source" });
+  });
 
   const replacement = "確認取代：\n舊規則：報告使用英文。\n新規則：報告使用繁體中文。";
 
