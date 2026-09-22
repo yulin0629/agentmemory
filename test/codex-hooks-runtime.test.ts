@@ -109,6 +109,18 @@ describe("Codex hook runtime contract", () => {
     expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("Use ASCII diagrams.");
   });
 
+  it.each([
+    [{ text: "valid" }, { text: 123 }],
+    [{ text: "one" }, { text: "two" }, { text: "three" }],
+    [{ text: "x".repeat(1201) }],
+    [{ text: "same" }, { text: "same" }],
+  ])("silences malformed or over-budget recall responses %#", async (...spans) => {
+    const result = await runHook("prompt-submit.mjs", codexPayload("UserPromptSubmit", { prompt: "draw the flow" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true", AGENTMEMORY_SHARED_CLIENT: "1" }, 0,
+      { "/agentmemory/selective-context": { status: "selected", spans } });
+    expect(result.stdout).toBe("");
+  });
+
   it("SessionStart registers the session and emits Codex JSON context", async () => {
     const result = await runHook(
       "session-start.mjs",

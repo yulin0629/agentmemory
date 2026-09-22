@@ -42,10 +42,12 @@ function renderSelectedContext(result: unknown): string | null {
   if (!result || typeof result !== "object") return null;
   const response = result as { status?: unknown; spans?: unknown };
   if (response.status !== "selected" || !Array.isArray(response.spans)) return null;
+  if (response.spans.length === 0 || response.spans.length > 2) return null;
   const texts = response.spans
-    .map((span) => span && typeof span === "object" ? (span as { text?: unknown }).text : null)
-    .filter((text): text is string => typeof text === "string" && text.trim().length > 0);
-  if (!texts.length) return null;
+    .map((span) => span && typeof span === "object" ? (span as { text?: unknown }).text : null);
+  if (!texts.every((text): text is string => typeof text === "string" && text.trim().length > 0)) return null;
+  if (texts.reduce((total, text) => total + text.length, 0) > 1200
+    || new Set(texts).size !== texts.length) return null;
   return `[Verified background relevant to this request]\n${texts.map(text => `- ${text}`).join("\n")}`;
 }
 

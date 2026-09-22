@@ -78,8 +78,14 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
         return { success: false, error: "content is required" };
       }
 
-      const fp = fingerprintId("lsn", data.content.trim().toLowerCase());
-      const existing = await kv.get<Lesson>(KV.lessons, fp);
+      const contentKey = data.content.trim().toLowerCase();
+      const fp = fingerprintId("lsn", JSON.stringify([data.project ?? null, contentKey]));
+      let existing = await kv.get<Lesson>(KV.lessons, fp);
+      if (!existing) {
+        // Preserve legacy IDs and references, but never reinforce another scope.
+        const legacy = await kv.get<Lesson>(KV.lessons, fingerprintId("lsn", contentKey));
+        if (legacy && !legacy.deleted && legacy.project === data.project) existing = legacy;
+      }
 
       if (existing && !existing.deleted) {
         reinforceLesson(existing);

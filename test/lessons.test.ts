@@ -6,6 +6,7 @@ vi.mock("../src/logger.js", () => ({
 
 import { registerLessonsFunctions } from "../src/functions/lessons.js";
 import type { Lesson } from "../src/types.js";
+import { KV, fingerprintId } from "../src/state/schema.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -107,6 +108,35 @@ describe("Lessons", () => {
       expect(second.lesson.id).toBe(originalId);
       expect(second.lesson.reinforcements).toBe(1);
       expect(second.lesson.confidence).toBeGreaterThan(0.5);
+    });
+
+    it("keeps identical text separate across projects and global scope", async () => {
+      const content = "Use strict TypeScript";
+      const saved = [];
+      for (const project of ["/one", "/two", undefined]) {
+        saved.push(await sdk.trigger("mem::lesson-save", { content, project }));
+      }
+      expect(new Set(saved.map(r => r.lesson.id)).size).toBe(3);
+      for (const result of saved) {
+        const repeated = await sdk.trigger("mem::lesson-save", { content, project: result.lesson.project });
+        expect(repeated.action).toBe("strengthened");
+        expect(repeated.lesson.id).toBe(result.lesson.id);
+      }
+    });
+
+    it("preserves legacy same-project IDs without modifying other projects", async () => {
+      const content = "Legacy scoped lesson";
+      const first = await sdk.trigger("mem::lesson-save", { content, project: "/one" });
+      const legacyId = fingerprintId("lsn", content.toLowerCase());
+      await kv.delete(KV.lessons, first.lesson.id);
+      await kv.set(KV.lessons, legacyId, { ...first.lesson, id: legacyId });
+      const other = await sdk.trigger("mem::lesson-save", { content, project: "/two" });
+      expect(other.action).toBe("created");
+      expect(other.lesson.id).not.toBe(legacyId);
+      expect((await kv.get<Lesson>(KV.lessons, legacyId))!.reinforcements).toBe(0);
+      const same = await sdk.trigger("mem::lesson-save", { content, project: "/one" });
+      expect(same.action).toBe("strengthened");
+      expect(same.lesson.id).toBe(legacyId);
     });
 
     it("rejects empty content", async () => {
