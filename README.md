@@ -1627,6 +1627,16 @@ Create `~/.agentmemory/.env`:
 # AGENTMEMORY_TOOLS=core
 ```
 
+### Selective recall MVP
+
+This opt-in MVP recalls explicitly confirmed knowledge from a small curated catalog. It does not search or automatically promote the existing historical memory corpus. Each namespace permits 12 records (including candidates and superseded rules) and 256 change events. Eligible records are filtered by status, source evidence, and repository identity, then bounded to 6,000 characters before one Jev request. No vector search is required on this path.
+
+Jev must find a span relevant, compatible with the current request, and additive to the recent dialogue. Otherwise the hook stays silent. A standalone acknowledgement with no preceding task should select nothing; a continuation with a known task may recall applicable knowledge. Selection is capped at two complete spans totaling 1,200 characters. Judge errors, malformed decisions, and the 1.5-second judge deadline produce no context; the hook's recall HTTP request has a two-second deadline.
+
+For a limited trial, configure the server with `AGENTMEMORY_SELECTIVE_CONTEXT=true`, `AGENTMEMORY_CONTEXT_NAMESPACE`, `AGENTMEMORY_SECRET`, and `TYPESAFE_API_KEY`, then restart that server. In the intended client's hook environment, set `AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=true` and the matching `AGENTMEMORY_URL` and `AGENTMEMORY_SECRET`. Keep `AGENTMEMORY_INJECT_CONTEXT=false` to avoid broad startup/tool context alongside selective recall. Both selective switches default to off. The explicit save flow below supplies the initial knowledge.
+
+Run `npm run build` and `npm run test:mvp` for the bounded, offline acceptance suite. It covers source-backed capture and replacement, scope isolation, invalid/expired decisions, dialogue extraction, backup preservation, and the packaged hook's output and timeout behavior. These tests do not call paid APIs or prove model adherence. The opt-in live Jev evaluation in `test/selective-context-live.test.ts` checks semantic decisions separately; actual harness acceptance additionally requires the model to use the selected fact in its answer. Passing this suite is not equivalent to passing the repository-wide suite or deploying the feature.
+
 ### Explicit project memory
 
 With selective context enabled on the server and the prompt hook opted in, a live `UserPromptSubmit` prompt beginning with `記住：` or `請記住：` enters the capture path. The hook marks the observation with `explicitMemoryRequest: true`; historical transcript backfills and unmarked observations do not activate knowledge. For example:
