@@ -276,6 +276,15 @@ function parseSummaryXml(
 // loses the summary permanently — nothing re-triggers summarize. Wait
 // for the pending compressions to land instead; on timeout summarize
 // whatever did compress rather than dropping the session.
+// A run that outlived its lock timeout keeps going in the background; the
+// run number lets it notice a newer run already wrote and drop its stale
+// result instead of overwriting.
+// debt: ceiling: one entry per summarized session for the process lifetime;
+// upgrade: delete the entry when no run for the session is in flight if a
+// single process ever summarizes hundreds of thousands of sessions.
+const lastWrittenRun = new Map<string, number>();
+let runCounter = 0;
+
 const COMPRESS_WAIT_MS_DEFAULT = 60_000;
 const COMPRESS_POLL_MS = 500;
 
@@ -347,6 +356,7 @@ export function registerSummarizeFunction(
       // race, and a second concurrent run would redo the same LLM work.
       // See the up-to-date short-circuit below for the sequential case.
       const runSummarize = async () => {
+        const run = ++runCounter;
         const session = await kv.get<Session>(KV.sessions, sessionId);
         if (!session) {
           logger.warn("Session not found for summarize", {
@@ -482,7 +492,29 @@ export function registerSummarizeFunction(
           const qualityScore = scoreSummary(summaryForValidation);
 
           summary.inputFingerprint = inputFingerprint;
-        await kv.set(KV.summaries, sessionId, summary);
+          // mem::forget deletes the session row under the same lock. Skip
+          // the write if a newer run already wrote, the session is gone, or
+          // an observation summarized here was forgotten meanwhile (the
+          // session row alone can be recreated by the next observation).
+          const dropped = await withKeyedLock(`session:${sessionId}`, async () => {
+            if ((lastWrittenRun.get(sessionId) ?? 0) > run) return "superseded";
+            if (!(await kv.get(KV.sessions, sessionId))) return "session_deleted";
+            const current = new Set(
+              (await kv.list<{ id: string }>(KV.observations(sessionId))).map((o) => o.id),
+            );
+            if (!compressed.every((o) => current.has(o.id))) return "observations_deleted";
+            await kv.set(KV.summaries, sessionId, summary);
+            lastWrittenRun.set(sessionId, run);
+            return null;
+          });
+          if (dropped) {
+            const latencyMs = Date.now() - startMs;
+            if (metricsStore) {
+              await metricsStore.record("mem::summarize", latencyMs, false);
+            }
+            logger.info("Summary dropped before write", { sessionId, reason: dropped });
+            return { success: false, error: dropped };
+          }
           await safeAudit(kv, "compress", "mem::summarize", [sessionId], {
             title: summary.title,
             observationCount: compressed.length,

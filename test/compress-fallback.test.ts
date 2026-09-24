@@ -83,6 +83,14 @@ const payload = {
 
 const scope = `mem:obs:${raw.sessionId}`;
 
+// mem::observe writes the raw entry before it triggers mem::compress, and
+// compress only persists while that entry still exists.
+async function kvWithRawObservation() {
+  const kv = mockKV();
+  await kv.set(scope, raw.id, raw);
+  return kv;
+}
+
 describe("mem::compress synthetic fallback on LLM failure", () => {
   beforeEach(() => {
     getSearchIndex().clear();
@@ -90,7 +98,7 @@ describe("mem::compress synthetic fallback on LLM failure", () => {
 
   it("persists a synthetic observation when the provider throws", async () => {
     const sdk = mockSdk();
-    const kv = mockKV();
+    const kv = await kvWithRawObservation();
     registerCompressFunction(
       sdk as never,
       kv as never,
@@ -133,7 +141,7 @@ describe("mem::compress synthetic fallback on LLM failure", () => {
 
   it("persists a synthetic observation when the LLM output is unparseable", async () => {
     const sdk = mockSdk();
-    const kv = mockKV();
+    const kv = await kvWithRawObservation();
     registerCompressFunction(
       sdk as never,
       kv as never,
@@ -155,7 +163,7 @@ describe("mem::compress synthetic fallback on LLM failure", () => {
 
   it("publishes the degraded observation to both stream groups", async () => {
     const sdk = mockSdk();
-    const kv = mockKV();
+    const kv = await kvWithRawObservation();
     registerCompressFunction(
       sdk as never,
       kv as never,
@@ -176,7 +184,7 @@ describe("mem::compress synthetic fallback on LLM failure", () => {
 
   it("keeps the LLM result when compression succeeds", async () => {
     const sdk = mockSdk();
-    const kv = mockKV();
+    const kv = await kvWithRawObservation();
     registerCompressFunction(
       sdk as never,
       kv as never,

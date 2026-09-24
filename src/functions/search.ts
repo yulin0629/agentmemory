@@ -193,8 +193,13 @@ export async function vectorIndexAddGuarded(
       }
     })
   }
+  // Registered like a coalesced add so a vectorIndexRemove that lands while
+  // the embed is in flight cancels the write instead of being undone by it.
+  const pending: PendingAdd = { id, sessionId, text, context, resolve: () => {} }
+  activeAdds.add(pending)
   try {
     const embedding = await ep.embed(clipEmbedInput(text))
+    if (cancelledAdds.has(pending)) return false
     if (embedding.length !== ep.dimensions) {
       logger.warn("vector-index add: dimension mismatch — skipping", {
         kind: context.kind,
@@ -215,6 +220,8 @@ export async function vectorIndexAddGuarded(
       error: err instanceof Error ? err.message : String(err),
     })
     return false
+  } finally {
+    activeAdds.delete(pending)
   }
 }
 

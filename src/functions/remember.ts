@@ -270,26 +270,34 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         }
       }
 
+      // obs-write:<sid> excludes mem::compress persisting a result for an
+      // observation deleted here; obs:<sid> also excludes mem::observe, which
+      // would otherwise write the synthetic compression of an observation
+      // deleted mid-observe, or re-upsert a partial session row mid-forget.
       if (
         data.sessionId &&
         data.observationIds &&
         data.observationIds.length > 0
       ) {
-        for (const obsId of data.observationIds) {
-          const obs = await kv.get<{ imageData?: string; imageRef?: string }>(
-            KV.observations(data.sessionId),
-            obsId,
-          );
-          await kv.delete(KV.observations(data.sessionId), obsId);
-          if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs?.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
+        const sessionId = data.sessionId;
+        const observationIds = data.observationIds;
+        await withKeyedLock(`obs:${sessionId}`, () => withKeyedLock(`obs-write:${sessionId}`, async () => {
+          for (const obsId of observationIds) {
+            const obs = await kv.get<{ imageData?: string; imageRef?: string }>(
+              KV.observations(sessionId),
+              obsId,
+            );
+            await kv.delete(KV.observations(sessionId), obsId);
+            if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
+            if (obs?.imageRef && obs.imageRef !== obs.imageData) {
+              await decrementImageRef(kv, sdk, obs.imageRef);
+            }
+            getSearchIndex().remove(obsId);
+            vectorIndexRemove(obsId);
+            deletedObservationIds.push(obsId);
+            deleted++;
           }
-          getSearchIndex().remove(obsId);
-          vectorIndexRemove(obsId);
-          deletedObservationIds.push(obsId);
-          deleted++;
-        }
+        }));
       }
 
       if (
@@ -297,23 +305,27 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         (!data.observationIds || data.observationIds.length === 0) &&
         !data.memoryId
       ) {
-        const observations = await kv.list<{ id: string; imageData?: string; imageRef?: string }>(
-          KV.observations(data.sessionId),
-        );
-        for (const obs of observations) {
-          await kv.delete(KV.observations(data.sessionId), obs.id);
-          if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
-          }
-          getSearchIndex().remove(obs.id);
-          vectorIndexRemove(obs.id);
-          deletedObservationIds.push(obs.id);
-          deleted++;
-        }
         const sessionId = data.sessionId;
-        await withKeyedLock(`session:${sessionId}`, () => kv.delete(KV.sessions, sessionId));
-        await kv.delete(KV.summaries, data.sessionId);
+        await withKeyedLock(`obs:${sessionId}`, () =>
+          withKeyedLock(`obs-write:${sessionId}`, async () => {
+            const observations = await kv.list<{ id: string; imageData?: string; imageRef?: string }>(
+              KV.observations(sessionId),
+            );
+            for (const obs of observations) {
+              await kv.delete(KV.observations(sessionId), obs.id);
+              if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
+              if (obs.imageRef && obs.imageRef !== obs.imageData) {
+                await decrementImageRef(kv, sdk, obs.imageRef);
+              }
+              getSearchIndex().remove(obs.id);
+              vectorIndexRemove(obs.id);
+              deletedObservationIds.push(obs.id);
+              deleted++;
+            }
+            await withKeyedLock(`session:${sessionId}`, () => kv.delete(KV.sessions, sessionId));
+            await kv.delete(KV.summaries, sessionId);
+          }),
+        );
         deletedSession = true;
         deleted += 2;
       }
