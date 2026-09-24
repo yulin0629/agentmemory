@@ -59,3 +59,31 @@ describe("embedding coalescer", () => {
     expect(add).not.toHaveBeenCalled();
   });
 });
+
+describe("uncoalesced add (EMBED_COALESCE_MS=0)", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("does not restore an entry deleted while its embedding is in flight", async () => {
+    vi.stubEnv("EMBED_COALESCE_MS", "0");
+    vi.resetModules();
+    const search = await import("../src/functions/search.js");
+    const uncoalescedAdd = vi.fn();
+    let finish!: (vector: Float32Array) => void;
+    search.setVectorIndex({ add: uncoalescedAdd, remove: vi.fn() } as never);
+    search.setEmbeddingProvider({
+      name: "test",
+      dimensions: 2,
+      embed: () => new Promise((resolve) => { finish = resolve; }),
+      embedBatch: vi.fn(),
+    });
+
+    const pending = search.vectorIndexAddGuarded("a", "s", "one", context);
+    search.vectorIndexRemove("a");
+    finish(new Float32Array([1, 0]));
+
+    expect(await pending).toBe(false);
+    expect(uncoalescedAdd).not.toHaveBeenCalled();
+    search.setVectorIndex(null);
+    search.setEmbeddingProvider(null);
+  });
+});

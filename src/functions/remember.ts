@@ -270,25 +270,58 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         }
       }
 
+      // obs-write:<sid> excludes mem::compress persisting a result for an
+      // observation deleted here; obs:<sid> also excludes mem::observe, which
+      // would otherwise write the synthetic compression of an observation
+      // deleted mid-observe, or re-upsert a partial session row mid-forget.
       if (
         data.sessionId &&
         data.observationIds &&
         data.observationIds.length > 0
       ) {
-        for (const obsId of data.observationIds) {
-          const obs = await kv.get<{ imageData?: string; imageRef?: string }>(
-            KV.observations(data.sessionId),
-            obsId,
-          );
-          await kv.delete(KV.observations(data.sessionId), obsId);
-          if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs?.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
+        const sessionId = data.sessionId;
+        const observationIds = data.observationIds;
+        const remaining = await withKeyedLock(`obs:${sessionId}`, () => withKeyedLock(`obs-write:${sessionId}`, async () => {
+          let removedAny = false;
+          for (const obsId of observationIds) {
+            const obs = await kv.get<{ imageData?: string; imageRef?: string }>(
+              KV.observations(sessionId),
+              obsId,
+            );
+            if (obs) removedAny = true;
+            await kv.delete(KV.observations(sessionId), obsId);
+            if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
+            if (obs?.imageRef && obs.imageRef !== obs.imageData) {
+              await decrementImageRef(kv, sdk, obs.imageRef);
+            }
+            getSearchIndex().remove(obsId);
+            vectorIndexRemove(obsId);
+            deletedObservationIds.push(obsId);
+            deleted++;
           }
-          getSearchIndex().remove(obsId);
-          vectorIndexRemove(obsId);
-          deletedObservationIds.push(obsId);
-          deleted++;
+          // The session summary may quote what was just forgotten. Drop it
+          // here (mem::summarize writes under obs-write:<sid> too) and
+          // rebuild it below from what is left. A retry for ids already
+          // gone leaves the summary alone.
+          if (!removedAny) return 0;
+          await kv.delete(KV.summaries, sessionId);
+          return (await kv.list(KV.observations(sessionId))).length;
+        }));
+        // Outside the locks: summarize takes obs-write:<sid> to write, and
+        // mocked SDKs run triggers inline.
+        if (remaining > 0) {
+          try {
+            await sdk.trigger({
+              function_id: "mem::summarize",
+              payload: { sessionId },
+              action: TriggerAction.Void(),
+            });
+          } catch (err) {
+            logger.warn("Re-summarize after forget failed to trigger", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
       }
 
@@ -297,23 +330,27 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         (!data.observationIds || data.observationIds.length === 0) &&
         !data.memoryId
       ) {
-        const observations = await kv.list<{ id: string; imageData?: string; imageRef?: string }>(
-          KV.observations(data.sessionId),
-        );
-        for (const obs of observations) {
-          await kv.delete(KV.observations(data.sessionId), obs.id);
-          if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
-          }
-          getSearchIndex().remove(obs.id);
-          vectorIndexRemove(obs.id);
-          deletedObservationIds.push(obs.id);
-          deleted++;
-        }
         const sessionId = data.sessionId;
-        await withKeyedLock(`session:${sessionId}`, () => kv.delete(KV.sessions, sessionId));
-        await kv.delete(KV.summaries, data.sessionId);
+        await withKeyedLock(`obs:${sessionId}`, () =>
+          withKeyedLock(`obs-write:${sessionId}`, async () => {
+            const observations = await kv.list<{ id: string; imageData?: string; imageRef?: string }>(
+              KV.observations(sessionId),
+            );
+            for (const obs of observations) {
+              await kv.delete(KV.observations(sessionId), obs.id);
+              if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
+              if (obs.imageRef && obs.imageRef !== obs.imageData) {
+                await decrementImageRef(kv, sdk, obs.imageRef);
+              }
+              getSearchIndex().remove(obs.id);
+              vectorIndexRemove(obs.id);
+              deletedObservationIds.push(obs.id);
+              deleted++;
+            }
+            await withKeyedLock(`session:${sessionId}`, () => kv.delete(KV.sessions, sessionId));
+            await kv.delete(KV.summaries, sessionId);
+          }),
+        );
         deletedSession = true;
         deleted += 2;
       }

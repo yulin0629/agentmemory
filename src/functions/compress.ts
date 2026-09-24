@@ -23,6 +23,7 @@ import { scoreCompression } from "../eval/quality.js";
 import { compressWithRetry } from "../eval/self-correct.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -73,6 +74,28 @@ function parseCompressionXml(
 // AGENTMEMORY_AUTO_COMPRESS is off, so recall and BM25 search still work.
 // The synthetic result carries confidence 0.3 (vs. the LLM path's
 // qualityScore/100), which keeps degraded entries distinguishable.
+// mem::forget deletes a session's observations under the same lock. Writing
+// only while the raw entry is still there keeps a compression that finishes
+// after the forget from resurrecting the observation.
+async function persistIfPresent(
+  kv: StateKV,
+  sessionId: string,
+  obsId: string,
+  value: CompressedObservation,
+): Promise<boolean> {
+  return withKeyedLock(`obs-write:${sessionId}`, async () => {
+    if (!(await kv.get(KV.observations(sessionId), obsId))) {
+      logger.info("Observation deleted during compression — dropping result", {
+        obsId,
+        sessionId,
+      });
+      return false;
+    }
+    await kv.set(KV.observations(sessionId), obsId, value);
+    return true;
+  });
+}
+
 async function persistSyntheticFallback(
   sdk: ISdk,
   kv: StateKV,
@@ -86,11 +109,9 @@ async function persistSyntheticFallback(
       sessionId: data.sessionId,
     };
 
-    await kv.set(
-      KV.observations(data.sessionId),
-      data.observationId,
-      synthetic,
-    );
+    if (!(await persistIfPresent(kv, data.sessionId, data.observationId, synthetic))) {
+      return null;
+    }
 
     try {
       getSearchIndex().add(synthetic);
@@ -282,11 +303,13 @@ export function registerCompressFunction(
           ...(data.raw.origin ? { origin: data.raw.origin } : {}),
         };
 
-        await kv.set(
-          KV.observations(data.sessionId),
-          data.observationId,
-          compressed,
-        );
+        if (!(await persistIfPresent(kv, data.sessionId, data.observationId, compressed))) {
+          const latencyMs = Date.now() - startMs;
+          if (metricsStore) {
+            await metricsStore.record("mem::compress", latencyMs, false);
+          }
+          return { success: false, error: "observation_deleted" };
+        }
         persisted = true;
 
         try {
