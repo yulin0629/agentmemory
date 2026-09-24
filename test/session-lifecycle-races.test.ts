@@ -24,6 +24,7 @@ function mockKV() {
   const kv = {
     store,
     afterSet: undefined as undefined | ((scope: string, key: string) => Promise<void>),
+    afterList: undefined as undefined | ((scope: string) => Promise<void>),
     get: async <T>(scope: string, key: string): Promise<T | null> =>
       (store.get(scope)?.get(key) as T) ?? null,
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
@@ -49,7 +50,9 @@ function mockKV() {
     },
     list: async <T>(scope: string): Promise<T[]> => {
       const m = store.get(scope);
-      return m ? (Array.from(m.values()) as T[]) : [];
+      const values = m ? (Array.from(m.values()) as T[]) : [];
+      await kv.afterList?.(scope);
+      return values;
     },
   };
   return kv;
@@ -300,6 +303,103 @@ describe("session lifecycle races", () => {
 
     expect(await kv.list(KV.observations(SID))).toEqual([]);
     expect(getSearchIndex().has(obsId)).toBe(false);
+  });
+
+  it("forgetting one observation re-summarizes the session from what is left", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const summarizedIds: string[][] = [];
+    const provider: MemoryProvider = {
+      name: "mock",
+      compress: async () => "",
+      summarize: async (_system, prompt) => {
+        summarizedIds.push(["obs_1", "obs_2"].filter((id) => prompt.includes(`narrative ${id.slice(4)}`)));
+        return summaryXml("rebuilt");
+      },
+    };
+    registerSummarizeFunction(sdk as never, kv as never, provider);
+    registerRememberFunction(sdk as never, kv as never);
+
+    await seedSession(kv);
+    await kv.set(KV.observations(SID), "obs_1", compressedObs(1));
+    await kv.set(KV.observations(SID), "obs_2", compressedObs(2));
+    await sdk.trigger("mem::summarize", { sessionId: SID });
+    expect(summarizedIds).toEqual([["obs_1", "obs_2"]]);
+
+    await sdk.trigger("mem::forget", { sessionId: SID, observationIds: ["obs_1"] });
+
+    expect(summarizedIds).toEqual([["obs_1", "obs_2"], ["obs_2"]]);
+    expect(await kv.get(KV.summaries, SID)).toMatchObject({ observationCount: 1 });
+  });
+
+  it("forgetting every observation one by one drops the summary without re-summarizing", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const summarize = vi.fn(async () => summaryXml("only"));
+    registerSummarizeFunction(sdk as never, kv as never, { name: "mock", compress: async () => "", summarize });
+    registerRememberFunction(sdk as never, kv as never);
+
+    await seedSession(kv);
+    await kv.set(KV.observations(SID), "obs_1", compressedObs(1));
+    await sdk.trigger("mem::summarize", { sessionId: SID });
+    expect(await kv.get(KV.summaries, SID)).not.toBeNull();
+
+    await sdk.trigger("mem::forget", { sessionId: SID, observationIds: ["obs_1"] });
+
+    expect(await kv.get(KV.summaries, SID)).toBeNull();
+    expect(summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("retrying a forget for an observation already gone keeps the current summary", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const summarize = vi.fn(async () => summaryXml("current"));
+    registerSummarizeFunction(sdk as never, kv as never, { name: "mock", compress: async () => "", summarize });
+    registerRememberFunction(sdk as never, kv as never);
+
+    await seedSession(kv);
+    await kv.set(KV.observations(SID), "obs_2", compressedObs(2));
+    await sdk.trigger("mem::summarize", { sessionId: SID });
+
+    await sdk.trigger("mem::forget", { sessionId: SID, observationIds: ["obs_1"] });
+
+    expect(await kv.get(KV.summaries, SID)).toMatchObject({ title: "current" });
+    expect(summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("a summarize write racing a forget of its observations does not restore the dropped summary", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const g = gate();
+    const provider: MemoryProvider = {
+      name: "mock",
+      compress: async () => "",
+      summarize: async () => {
+        // The next list of the observations is the pre-write re-check.
+        kv.afterList = async (scope) => {
+          if (scope !== KV.observations(SID)) return;
+          kv.afterList = undefined;
+          g.entered();
+          await g.opened;
+        };
+        return summaryXml("stale");
+      },
+    };
+    registerSummarizeFunction(sdk as never, kv as never, provider);
+    registerRememberFunction(sdk as never, kv as never);
+
+    await seedSession(kv);
+    await kv.set(KV.observations(SID), "obs_1", compressedObs(1));
+
+    const summarizing = sdk.trigger("mem::summarize", { sessionId: SID });
+    await g.reached;
+    const forgetting = sdk.trigger("mem::forget", { sessionId: SID, observationIds: ["obs_1"] });
+    await Promise.race([forgetting, new Promise((r) => setTimeout(r, 50))]);
+    g.open();
+    await Promise.all([summarizing, forgetting]);
+
+    expect(await kv.list(KV.observations(SID))).toEqual([]);
+    expect(await kv.get(KV.summaries, SID)).toBeNull();
   });
 
   it("a summarize run that outlived its lock timeout does not overwrite a newer summary", async () => {

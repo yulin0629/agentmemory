@@ -492,11 +492,12 @@ export function registerSummarizeFunction(
           const qualityScore = scoreSummary(summaryForValidation);
 
           summary.inputFingerprint = inputFingerprint;
-          // mem::forget deletes the session row under the same lock. Skip
-          // the write if a newer run already wrote, the session is gone, or
-          // an observation summarized here was forgotten meanwhile (the
-          // session row alone can be recreated by the next observation).
-          const dropped = await withKeyedLock(`session:${sessionId}`, async () => {
+          // mem::forget deletes observations under obs-write:<sid> and the
+          // session row under session:<sid>. Skip the write if a newer run
+          // already wrote, the session is gone, or an observation summarized
+          // here was forgotten meanwhile (the session row alone can be
+          // recreated by the next observation).
+          const dropped = await withKeyedLock(`obs-write:${sessionId}`, () => withKeyedLock(`session:${sessionId}`, async () => {
             if ((lastWrittenRun.get(sessionId) ?? 0) > run) return "superseded";
             if (!(await kv.get(KV.sessions, sessionId))) return "session_deleted";
             const current = new Set(
@@ -506,7 +507,7 @@ export function registerSummarizeFunction(
             await kv.set(KV.summaries, sessionId, summary);
             lastWrittenRun.set(sessionId, run);
             return null;
-          });
+          }));
           if (dropped) {
             const latencyMs = Date.now() - startMs;
             if (metricsStore) {

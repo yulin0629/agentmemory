@@ -281,12 +281,14 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
       ) {
         const sessionId = data.sessionId;
         const observationIds = data.observationIds;
-        await withKeyedLock(`obs:${sessionId}`, () => withKeyedLock(`obs-write:${sessionId}`, async () => {
+        const remaining = await withKeyedLock(`obs:${sessionId}`, () => withKeyedLock(`obs-write:${sessionId}`, async () => {
+          let removedAny = false;
           for (const obsId of observationIds) {
             const obs = await kv.get<{ imageData?: string; imageRef?: string }>(
               KV.observations(sessionId),
               obsId,
             );
+            if (obs) removedAny = true;
             await kv.delete(KV.observations(sessionId), obsId);
             if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
             if (obs?.imageRef && obs.imageRef !== obs.imageData) {
@@ -297,7 +299,30 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             deletedObservationIds.push(obsId);
             deleted++;
           }
+          // The session summary may quote what was just forgotten. Drop it
+          // here (mem::summarize writes under obs-write:<sid> too) and
+          // rebuild it below from what is left. A retry for ids already
+          // gone leaves the summary alone.
+          if (!removedAny) return 0;
+          await kv.delete(KV.summaries, sessionId);
+          return (await kv.list(KV.observations(sessionId))).length;
         }));
+        // Outside the locks: summarize takes obs-write:<sid> to write, and
+        // mocked SDKs run triggers inline.
+        if (remaining > 0) {
+          try {
+            await sdk.trigger({
+              function_id: "mem::summarize",
+              payload: { sessionId },
+              action: TriggerAction.Void(),
+            });
+          } catch (err) {
+            logger.warn("Re-summarize after forget failed to trigger", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
       }
 
       if (
