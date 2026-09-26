@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk } from "iii-sdk";
+import { TriggerAction, type IIIClient } from "iii-sdk";
 import type { RawObservation, HookPayload, Origin } from "../types.js";
 
 const TOOL_HOOKS = new Set(["pre_tool_use", "post_tool_use", "post_tool_failure"]);
@@ -9,7 +9,7 @@ import { DedupMap } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { isAutoCompressEnabled } from "../config.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
-import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
+import { getSearchIndex, scheduleIndexSave, vectorIndexAddGuarded } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
@@ -38,7 +38,7 @@ export function extractImage(d: unknown): string | undefined {
 }
 
 export function registerObserveFunction(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
   dedupMap?: DedupMap,
   maxObservationsPerSession?: number,
@@ -321,6 +321,7 @@ export function registerObserveFunction(
             synthetic,
           );
           getSearchIndex().add(synthetic);
+          scheduleIndexSave();
           await vectorIndexAddGuarded(
             synthetic.id,
             synthetic.sessionId,

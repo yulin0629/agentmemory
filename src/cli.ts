@@ -63,17 +63,23 @@ import {
   resolveEngineCwd,
   rewriteBundledConfig,
   runtimeConfigPath,
+  engineChildEnv,
 } from "./cli/engine-launch.js";
 import { runtimeMetadataPath } from "./runtime-paths.js";
 import { createStartupStderrCapture } from "./cli/startup-stderr.js";
-import { renderEngineConfig } from "./cli/engine-config.js";
+import {
+  clearPersistedBuiltinConfig,
+  renderEngineConfig,
+} from "./cli/engine-config.js";
+import { SHUTDOWN_HARD_EXIT_MS } from "./shutdown.js";
+import { consoleArgs, defaultConsolePort, parseConsoleArgs } from "./cli/console.js";
 import { processStatIsRunning } from "./cli/process-state.js";
 import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
 import { setBootVerbose } from "./logger.js";
 import { hydrateProcessEnvFromFile } from "./config.js";
-import { VERSION } from "./version.js";
+import { III_PINNED_VERSION, VERSION } from "./version.js";
 import { getAllTools, ESSENTIAL_TOOLS } from "./mcp/tools-registry.js";
 import { knownAgents } from "./cli/connect/index.js";
 
@@ -112,18 +118,22 @@ if (args.includes("--version") || args.includes("-V")) {
   process.exit(0);
 }
 
-// Pinned iii-engine version. The unpinned `install.iii.dev/iii/main/install.sh`
-// script tracks `latest`, which made every fresh agentmemory install pull
-// engine 0.11.6 — and 0.11.6 introduces a new sandbox-everything-via-
-// `iii worker add` worker model that agentmemory hasn't been refactored
-// for yet (the CLI still registers its worker directly through the SDK). The
-// architectural mismatch surfaces as EPIPE reconnect loops and empty
-// search results after save. Pin to v0.11.2 — the last engine that runs
-// agentmemory's current worker model cleanly — until the refactor lands.
-// Override env var AGENTMEMORY_III_VERSION lets users on the sandbox
-// model already point at a newer engine without us cutting a release.
+// Pinned iii-engine version. The engine, the iii-sdk and the @iii-dev/helpers
+// packages in package.json must stay on the same release: the worker speaks
+// that engine's wire protocol and the unpinned installer tracks `latest`.
+// 0.22.x is the last line before 0.23 removes the config.yaml worker
+// lifecycle this CLI relies on; it keeps HTTP routes owned by the
+// reconnecting worker (no REST 404s after an engine reconnect). The engine
+// still boots its iii- prefixed builtins from config.yaml (the unprefixed
+// http/state/queue/pubsub/cron names resolve to the standalone registry
+// workers, which is the 0.23 migration, not this one). Bump this
+// constant and the two package.json dependencies together.
+// AGENTMEMORY_III_VERSION overrides the pin for anyone running a
+// self-managed engine.
+const IIPINNED_DEFAULT_VERSION = III_PINNED_VERSION;
 const IIPINNED_VERSION =
-  process.env["AGENTMEMORY_III_VERSION"] || "0.11.2";
+  process.env["AGENTMEMORY_III_VERSION"] || IIPINNED_DEFAULT_VERSION;
+const IIIENGINE_INSTALL_CMD = `curl -fsSL https://install.iii.dev/iii/main/install.sh | VERSION=${IIPINNED_VERSION} sh`;
 
 // Map Node platform/arch → the asset name iii-hq/iii ships under
 // https://github.com/iii-hq/iii/releases/download/iii/v<version>/<asset>
@@ -150,7 +160,7 @@ function iiiReleaseAsset(): string | null {
 function iiiReleaseUrl(): string | null {
   const asset = iiiReleaseAsset();
   if (!asset) return null;
-  // Tag name is monorepo-prefixed: `iii/v0.11.2`. Slash is URL-encoded
+  // Tag name is monorepo-prefixed: `iii/v0.22.1`. Slash is URL-encoded
   // by GitHub when serving the download path, hence `iii/v...` not `iii%2Fv...`.
   return `https://github.com/iii-hq/iii/releases/download/iii/v${IIPINNED_VERSION}/${asset}`;
 }
@@ -189,6 +199,8 @@ Commands:
                      No arg = interactive picker. --all wires every detected agent.
                      --dry-run shows what would change. --force re-installs.
   status             Show connection status, memory count, flags, and health
+  console            Launch the iii web console for this engine (workers, functions,
+                     triggers, queues, traces). --console-port N, default viewer+1
   doctor             Interactive diagnostic + fixer. [F]ix · [S]kip · [?]more · [Q]uit
                      --all: apply every fix without prompting (CI)
                      --dry-run: show what each fix would do, don't execute
@@ -525,7 +537,7 @@ function whichBinary(name: string): string | null {
 // isolated from a user-managed iii on PATH or in ~/.local/bin. A
 // fresh box with iii 0.16.1 already on PATH refused to boot because the
 // hard-pin enforcer told users to overwrite their global install with
-// v0.11.2. Private install resolves the conflict without touching their
+// the pinned version. Private install resolves the conflict without touching their
 // existing iii.
 function agentmemoryBinDir(): string {
   if (IS_WINDOWS) {
@@ -578,8 +590,8 @@ function iiiBinVersion(binPath: string): string | null {
 // Resolve a compatible iii binary for the pinned engine version.
 //
 // Soft-warn lets the worker boot against a mismatched engine and crash at
-// runtime (state::list-not-found on v0.13.0+, sandbox-everything trap on
-// v0.11.6+). Hard-pin without a fallback leaves the user stuck — they
+// runtime (the SDK and engine wire protocol move together; 0.20+ renamed the
+// SDK surface entirely). Hard-pin without a fallback leaves the user stuck — they
 // either downgrade their global iii (breaking other consumers) or set
 // AGENTMEMORY_III_VERSION and hope it works.
 //
@@ -733,7 +745,7 @@ function engineStateRestPort(state: EngineState): number {
   try {
     const raw = readFileSync(state.configPath, "utf-8");
     const httpBlock = raw.match(
-      /- name:\s*iii-http([\s\S]*?)(?=\n\s*- name:|$)/,
+      /- name:\s*(?:iii-)?http([\s\S]*?)(?=\n\s*- name:|$)/,
     )?.[1];
     const configuredPort = httpBlock?.match(/\n\s*port:\s*(\d+)/)?.[1];
     if (configuredPort) return parseInt(configuredPort, 10);
@@ -1239,95 +1251,6 @@ async function maybeOfferGlobalInstall(): Promise<void> {
   }
 }
 
-// iii-console install state.
-//   "installed" — `iii-console` is on PATH or at `~/.local/bin/iii-console`
-//   "missing"   — binary not found anywhere we look
-// We deliberately do NOT probe the console's HTTP port: the binary
-// being on disk is the signal we care about (it's not auto-started by
-// agentmemory and its default port 3113 collides with our viewer, so
-// "is it listening?" is the wrong question at boot time).
-type IiiConsoleState =
-  | { kind: "installed"; binPath: string }
-  | { kind: "missing" };
-
-function detectIiiConsole(): IiiConsoleState {
-  const onPath = whichBinary("iii-console");
-  if (onPath) return { kind: "installed", binPath: onPath };
-  const fallback = IS_WINDOWS
-    ? join(process.env["USERPROFILE"] ?? "", ".local", "bin", "iii-console.exe")
-    : join(homedir(), ".local", "bin", "iii-console");
-  if (fallback && existsSync(fallback)) {
-    return { kind: "installed", binPath: fallback };
-  }
-  return { kind: "missing" };
-}
-
-// The upstream install script reads `VERSION` as an env var (see
-// install.iii.dev/iii/main/install.sh: `engine_version="${VERSION:-}"`).
-// Pin to IIPINNED_VERSION so a fresh boot can never pull a newer iii
-// console that talks a different protocol than our pinned engine
-// (root cause of protocol drift).
-const III_CONSOLE_INSTALL_CMD =
-  `curl -fsSL https://install.iii.dev/iii/main/install.sh | VERSION=${IIPINNED_VERSION} sh`;
-
-// Display-only renderer. The internal `runCommand(shBin, ["-c", ...])`
-// path uses III_CONSOLE_INSTALL_CMD verbatim (POSIX shell). Anywhere
-// that PRINTS the command to a user has to handle Windows separately
-// since `VERSION=X sh` and the pipe-to-sh idiom aren't valid in
-// cmd.exe / PowerShell.
-function iiiConsoleInstallHint(): string {
-  if (!IS_WINDOWS) return III_CONSOLE_INSTALL_CMD;
-  return (
-    `# PowerShell:\n` +
-    `  $env:VERSION = "${IIPINNED_VERSION}"\n` +
-    `  iwr -useb https://install.iii.dev/iii/main/install.sh -OutFile install.sh\n` +
-    `  bash install.sh   # WSL or Git Bash required\n` +
-    `# Or grab the pinned release directly:\n` +
-    `  https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}`
-  );
-}
-
-async function ensureIiiConsole(): Promise<IiiConsoleState> {
-  const state = detectIiiConsole();
-  if (state.kind === "installed") return state;
-
-  // Non-interactive contexts get the panel hint but no prompt.
-  if (!process.stdin.isTTY || process.env["CI"]) return state;
-  const prefs = readPrefs();
-  if (prefs.skipConsoleInstall) return state;
-
-  const answer = await p.confirm({
-    message:
-      "iii console gives engine-level visibility (workers, functions, queues, traces). Install now?",
-    initialValue: true,
-  });
-  if (p.isCancel(answer)) return state;
-  if (answer === false) {
-    writePrefs({ skipConsoleInstall: true });
-    return state;
-  }
-
-  const shBin = whichBinary("sh");
-  const curlBin = whichBinary("curl");
-  if (!shBin || !curlBin) {
-    p.log.warn(
-      `curl or sh not found. Install manually:\n  ${iiiConsoleInstallHint()}`,
-    );
-    return state;
-  }
-  const ok = runCommand(shBin, ["-c", III_CONSOLE_INSTALL_CMD], {
-    label: "Installing iii console",
-  });
-  if (!ok) {
-    p.log.warn(
-      `iii console install failed. Re-run manually:\n  ${iiiConsoleInstallHint()}`,
-    );
-    return state;
-  }
-  // Re-detect rather than trust install-script output paths.
-  return detectIiiConsole();
-}
-
 function adoptRunningEngine(): void {
   try {
     const existingState = readEngineState();
@@ -1477,6 +1400,7 @@ function spawnEngineBackground(
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
     windowsHide: true,
+    env: engineChildEnv(process.env),
     ...(cwd ? { cwd } : {}),
   });
   const isDocker = label.includes("Docker");
@@ -1554,6 +1478,19 @@ function prepareEngineLaunch(configPath: string): {
     const runtimePath = runtimeConfigPath(dataDirResolution.dataDir);
     mkdirSync(dirname(runtimePath), { recursive: true });
     writeFileSync(runtimePath, rewritten, "utf-8");
+    try {
+      const cleared = clearPersistedBuiltinConfig(cwd, runtimePath, rewritten);
+      if (cleared.length > 0) {
+        vlog(
+          `cleared ${cleared.length} persisted builtin config entries so the rendered runtime config seeds the engine again`,
+        );
+      }
+    } catch (err) {
+      p.log.error(
+        `${String(err instanceof Error ? err.message : err)}. The engine would ignore the rendered runtime config and keep its previously persisted ports and timeouts. Fix the permissions on that file and run agentmemory start again.`,
+      );
+      process.exit(1);
+    }
     if (selectedInstance === 0 && dataDirResolution.source === "default") {
       for (const m of legacyDataMigrations(
         process.cwd(),
@@ -1590,7 +1527,12 @@ function startIiiBin(iiiBin: string, configPath: string): boolean {
     configPath: launch.configPath,
     binPath: iiiBin,
   });
-  spawnEngineBackground(iiiBin, ["--config", launch.configPath], "iii-engine", launch.cwd);
+  spawnEngineBackground(
+    iiiBin,
+    ["--config", launch.configPath, "--no-update-check"],
+    "iii-engine",
+    launch.cwd,
+  );
   s.stop(c.ok("iii-engine process started"));
   return true;
 }
@@ -1839,9 +1781,8 @@ async function reconcilePersistedDockerEngine(): Promise<boolean> {
     p.log.error("agentmemory worker did not become ready within 15s.");
     process.exit(1);
   }
-  const consoleState = await ensureIiiConsole();
   await maybeOfferGlobalInstall();
-  printReadyHint(consoleState);
+  printReadyHint();
   return true;
 }
 
@@ -1918,26 +1859,16 @@ function getEngineHost(): string {
   return "localhost";
 }
 
-function printReadyHint(consoleState: IiiConsoleState): void {
-  // REST goes through getBaseUrl which already honors AGENTMEMORY_URL
-  // for full host+protocol overrides. Streams/Engine are derived from
-  // III_ENGINE_URL so a remote bind reads correctly in the panel.
+function printReadyHint(): void {
   const restUrl = getBaseUrl();
   const viewerUrl = getViewerUrl();
   const engineHost = getEngineHost();
   const streamUrl = `ws://${engineHost}:${getStreamPort()}`;
   const engineUrl = `ws://${engineHost}:${getEnginePort()}`;
+  const invocation = isInvokedViaNpx() ? "npx @agentmemory/agentmemory" : "agentmemory";
+  const consolePort = defaultConsolePort(getConfiguredViewerPort());
 
-  const consoleLine =
-    consoleState.kind === "installed"
-      ? // We can't safely probe iii-console's port (default 3113
-        // collides with our viewer) so we surface the binary location
-        // and let the user start it on a port of their choice. Use
-        // the detected binary path so `(run: ...)` is executable as-
-        // is, even when the binary isn't on PATH under the bare
-        // name `iii-console`.
-        `${c.label("iii console")}  ${c.dim(consoleState.binPath)}  ${c.dim(`(run: ${consoleState.binPath} -p <port>)`)}`
-      : `${c.label("iii console")}  ${c.dim(`(install: ${iiiConsoleInstallHint()})`)}`;
+  const consoleLine = `${c.label("iii console")}  ${c.cmd(`${invocation} console`)}  ${c.dim(`(serves on :${consolePort}; first run downloads the console next to the pinned iii)`)}`;
 
   const lines = [
     `${c.label("REST API")}     ${c.url(restUrl)}`,
@@ -1956,17 +1887,15 @@ function printReadyHint(consoleState: IiiConsoleState): void {
   // (unless they accepted the global-install prompt and the npm bin
   // dir was already on PATH in this shell), so we suggest the npx
   // form for them; everyone else gets the global form.
-  const demoCommand = isInvokedViaNpx()
-    ? "npx @agentmemory/agentmemory demo"
-    : "agentmemory demo";
+  const demoCommand = `${invocation} demo`;
   process.stdout.write(`\n${c.dim("Try:")} ${c.cmd(demoCommand)}\n`);
 }
 
 async function main() {
   await assertRuntimePortOwnership();
   // Booting a second instance next to a live daemon registers a duplicate
-  // worker on the running engine, and on iii 0.11.2 the second instance's
-  // shutdown tears down the daemon's HTTP trigger routing (every
+  // worker on the running engine, and before iii 0.19.2 the second instance's
+  // shutdown tore down the daemon's HTTP trigger routing (every
   // /agentmemory/* route 404s until a full engine restart). Refuse instead.
   // A different --instance resolves to a different port, so multi-instance
   // setups are unaffected.
@@ -2008,9 +1937,8 @@ async function main() {
     if (IS_VERBOSE) p.log.info("Skipping engine check (--no-engine)");
     await import("./index.js");
     if (await waitForAgentmemoryReady(15000)) {
-      const consoleState = await ensureIiiConsole();
       await maybeOfferGlobalInstall();
-      printReadyHint(consoleState);
+      printReadyHint();
     }
     return;
   }
@@ -2048,9 +1976,8 @@ async function main() {
         p.log.error("agentmemory worker did not become ready within 120s.");
         process.exit(1);
       }
-      const consoleState = await ensureIiiConsole();
       await maybeOfferGlobalInstall();
-      printReadyHint(consoleState);
+      printReadyHint();
       return;
     }
 
@@ -2081,7 +2008,7 @@ async function main() {
         `       ${c.cmd(base)}`,
         "",
         c.dim(`Step 2 needs no manual install. To install iii v${IIPINNED_VERSION} yourself (replaces your global iii), curl:`),
-        `     ${c.cmd(III_CONSOLE_INSTALL_CMD)}`,
+        `     ${c.cmd(IIIENGINE_INSTALL_CMD)}`,
         `     ${c.dim("or download the release:")} ${c.url(`https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}`)}`,
       ].join("\n"),
       "engine conflict",
@@ -2160,9 +2087,8 @@ async function main() {
     p.log.error("agentmemory worker did not become ready within 120s.");
     process.exit(1);
   }
-  const consoleState = await ensureIiiConsole();
   await maybeOfferGlobalInstall();
-  printReadyHint(consoleState);
+  printReadyHint();
   // Mark splash as something to skip on subsequent runs. This is a
   // no-op if onboarding already flipped the flag (idempotent merge).
   writePrefs({ skipSplash: true });
@@ -3186,19 +3112,35 @@ async function runUpgrade() {
         label: "Refreshing dependencies (pnpm install)",
       });
       requireSuccess(installOk, "pnpm install");
-      runCommand(pnpmBin, ["up", "iii-sdk@0.11.2"], {
-        label: "Pinning iii-sdk@0.11.2",
-        optional: true,
-      });
+      runCommand(
+        pnpmBin,
+        [
+          "up",
+          `iii-sdk@${IIPINNED_DEFAULT_VERSION}`,
+          `@iii-dev/helpers@${IIPINNED_DEFAULT_VERSION}`,
+        ],
+        {
+          label: `Pinning iii-sdk and @iii-dev/helpers at ${IIPINNED_DEFAULT_VERSION}`,
+          optional: true,
+        },
+      );
     } else if (npmBin) {
       const installOk = runCommand(npmBin, ["install"], {
         label: "Refreshing dependencies (npm install)",
       });
       requireSuccess(installOk, "npm install");
-      runCommand(npmBin, ["install", "iii-sdk@0.11.2"], {
-        label: "Pinning iii-sdk@0.11.2",
-        optional: true,
-      });
+      runCommand(
+        npmBin,
+        [
+          "install",
+          `iii-sdk@${IIPINNED_DEFAULT_VERSION}`,
+          `@iii-dev/helpers@${IIPINNED_DEFAULT_VERSION}`,
+        ],
+        {
+          label: `Pinning iii-sdk and @iii-dev/helpers at ${IIPINNED_DEFAULT_VERSION}`,
+          optional: true,
+        },
+      );
     } else {
       p.log.warn("No package manager found (pnpm/npm). Skipping JS dependency upgrade.");
     }
@@ -3545,7 +3487,7 @@ async function runStop(): Promise<void> {
       // instead of preserving for manual cleanup.
       const s = p.spinner();
       s.start(`Stopping orphaned agentmemory worker (pid ${workerPid})...`);
-      const ok = await signalAndWait(workerPid, "SIGTERM", 3000);
+      const ok = await signalAndWait(workerPid, "SIGTERM", SHUTDOWN_HARD_EXIT_MS + 1000);
       s.stop(ok ? `Stopped worker pid ${workerPid}` : `Failed to stop worker pid ${workerPid}`);
       clearEnginePidfile();
       clearEngineState();
@@ -4009,10 +3951,72 @@ async function runRemove(): Promise<void> {
   );
 }
 
+async function runConsole(): Promise<void> {
+  const iiiBin = pickCompatibleIii([
+    whichBinary("iii"),
+    ...fallbackIiiPaths().filter((candidate) => existsSync(candidate)),
+  ]);
+  if (!iiiBin) {
+    p.log.error(
+      `No iii v${IIPINNED_VERSION} found. Start agentmemory once so it installs the pinned engine into ${privateIiiPath()}, then run this again.`,
+    );
+    process.exit(1);
+  }
+  let parsed: ReturnType<typeof parseConsoleArgs>;
+  try {
+    parsed = parseConsoleArgs(
+      args.slice(1),
+      defaultConsolePort(getConfiguredViewerPort()),
+    );
+  } catch (err) {
+    p.log.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+  const launch = {
+    iiiBin,
+    consolePort: parsed.consolePort,
+    restPort: getRestPort(),
+    streamPort: getStreamPort(),
+    enginePort: getEnginePort(),
+    extraArgs: parsed.extraArgs,
+  };
+  if (!(await isEngineRunning())) {
+    p.log.warn(
+      `No engine responding on port ${launch.restPort}. The console starts anyway and connects once agentmemory is up.`,
+    );
+  }
+  p.log.info(
+    `iii console: http://127.0.0.1:${launch.consolePort} (engine REST ${launch.restPort}, streams ${launch.streamPort}, bridge ${launch.enginePort}). The first run downloads the console binary next to the pinned iii.`,
+  );
+  const child = spawn(iiiBin, consoleArgs(launch), {
+    stdio: "inherit",
+    detached: true,
+  });
+  const forward = (signal: NodeJS.Signals): void => {
+    try {
+      process.kill(-child.pid!, signal);
+    } catch {
+      child.kill(signal);
+    }
+  };
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(signal, () => forward(signal));
+  }
+  const code = await new Promise<number>((resolve) => {
+    child.on("exit", (status, signal) => resolve(status ?? (signal ? 1 : 0)));
+    child.on("error", (err) => {
+      p.log.error(err.message);
+      resolve(1);
+    });
+  });
+  process.exit(code);
+}
+
 const commands: Record<string, () => Promise<void>> = {
   init: runInit,
   connect: runConnectCmd,
   status: runStatus,
+  console: runConsole,
   doctor: runDoctor,
   demo: runDemo,
   upgrade: runUpgrade,

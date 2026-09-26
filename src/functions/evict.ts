@@ -1,5 +1,5 @@
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import type {
   Session,
   CompressedObservation,
@@ -56,7 +56,7 @@ function isCompressedObservation(
 }
 
 async function recoverStaleSession(
-  sdk: ISdk,
+  sdk: IIIClient,
   sessionId: string,
 ): Promise<boolean> {
   try {
@@ -83,7 +83,7 @@ async function recoverStaleSession(
   }
 }
 
-async function runRecoveredSessionConsolidation(sdk: ISdk): Promise<void> {
+async function runRecoveredSessionConsolidation(sdk: IIIClient): Promise<void> {
   // Same gate as the session-stop path: keyless installs must not fire
   // no-op LLM consolidation from an eviction sweep either.
   if (!isConsolidationEnabled()) return;
@@ -106,7 +106,7 @@ async function runRecoveredSessionConsolidation(sdk: ISdk): Promise<void> {
   }
 }
 
-export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
+export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction("mem::evict", 
     async (data: { dryRun?: boolean }): Promise<EvictionStats> => {
       const dryRun = data?.dryRun ?? false;
