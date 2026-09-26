@@ -133,6 +133,12 @@ if (args.includes("--version") || args.includes("-V")) {
 const IIPINNED_DEFAULT_VERSION = III_PINNED_VERSION;
 const IIPINNED_VERSION =
   process.env["AGENTMEMORY_III_VERSION"] || IIPINNED_DEFAULT_VERSION;
+// Boot rebuilds the BM25 index from the state store before the worker
+// answers /livez, so a large store needs longer than the default.
+const WORKER_READY_TIMEOUT_MS = (() => {
+  const raw = Number.parseInt(process.env["AGENTMEMORY_READY_TIMEOUT_MS"] ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 120_000;
+})();
 const IIIENGINE_INSTALL_CMD = `curl -fsSL https://install.iii.dev/iii/main/install.sh | VERSION=${IIPINNED_VERSION} sh`;
 
 // Map Node platform/arch → the asset name iii-hq/iii ships under
@@ -241,6 +247,7 @@ Environment:
   AGENTMEMORY_USE_DOCKER=1     Prefer the bundled docker-compose path over the
                                native iii-engine binary on first run.
   AGENTMEMORY_III_VERSION      Override pinned iii-engine version (default ${IIPINNED_VERSION}).
+  AGENTMEMORY_READY_TIMEOUT_MS How long start waits for the worker (default 120000).
   AGENTMEMORY_FOLLOWUP_WINDOW_SECONDS
                                Window (seconds) for the smart-search follow-up diagnostic
                                (default 30). Long values overcount, short values undercount.
@@ -1972,8 +1979,8 @@ async function main() {
     if (detected === IIPINNED_VERSION) {
       adoptRunningEngine();
       await startWorkerForEngineState();
-      if (!(await waitForAgentmemoryReady(120000))) {
-        p.log.error("agentmemory worker did not become ready within 120s.");
+      if (!(await waitForAgentmemoryReady(WORKER_READY_TIMEOUT_MS))) {
+        p.log.error(`agentmemory worker did not become ready within ${Math.round(WORKER_READY_TIMEOUT_MS / 1000)}s (AGENTMEMORY_READY_TIMEOUT_MS).`);
         process.exit(1);
       }
       await maybeOfferGlobalInstall();
@@ -2083,8 +2090,8 @@ async function main() {
 
   s.stop(c.ok("iii-engine is ready"));
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(120000))) {
-    p.log.error("agentmemory worker did not become ready within 120s.");
+  if (!(await waitForAgentmemoryReady(WORKER_READY_TIMEOUT_MS))) {
+    p.log.error(`agentmemory worker did not become ready within ${Math.round(WORKER_READY_TIMEOUT_MS / 1000)}s (AGENTMEMORY_READY_TIMEOUT_MS).`);
     process.exit(1);
   }
   await maybeOfferGlobalInstall();
