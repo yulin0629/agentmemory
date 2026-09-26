@@ -5,7 +5,7 @@
 agentmemory is a persistent memory system for AI coding agents, built on iii-engine's three primitives (Worker/Function/Trigger). Everything goes through `registerFunction`/`registerTrigger`/`sdk.trigger()` — never bypass iii-engine with standalone SQLite or in-process alternatives.
 
 - **Engine**: iii-sdk 0.22.1 with @iii-dev/helpers 0.22.1 (WebSocket to iii-engine 0.22.1 on port 49134; the client type is `IIIClient`, HTTP requests are `HttpRequest` from `@iii-dev/helpers/http`)
-- **State**: File-based SQLite via iii-engine's StateModule (`./data/state_store.db`)
+- **State**: iii-engine StateWorker KV; `file_based` uses a directory at `./data/state_store.db/` with asynchronous snapshot writes, not a SQLite file.
 - **Build**: TypeScript → ESM via tsdown, output to `dist/`
 - **Test**: vitest (`npm test` excludes integration tests)
 
@@ -95,8 +95,13 @@ case "memory_your_tool": {
 ### Hook Scripts
 Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import). They read JSON from stdin, make HTTP calls to the REST API, and exit. There are two patterns depending on whether Claude Code consumes the script's stdout:
 
-- **Context-injecting hooks** (`pre-tool-use`, `pre-compact`, `session-start`) write recalled context to stdout for Claude Code to inject. These MUST use `try/catch` with `await fetch(..., { signal: AbortSignal.timeout(N) })` — the script has to wait for the response before exiting, and the timeout is the only bound on hang time.
-- **Telemetry-only hooks** (`notification`, `post-tool-failure`, `prompt-submit`, `stop`, `session-end`, `subagent-start`, `subagent-stop`, `task-completed`) write nothing to stdout. These use fire-and-forget `fetch(..., { signal: AbortSignal.timeout(N) }).catch(() => {})` paired with an unref'd `setTimeout(() => process.exit(0), timeout)`. Use 1500ms whenever losing the request matters and the path may be slow: `prompt-submit`, `stop`, and `session-end` all qualify, because a remote `AGENTMEMORY_URL` can take more than 500ms to acknowledge. **Request count is not the criterion — delivery-path latency is.** A hook that sends one request to a slow host drops it just as readily as one that sends three; 500ms is only safe for hooks whose loss is inconsequential (`notification`, `post-tool-failure`, `subagent-start`, `subagent-stop`, `task-completed`). **`post-tool-use` is the delivery-guaranteed exception:** it MUST await its single observation request with the existing 3-second abort bound because exiting after a short timer can drop tool observations on higher-latency relays.
+- **Context-injecting hooks** (`pre-tool-use`, `pre-compact`, `session-start`) write recalled context to stdout for Claude Code to inject. `prompt-submit` joins this group only when `AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=true`; it must await the bounded selective-context response and otherwise remain silent. These paths MUST use `try/catch` with `await fetch(..., { signal: AbortSignal.timeout(N) })` — the timeout is the only bound on hang time.
+- **Explicit saves/replacements**: An opted-in `prompt-submit` beginning with `記住：`, `請記住：`, or the three-line `確認取代：` form awaits `/observe` for at most 5 seconds and emits only its capture acknowledgement. Replacement syntax and limits are in README's Explicit project memory section. `mem::context-knowledge-capture` must read the stored user event before compression. Internal iii invocations include `_caller_worker_id`; allow that metadata only in internal schemas, never loosen the public HTTP schemas.
+- **Selective project scope**: `_project.ts` keeps the legacy display label separate from `resolveContextProjectId`. New scoped recall requires identity equality, never basename equality. Backup validation/restoration is shared by export/import and Git snapshots in `state/context-knowledge-backup.ts`; keep record links and namespace revision invalidation intact.
+- **Selective authentication**: The global API secret takes precedence over `AGENTMEMORY_SELECTIVE_CONTEXT_SECRET`. With only the latter configured, legacy telemetry remains unchanged but explicit-save observations and both selective endpoints require its bearer token or `X-AgentMemory-Selective-Secret` (separate from relay authentication). Client prompt hooks may opt in through private `~/.config/agentmemory/selective-context.json`.
+- **Shared recall ownership**: With private config `owner: "agent-hooks"`, native adapters use `selective-client.mjs --stdin`; standalone prompt hooks retain telemetry but do not inject. `AGENTMEMORY_SHARED_CLIENT=1` is internal routing, not authorization. The shared client skips ordinary observation writes, but explicit saves still require authenticated, source-backed capture. Do not enable both native shared recall and separate extension recall.
+- **Historical lessons**: `lessonId` links adoption evidence to an existing lesson without another mutable lesson copy. Filter approved IDs before BM25 top-k, verify exact text/project against KV, then recheck source versions and catalog revision after Jev. Missing provenance never implies global adoption. Shared ownership also suppresses broad startup/tool/precompact injection.
+- **Telemetry-only hooks** (`notification`, `post-tool-failure`, `prompt-submit` by default, `stop`, `session-end`, `subagent-start`, `subagent-stop`, `task-completed`) write nothing to stdout. These use fire-and-forget `fetch(..., { signal: AbortSignal.timeout(N) }).catch(() => {})` paired with an unref'd `setTimeout(() => process.exit(0), timeout)`. Use 1500ms whenever losing the request matters and the path may be slow: `prompt-submit`, `stop`, and `session-end` all qualify, because a remote `AGENTMEMORY_URL` can take more than 500ms to acknowledge. **Request count is not the criterion — delivery-path latency is.** A hook that sends one request to a slow host drops it just as readily as one that sends three; 500ms is only safe for hooks whose loss is inconsequential (`notification`, `post-tool-failure`, `subagent-start`, `subagent-stop`, `task-completed`). **`post-tool-use` is the delivery-guaranteed exception:** it MUST await its single observation request with the existing 3-second abort bound because exiting after a short timer can drop tool observations on higher-latency relays.
 
 ## Coding Standards
 
@@ -119,7 +124,7 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 ## Current Stats (v0.9.29)
 
 - 54 MCP tools (8 visible by default, `AGENTMEMORY_TOOLS=all` for all)
-- 132 REST endpoints
+- 134 REST endpoints
 - 6 MCP resources, 3 MCP prompts
 - 12 hooks, 17 skills
 - 260+ iii functions

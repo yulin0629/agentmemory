@@ -52,6 +52,40 @@ async function ensureLessonIndex(kv: StateKV): Promise<SearchIndex> {
   return lessonIndex ?? ensureLessonIndex(kv);
 }
 
+export async function findContextLesson(kv: StateKV, text: string, project: string): Promise<Lesson | undefined> {
+  for (const key of [JSON.stringify([project, text.toLowerCase()]), text.toLowerCase()]) {
+    const lesson = await kv.get<Lesson>(KV.lessons, fingerprintId("lsn", key));
+    if (lesson && !lesson.deleted && lesson.project === project && lesson.content === text) return lesson;
+  }
+}
+
+export async function searchContextLessons(kv: StateKV, query: string, eligibleIds: Set<string>, limit = 10): Promise<Lesson[]> {
+  if (!eligibleIds.size) return [];
+  const index = await ensureLessonIndex(kv);
+  return index.search(query, limit, id => eligibleIds.has(id))
+    .flatMap(hit => {
+      const lesson = lessonRecords.get(hit.obsId);
+      return lesson && !lesson.deleted ? [lesson] : [];
+    });
+}
+
+// Relevance-ranked recall over the whole lesson corpus. Selective recall
+// hands these to the judge as candidates; adoption through the catalog
+// is not required. Records whose KV copy drifted from the index are
+// dropped rather than served stale.
+export async function searchAllLessons(kv: StateKV, query: string, limit = 10): Promise<Lesson[]> {
+  const index = await ensureLessonIndex(kv);
+  const out: Lesson[] = [];
+  for (const hit of index.search(query, limit)) {
+    const indexed = lessonRecords.get(hit.obsId);
+    if (!indexed || indexed.deleted) continue;
+    const current = await kv.get<Lesson>(KV.lessons, hit.obsId);
+    if (!current || current.deleted || current.content !== indexed.content) continue;
+    out.push(current);
+  }
+  return out;
+}
+
 function reinforceLesson(lesson: Lesson): void {
   const now = new Date().toISOString();
   lesson.reinforcements++;
@@ -78,8 +112,14 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
         return { success: false, error: "content is required" };
       }
 
-      const fp = fingerprintId("lsn", data.content.trim().toLowerCase());
-      const existing = await kv.get<Lesson>(KV.lessons, fp);
+      const contentKey = data.content.trim().toLowerCase();
+      const fp = fingerprintId("lsn", JSON.stringify([data.project ?? null, contentKey]));
+      let existing = await kv.get<Lesson>(KV.lessons, fp);
+      if (!existing) {
+        // Preserve legacy IDs and references, but never reinforce another scope.
+        const legacy = await kv.get<Lesson>(KV.lessons, fingerprintId("lsn", contentKey));
+        if (legacy && !legacy.deleted && legacy.project === data.project) existing = legacy;
+      }
 
       if (existing && !existing.deleted) {
         reinforceLesson(existing);

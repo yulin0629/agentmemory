@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { resolveProject, hookCwd } from "./_project.js";
+import { sharedSelectiveRecall } from "./_selective-settings.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -31,6 +32,7 @@ async function main() {
 
   if (!data || typeof data !== "object") return;
   if (isSdkChildContext(data)) return;
+  if (sharedSelectiveRecall()) return;
 
   const sessionId = ((data.session_id || data.sessionId || data.conversation_id) as string) || "unknown";
   const project = resolveProject(hookCwd(data));

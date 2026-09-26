@@ -13,6 +13,7 @@ import { getSearchIndex, scheduleIndexSave, vectorIndexAddGuarded } from "./sear
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
+import { isRememberRequest } from "../state/explicit-memory.js";
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -42,6 +43,7 @@ export function registerObserveFunction(
   kv: StateKV,
   dedupMap?: DedupMap,
   maxObservationsPerSession?: number,
+  captureExplicitKnowledge = false,
 ): void {
   sdk.registerFunction("mem::observe", 
     async (payload: HookPayload) => {
@@ -62,6 +64,12 @@ export function registerObserveFunction(
       }
 
       const obsId = generateId("obs");
+      const incomingProjectId = (payload.data as { contextProjectId?: unknown } | null)?.contextProjectId;
+      const contextProjectId = typeof incomingProjectId === "string" && incomingProjectId.trim().length > 0
+        && incomingProjectId.length <= 200 ? incomingProjectId.trim() : undefined;
+      const explicitRequest = captureExplicitKnowledge && payload.hookType === "prompt_submit"
+        && (payload.data as { explicitMemoryRequest?: unknown } | null)?.explicitMemoryRequest === true
+        && isRememberRequest((payload.data as { prompt?: unknown } | null)?.prompt);
 
       let dedupHash: string | undefined;
       if (dedupMap) {
@@ -84,7 +92,7 @@ export function registerObserveFunction(
           toolName,
           dedupInput,
         );
-        if (dedupMap.isDuplicate(dedupHash)) {
+        if (!explicitRequest && dedupMap.isDuplicate(dedupHash)) {
           return { deduplicated: true, sessionId: payload.sessionId };
         }
       }
@@ -162,6 +170,8 @@ export function registerObserveFunction(
           agentId?: string;
           observationCount?: number;
           firstPrompt?: string;
+          project?: string;
+          contextProjectId?: string;
         }>(KV.sessions, payload.sessionId);
         const inheritedAgentId = existingSession
           ? existingSession.agentId
@@ -254,6 +264,9 @@ export function registerObserveFunction(
               value: (session.observationCount || 0) + 1,
             },
           ];
+          if (!session.contextProjectId && contextProjectId && session.project === payload.project) {
+            updates.push({ type: "set", path: "contextProjectId", value: contextProjectId });
+          }
           if (!session.firstPrompt && typeof raw.userPrompt === "string") {
             const trimmed = raw.userPrompt.replace(/\s+/g, " ").trim();
             if (trimmed.length > 0) {
@@ -291,12 +304,27 @@ export function registerObserveFunction(
             startedAt: payload.timestamp ?? ts,
             updatedAt: ts,
             status: "active",
+            ...(contextProjectId ? { contextProjectId } : {}),
             observationCount: 1,
             ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
             ...(trimmedPrompt && trimmedPrompt.length > 0
               ? { firstPrompt: trimmedPrompt }
               : {}),
           });
+        }
+
+        let knowledgeCapture: unknown;
+        if (explicitRequest) {
+          try {
+            // The producer reads this stored user event before compression can
+            // replace its full text. Knowledge-level dedup handles retries.
+            knowledgeCapture = await sdk.trigger({
+              function_id: "mem::context-knowledge-capture",
+              payload: { sessionId: payload.sessionId, observationId: obsId },
+            });
+          } catch {
+            knowledgeCapture = { success: false, error: "capture_failed" };
+          }
         }
 
         // Per-observation LLM compression is opt-in as of 0.8.8.
@@ -358,7 +386,7 @@ export function registerObserveFunction(
           hook: payload.hookType,
           compress: isAutoCompressEnabled() ? "llm" : "synthetic",
         });
-        return { observationId: obsId };
+        return { observationId: obsId, ...(explicitRequest ? { knowledgeCapture } : {}) };
       });
     },
   );

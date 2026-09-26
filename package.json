@@ -22,6 +22,7 @@
     "start": "node dist/cli.mjs",
     "migrate": "node dist/functions/migrate.js",
     "test": "vitest run --exclude test/integration.test.ts",
+    "test:mvp": "vitest run test/selective-context.test.ts test/selective-context-api.test.ts test/explicit-memory-capture.test.ts test/context-project.test.ts test/context-knowledge-backup.test.ts test/previous-context.test.ts test/codex-hooks-runtime.test.ts",
     "test:watch": "vitest --exclude test/integration.test.ts",
     "test:integration": "AGENTMEMORY_URL=${AGENTMEMORY_URL:-http://localhost:3111} vitest run test/integration.test.ts",
     "test:all": "vitest run",
