@@ -3277,7 +3277,7 @@ async function stopNativeEngineForRemoval(): Promise<NativeRemovalStopResult> {
   }
 
   if (workerPid) {
-    if (!(await stopWorkerPid(workerPid, 5000))) {
+    if (!(await stopWorkerPid(workerPid, SHUTDOWN_HARD_EXIT_MS + 1000))) {
       return {
         ok: false,
         reason: `worker pid ${workerPid} could not be stopped; no engine or files were removed`,
@@ -3376,7 +3376,7 @@ async function stopDockerEngine(
   const resolvedState = persistDockerInspection(state, inspection);
 
   const workerPid = readWorkerPidfile();
-  if (workerPid && !(await stopWorkerPid(workerPid, 5000))) {
+  if (workerPid && !(await stopWorkerPid(workerPid, SHUTDOWN_HARD_EXIT_MS + 1000))) {
     p.log.error("The agentmemory worker could not be stopped; Docker ownership state was preserved.");
     process.exit(1);
   }
@@ -3559,10 +3559,10 @@ async function runStop(): Promise<void> {
   // to flush BM25/vector snapshots + audit rows. Killing iii first
   // leaves those writes with no engine to land on, and the index +
   // observations end up as in-memory state the iii process never
-  // persists. Worker SIGTERM grace bumped 3s -> 5s to give a large
-  // index a real chance to commit before the engine goes away.
+  // persists. The grace outlasts the worker's own hard-exit deadline so
+  // its bounded flush finishes instead of being SIGKILLed mid-write.
   for (const pid of workerCandidates) {
-    if (!(await stopWorkerPid(pid, 5000))) allStopped = false;
+    if (!(await stopWorkerPid(pid, SHUTDOWN_HARD_EXIT_MS + 1000))) allStopped = false;
   }
   const skippedForeign: Array<{ pid: number; comm: string }> = [];
   for (const pid of candidates) {
