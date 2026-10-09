@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export const MAX_EVENT_BYTES = 16 * 1024;
 
 export function redact(value, limit = 2048) {
@@ -10,6 +12,10 @@ export function redact(value, limit = 2048) {
     .replace(/\b(?:sk-|gh[pousr]_|github_pat_|AKIA|ASIA)[A-Za-z0-9_/-]+/g, "[redacted]")
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "")
     .slice(0, limit);
+}
+
+export function sessionIdentity(value) {
+  return redact(value, 128) === value ? value : `redacted-${createHash("sha256").update(value).digest("hex")}`;
 }
 
 export function commandSummary(command) {
@@ -69,8 +75,8 @@ export function sanitizeEvent(raw) {
     event_id: raw.event_id,
     event_type: "tool.completed",
     occurred_at: raw.occurred_at,
-    machine_id: redact(raw.machine_id, 128),
-    workspace_id: redact(raw.workspace_id, 128),
+    machine_id: sessionIdentity(raw.machine_id),
+    workspace_id: sessionIdentity(raw.workspace_id),
     project: redact(raw.project, 256),
     cwd: redact(raw.cwd),
     tool: redact(raw.tool, 128),

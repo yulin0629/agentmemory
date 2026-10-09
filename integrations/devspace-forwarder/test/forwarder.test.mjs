@@ -269,6 +269,30 @@ test("whitelists and redacts event metadata, retaining benign paths and metrics"
   assert.equal(sanitizeEvent(event({ tool: "other", details: { arbitrary: "value" } })).details, undefined);
 });
 
+test("keeps redacted machine and workspace identities distinct across restart", async (t) => {
+  const f = await fixture(t);
+  const raw = [
+    event({ machine_id: "token=fixture-alpha" }), event({ machine_id: "token=fixture-beta" }),
+    event({ workspace_id: "secret=fixture-alpha" }), event({ workspace_id: "secret=fixture-beta" }),
+  ];
+  await writeFile(f.file, raw.map((value) => JSON.stringify(value) + "\n").join(""));
+  await f.forwarder.poll();
+  assert.equal(new Set(f.calls.map((call) => call.body.sessionId)).size, 4);
+  const checkpoint = await readFile(join(f.options.stateDir, "checkpoint.json"), "utf8");
+  for (const value of ["fixture-alpha", "fixture-beta"]) {
+    assert.ok(!checkpoint.includes(value));
+    assert.ok(!JSON.stringify(f.calls).includes(value));
+  }
+  const restarted = new Forwarder(f.options);
+  await restarted.init();
+  await appendFile(f.file, JSON.stringify(event({ machine_id: raw[0].machine_id })) + "\n");
+  await restarted.poll();
+  assert.equal(f.calls[4].body.sessionId, f.calls[0].body.sessionId);
+  const ordinary = sanitizeEvent(event());
+  assert.equal(ordinary.machine_id, "host");
+  assert.equal(ordinary.workspace_id, "workspace");
+});
+
 test("disabled CLI adds no spool or checkpoint and rejects broadly readable settings", async (t) => {
   const f = await fixture(t);
   const settings = join(f.dir, "settings.json");
