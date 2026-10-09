@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerSelectiveContextFunctions } from "../src/functions/selective-context.js";
 import { selectContext, type ContextJudge, type ContextKnowledge } from "../src/state/selective-context.js";
 import { KV } from "../src/state/schema.js";
+import { getSearchIndex } from "../src/functions/search.js";
+import { resetLessonIndex } from "../src/functions/lessons.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -31,8 +33,14 @@ function mockSdk() {
     registerFunction: (id: string, handler: (input: unknown) => Promise<unknown>) => {
       functions.set(id, handler);
     },
-    trigger: async (id: string, input: unknown) => {
+    trigger: async (id: string | { function_id: string; payload: unknown }, input?: unknown) => {
+      if (typeof id !== "string") { input = id.payload; id = id.function_id; }
       const fn = functions.get(id);
+      if (!fn && id === "mem::smart-search") {
+        const query = (input as { query: string }).query;
+        return { mode: "compact", results: getSearchIndex().search(query, 100)
+          .map(hit => ({ obsId: hit.obsId, sessionId: hit.sessionId })) };
+      }
       if (!fn) throw new Error(`No function: ${id}`);
       return fn(input);
     },
@@ -74,14 +82,291 @@ describe("selective context", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     sdk = mockSdk();
     kv = mockKV();
+    getSearchIndex().clear();
+    resetLessonIndex();
+    await kv.set(KV.sessions, "current", { id: "current", project: "home", status: "active",
+      agentId: "hermes-owner", startedAt: NOW });
     registerSelectiveContextFunctions(sdk as never, kv as never, {
       namespace: "personal",
       judge: usefulJudge,
       now: () => NOW,
     });
+  });
+
+  it("Hermes opt-in admits verified owned observation and summary evidence without current-session echoes", async () => {
+    const oldSession = { id: "old", project: "home", cwd: "/home", startedAt: NOW,
+      status: "completed", observationCount: 1, agentId: "hermes-owner" };
+    await kv.set(KV.sessions, "old", oldSession);
+    await kv.set(KV.sessions, "current", { ...oldSession, id: "current", status: "active" });
+    const observation = { id: "obs_old", sessionId: "old", timestamp: NOW,
+      type: "decision", title: "Router setting", subtitle: "", facts: [],
+      narrative: "The router configuration was reviewed.", concepts: [], files: [],
+      importance: 8, agentId: "hermes-owner", origin: { channel: "agent", capturedAt: NOW } };
+    await kv.set(KV.observations("old"), observation.id, observation);
+    getSearchIndex().add(observation as never);
+    const echo = { ...observation, id: "obs_echo", sessionId: "current", narrative: "The router uses port 9999." };
+    await kv.set(KV.observations("current"), echo.id, echo);
+    getSearchIndex().add(echo as never);
+    await kv.set(KV.summaries, "old", { sessionId: "old", project: "home", createdAt: NOW,
+      title: "Router setting", narrative: "The router uses port 4180.", keyDecisions: [],
+      filesModified: [], concepts: [], observationCount: 1 });
+    const result = await sdk.trigger("mem::selective-context", { prompt: "router port?", previous: "",
+      project: "home", hermes: { sessionId: "current", ownerId: "hermes-owner", visibility: "private" } }) as {
+      status: string; spans: Array<{ text: string }>;
+    };
+    expect(result.status).toBe("selected");
+    expect(result.spans.some(span => span.text.includes("4180"))).toBe(true);
+    expect(result.spans.every(span => !span.text.includes("9999"))).toBe(true);
+  });
+
+  it("admits legacy conversation evidence only with bounded same-owner session proof", async () => {
+    const session = { id: "old", project: "home", status: "completed" };
+    await kv.set(KV.sessions, "old", session);
+    await kv.set(KV.sessions, "current", { id: "current", project: "home", status: "active", startedAt: NOW });
+    const observation = { id: "obs_legacy", sessionId: "old", timestamp: NOW, type: "conversation",
+      title: "Route repair", narrative: "The route repair uses the HTTPS relay.", facts: [], concepts: [],
+      files: [], importance: 8, origin: { channel: "tool", detail: "conversation", capturedAt: NOW } };
+    await kv.set(KV.observations("old"), observation.id, observation);
+    getSearchIndex().add(observation as never);
+    await kv.set(KV.summaries, "old", { sessionId: "old", project: "home", createdAt: NOW,
+      title: "Route repair", narrative: "The HTTPS relay carries the route repair.", keyDecisions: [],
+      filesModified: [], concepts: [], observationCount: 1 });
+    const request = { prompt: "route repair", hermes: { sessionId: "current", ownerId: "hermes-owner",
+      visibility: "private", verifiedSessionIds: ["current", "old"] } };
+    const selected = await sdk.trigger("mem::selective-context", request) as { status: string; spans: Array<{ text: string }> };
+    expect(selected.status).toBe("selected");
+    expect(selected.spans.some(span => span.text.includes("HTTPS relay"))).toBe(true);
+    expect(await sdk.trigger("mem::selective-context", { ...request, hermes: {
+      ...request.hermes, verifiedSessionIds: ["current"] } })).toMatchObject({ status: "empty", spans: [] });
+    await kv.set(KV.sessions, "old", { ...session, agentId: "other-owner" });
+    expect(await sdk.trigger("mem::selective-context", request)).toMatchObject({ status: "empty", spans: [] });
+    expect(await sdk.trigger("mem::selective-context", { ...request, hermes: {
+      ...request.hermes, visibility: "group" } })).toMatchObject({ status: "empty", spans: [] });
+    expect(await sdk.trigger("mem::selective-context", { ...request, sessionId: "foreign" }))
+      .toMatchObject({ status: "unavailable", spans: [], error: "invalid_request" });
+  });
+
+  it("keeps deployed recallHistory selection and sends no session proof to the judge", async () => {
+    const seen: string[] = [];
+    const localSdk = mockSdk();
+    registerSelectiveContextFunctions(localSdk as never, kv as never, { namespace: "personal", now: () => NOW,
+      judge: async (request, candidates, signal) => {
+        seen.push(JSON.stringify(request));
+        return usefulJudge(request, candidates, signal);
+      } });
+    await kv.set(KV.sessions, "old", { id: "old", project: "home", status: "completed" });
+    const observation = { id: "obs_runtime", sessionId: "old", timestamp: NOW, type: "conversation",
+      title: "Native installer", narrative: "Native installer uses the stable release tree.", facts: [],
+      concepts: [], files: [], importance: 8, origin: { channel: "tool", detail: "conversation", capturedAt: NOW } };
+    await kv.set(KV.observations("old"), observation.id, observation);
+    getSearchIndex().add(observation as never);
+    await kv.set(KV.memories, "mem_runtime", { id: "mem_runtime", title: "Installer path",
+      content: "The installer uses the stable release directory.", type: "fact", isLatest: true,
+      sessionIds: ["old"], sourceObservationIds: [], createdAt: NOW, updatedAt: NOW });
+    getSearchIndex().add({ id: "mem_runtime", sessionId: "old", timestamp: NOW,
+      title: "Installer path", narrative: "The installer uses the stable release directory.",
+      type: "decision", facts: [], concepts: [], files: [], importance: 8 } as never);
+    const response = await localSdk.trigger("mem::selective-context", { prompt: "native installer",
+      recallHistory: true, sessionId: "current", excludedSessionIds: ["current"] }) as {
+      status: string; spans: Array<{ evidenceEventId: string; source: { sessionId: string } }>;
+    };
+    expect(response.status).toBe("selected");
+    expect(response.spans.some(span => span.evidenceEventId === "obs_runtime"
+      && span.source?.sessionId === "old")).toBe(true);
+    expect(response.spans.some(span => span.evidenceEventId === "mem_runtime")).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).not.toContain("sessionId");
+    expect(seen[0]).not.toContain("excludedSessionIds");
+    expect(await localSdk.trigger("mem::selective-context", { prompt: "native installer",
+      recallHistory: true, sessionId: "current", excludedSessionIds: ["old"] }))
+      .toMatchObject({ status: "empty", spans: [] });
+  });
+
+  it("recalls a legacy native command observation while Hermes rejects its missing provenance", async () => {
+    await kv.set(KV.sessions, "old", { id: "old", project: "home", status: "completed" });
+    const observation = { id: "obs_mq08wi0l_cef5dbf773ee", sessionId: "old", timestamp: NOW,
+      type: "command_run", title: "Router rollback", narrative: "The router rollback uses the saved M2 configuration.",
+      facts: [], concepts: [], files: [], importance: 8, confidence: 1, agentId: null, origin: null };
+    await kv.set(KV.observations("old"), observation.id, observation);
+    getSearchIndex().add(observation as never);
+    const legacy = await sdk.trigger("mem::selective-context", { prompt: "router rollback M2",
+      recallHistory: true, sessionId: "current" }) as { status: string; candidates: { historical: number } };
+    expect(legacy.status).toBe("selected");
+    expect(legacy.candidates.historical).toBeGreaterThan(0);
+    expect(await sdk.trigger("mem::selective-context", { prompt: "router rollback M2",
+      hermes: { sessionId: "current", ownerId: "hermes-owner", visibility: "private",
+        verifiedSessionIds: ["current", "old"] } })).toMatchObject({ status: "empty", spans: [] });
+  });
+
+  it("retrieves an owned historical conversation from the deployed hybrid search path when BM25 misses", async () => {
+    const prompt = "M2 ChatGPT Web 5.0.8 修補部署失敗後採取什麼決策？是否可以說已經修好了？";
+    const gold = { id: "obs_gold", sessionId: "old", timestamp: NOW, type: "conversation",
+      title: "Deployment decision", narrative: "The M2 deployment failed, so the team rolled back. It is not fixed yet.",
+      facts: [], concepts: [], files: [], importance: 8, confidence: 1, agentId: null,
+      origin: { channel: "tool", detail: "conversation", capturedAt: NOW } };
+    await kv.set(KV.sessions, "old", { id: "old", project: "home", status: "completed", agentId: null });
+    await kv.set(KV.observations("old"), gold.id, gold);
+    const searchInputs: unknown[] = [];
+    sdk.registerFunction("mem::smart-search", async input => {
+      searchInputs.push(input);
+      return { mode: "compact", results: [
+        ...Array.from({ length: 22 }, (_, i) => ({ obsId: `obs_other_${i}`, sessionId: "foreign" })),
+        { obsId: gold.id, sessionId: "old" },
+      ] };
+    });
+    const result = await sdk.trigger("mem::selective-context", { prompt,
+      hermes: { sessionId: "current", ownerId: "hermes-owner", visibility: "private",
+        verifiedSessionIds: ["old"] } }) as { status: string; candidates: { historical: number }; spans: Array<{ evidenceEventId: string }> };
+    expect(result.status).toBe("selected");
+    expect(searchInputs).toMatchObject([{ query: `${prompt}\n`, limit: 100,
+      includeLessons: false, agentId: "*" }]);
+    expect(result.candidates.historical).toBe(1);
+    expect(result.spans.some(span => span.evidenceEventId === gold.id)).toBe(true);
+  });
+
+  it("keeps legacy historical observations when the source session row is absent", async () => {
+    const observation = { id: "obs_legacy_without_session", sessionId: "old", timestamp: NOW,
+      type: "command_run", title: "Installer decision", narrative: "The installer uses the stable release tree.",
+      facts: [], concepts: [], files: [], importance: 8 };
+    await kv.set(KV.observations("old"), observation.id, observation);
+    getSearchIndex().add(observation as never);
+    const result = await sdk.trigger("mem::selective-context", { prompt: "installer decision",
+      recallHistory: true, sessionId: "current" }) as { spans: Array<{ evidenceEventId: string }> };
+    expect(result.spans.some(span => span.evidenceEventId === observation.id)).toBe(true);
+  });
+
+  it("keeps long source lineage on legacy memory while Hermes bounds private memory lineage", async () => {
+    const sourceObservationIds = Array.from({ length: 11 }, (_, i) => `obs_source_${i}`);
+    await kv.set(KV.sessions, "old", { id: "old", project: "home", status: "completed", agentId: "hermes-owner" });
+    await kv.set(KV.memories, "mem_lineage", { id: "mem_lineage", title: "Installer decision",
+      content: "The installer uses the stable release tree.", type: "fact", isLatest: true,
+      sessionIds: ["old"], sourceObservationIds, createdAt: NOW, updatedAt: NOW, agentId: "hermes-owner" });
+    getSearchIndex().add({ id: "mem_lineage", sessionId: "old", timestamp: NOW,
+      title: "Installer decision", narrative: "The installer uses the stable release tree.",
+      type: "decision", facts: [], concepts: [], files: [], importance: 8 } as never);
+    const legacy = await sdk.trigger("mem::selective-context", { prompt: "installer decision",
+      recallHistory: true, sessionId: "current" }) as { spans: Array<{ evidenceEventId: string }> };
+    expect(legacy.spans.some(span => span.evidenceEventId === "mem_lineage")).toBe(true);
+    const hermes = await sdk.trigger("mem::selective-context", { prompt: "installer decision",
+      hermes: { sessionId: "current", ownerId: "hermes-owner", visibility: "private" } }) as {
+      spans: Array<{ evidenceEventId: string }> };
+    expect(hermes.spans.some(span => span.evidenceEventId === "mem_lineage")).toBe(false);
+  });
+
+  it("excludes parent observation lineage from both memory and lesson recall routes", async () => {
+    await kv.set(KV.sessions, "old", { id: "old", project: "home", status: "completed", agentId: "hermes-owner" });
+    await kv.set(KV.sessions, "parent", { id: "parent", project: "home", status: "completed" });
+    await kv.set(KV.sessions, "ancestor", { id: "ancestor", project: "home", status: "completed" });
+    await kv.set(KV.observations("parent"), "obs_parent", { id: "obs_parent", sessionId: "parent" });
+    await kv.set(KV.observations("ancestor"), "obs_ancestor", { id: "obs_ancestor", sessionId: "ancestor" });
+    await kv.set(KV.memories, "mem_parent", { id: "mem_parent", title: "Router rollback",
+      content: "The router rollback used the parent session setting.", type: "fact", isLatest: true,
+      sessionIds: ["old"], sourceObservationIds: ["obs_parent", "obs_ancestor"], createdAt: NOW, updatedAt: NOW,
+      agentId: "hermes-owner" });
+    getSearchIndex().add({ id: "mem_parent", sessionId: "old", timestamp: NOW, title: "Router rollback",
+      narrative: "The router rollback used the parent session setting.", type: "decision", facts: [],
+      concepts: [], files: [], importance: 8 } as never);
+    await kv.set(KV.lessons, "lesson_parent", { id: "lesson_parent", project: "home",
+      content: "The router rollback used the parent session lesson.", context: "router rollback",
+      confidence: 1, reinforcements: 0, source: "manual", sourceIds: ["obs_parent", "obs_ancestor"], tags: [],
+      createdAt: "2026-09-18T00:00:00.000Z", updatedAt: NOW, decayRate: 0 });
+    for (const excludedSessionId of ["parent", "ancestor"]) {
+      for (const request of [{ recallHistory: true, sessionId: "current" },
+        { hermes: { sessionId: "current", ownerId: "hermes-owner", visibility: "private",
+          verifiedSessionIds: ["current", "old"] } }]) {
+        const result = await sdk.trigger("mem::selective-context", { prompt: "router rollback", project: "home",
+          excludedSessionIds: [excludedSessionId], ...request }) as { spans: Array<{ text: string }> };
+        expect(result.spans.every(span => !span.text.includes("parent session"))).toBe(true);
+      }
+    }
+  });
+
+  it("Hermes opt-in fails closed for shared visibility and unknown source ownership", async () => {
+    await sdk.trigger("mem::context-knowledge-put", { expectedRevision: 0, confirmedByUser: true,
+      knowledge: knowledge({ scope: { namespace: "personal" } }) });
+    const result = await sdk.trigger("mem::selective-context", { prompt: "draw a diagram", previous: "",
+      hermes: { sessionId: "current", ownerId: "hermes-owner", visibility: "group" } });
+    expect(result).toMatchObject({ status: "empty", spans: [] });
+    await kv.set(KV.sessions, "foreign", { id: "foreign", project: "home", status: "completed", agentId: "other" });
+    const observation = { id: "obs_foreign", sessionId: "foreign", timestamp: NOW, type: "decision",
+      title: "Router port", narrative: "Private router port 9999.", facts: [], concepts: [], files: [],
+      importance: 8, agentId: "other", origin: { channel: "agent", capturedAt: NOW } };
+    await kv.set(KV.observations("foreign"), observation.id, observation);
+    getSearchIndex().add(observation as never);
+    const privateResult = await sdk.trigger("mem::selective-context", { prompt: "Router port", previous: "",
+      hermes: { sessionId: "current", ownerId: "hermes-owner", visibility: "private" } }) as {
+      spans: Array<{ text: string }>;
+    };
+    expect(privateResult.spans.every(span => !span.text.includes("9999"))).toBe(true);
+    expect(await sdk.trigger("mem::selective-context", { prompt: "Router port", previous: "",
+      hermes: { sessionId: "current", ownerId: "foreign-owner", visibility: "private" } }))
+      .toMatchObject({ status: "unavailable", spans: [], error: "unverified_session" });
+    expect(await sdk.trigger("mem::selective-context", { prompt: "Do not send this externally; draw a diagram",
+      hermes: { sessionId: "current", ownerId: "hermes-owner", visibility: "private" } }))
+      .toMatchObject({ status: "empty", spans: [] });
+  });
+
+  it("redacts prompt and candidate secrets before Hermes judge egress", async () => {
+    const secret = `sk-${"a".repeat(24)}`;
+    const judged: string[] = [];
+    const localSdk = mockSdk();
+    registerSelectiveContextFunctions(localSdk as never, kv as never, {
+      namespace: "personal", now: () => NOW,
+      judge: async (request, candidates, signal) => {
+        judged.push(JSON.stringify({ request, candidates }));
+        return usefulJudge(request, candidates, signal);
+      },
+    });
+    await kv.set(KV.sessions, "old", { id: "old", project: "home", status: "completed", agentId: "owner" });
+    await kv.set(KV.sessions, "current", { id: "current", project: "home", status: "active",
+      agentId: "owner", startedAt: NOW });
+    const observation = { id: "obs_secret", sessionId: "old", timestamp: NOW, type: "decision",
+      title: "Router port", narrative: `Router port is 4180; token ${secret} is private.`,
+      facts: [], concepts: [], files: [], importance: 8, agentId: "owner",
+      origin: { channel: "agent", capturedAt: NOW } };
+    await kv.set(KV.observations("old"), observation.id, observation);
+    getSearchIndex().add(observation as never);
+    const result = await localSdk.trigger("mem::selective-context", { prompt: `router port ${secret}`,
+      hermes: { sessionId: "current", ownerId: "owner", visibility: "private" } }) as {
+      spans: Array<{ text: string }>;
+    };
+    expect(judged).toHaveLength(0);
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(result).toMatchObject({ status: "unavailable", spans: [], error: "credential_input" });
+    const sourceOnly = await localSdk.trigger("mem::selective-context", { prompt: "router port",
+      hermes: { sessionId: "current", ownerId: "owner", visibility: "private" } }) as {
+      status: string; spans: unknown[];
+    };
+    expect(sourceOnly).toMatchObject({ status: "empty", spans: [] });
+    expect(JSON.stringify(judged)).not.toContain(secret);
+  });
+
+  it("keeps complete sentences and rejects a stale Hermes source after judgment", async () => {
+    const localSdk = mockSdk();
+    registerSelectiveContextFunctions(localSdk as never, kv as never, {
+      namespace: "personal", now: () => NOW,
+      judge: async (request, candidates, signal) => {
+        expect(candidates.find(candidate => candidate.id === "observation:obs_long")?.spans[0]?.text)
+          .toBe(`${"A".repeat(700)}.`);
+        await kv.delete(KV.observations("old"), "obs_long");
+        return usefulJudge(request, candidates, signal);
+      },
+    });
+    await kv.set(KV.sessions, "old", { id: "old", project: "home", status: "completed", agentId: "owner" });
+    await kv.set(KV.sessions, "current", { id: "current", project: "home", status: "active",
+      agentId: "owner", startedAt: NOW });
+    const observation = { id: "obs_long", sessionId: "old", timestamp: NOW, type: "decision",
+      title: "Router fact", narrative: `${"A".repeat(700)}. ${"B".repeat(700)}.`,
+      facts: [], concepts: [], files: [], importance: 8, agentId: "owner",
+      origin: { channel: "agent", capturedAt: NOW } };
+    await kv.set(KV.observations("old"), observation.id, observation);
+    getSearchIndex().add(observation as never);
+    const result = await localSdk.trigger("mem::selective-context", { prompt: "Router fact",
+      hermes: { sessionId: "current", ownerId: "owner", visibility: "private" } });
+    expect(result).toMatchObject({ status: "unavailable", spans: [], error: "knowledge_changed" });
   });
 
   it("stores evidence-backed knowledge, replays the same event, and audits the save", async () => {

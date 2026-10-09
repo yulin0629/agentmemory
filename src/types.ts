@@ -121,6 +121,7 @@ export interface Memory {
   imageRef?: string;
   imageData?: string;
   agentId?: string;
+  mirrorOwner?: string;
   project?: string;
   origin?: Origin;
 }

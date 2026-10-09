@@ -91,6 +91,41 @@ describe("selective context REST endpoints", () => {
     });
   });
 
+  it("validates and whitelists Hermes mirror ownership on remember and forget", async () => {
+    const { handlers, trigger } = setup();
+    const owner = `hermes:${"a".repeat(32)}:memory`;
+    const headers = { authorization: "Bearer test-secret" };
+    expect(await handlers.get("api::remember")!({ headers, body: { content: "route", mirrorOwner: "foreign" } }))
+      .toMatchObject({ status_code: 400 });
+    expect(await handlers.get("api::remember")!({ headers, body: { content: "route", mirrorOwner: owner } }))
+      .toMatchObject({ status_code: 201 });
+    expect(trigger).toHaveBeenLastCalledWith({ function_id: "mem::remember", payload: {
+      content: "route", mirrorOwner: owner,
+    } });
+    expect(await handlers.get("api::forget")!({ headers, body: { memoryId: "mem_1", mirrorOwner: "foreign" } }))
+      .toMatchObject({ status_code: 400 });
+    expect(await handlers.get("api::forget")!({ headers, body: { memoryId: "mem_1", mirrorOwner: owner,
+      ignored: "untrusted" } })).toMatchObject({ status_code: 200 });
+    expect(trigger).toHaveBeenLastCalledWith({ function_id: "mem::forget", payload: {
+      memoryId: "mem_1", mirrorOwner: owner,
+    } });
+  });
+
+  it("accepts bounded Hermes session proof and the deployed recallHistory request shape", async () => {
+    const { handlers, trigger } = setup();
+    const handler = handlers.get("api::selective-context")!;
+    const headers = { authorization: "Bearer test-secret" };
+    const body = { prompt: "route repair", sessionId: "current", recallHistory: true,
+      excludedSessionIds: ["current"], hermes: { sessionId: "current", ownerId: "hermes-owner",
+        visibility: "private", verifiedSessionIds: ["current", "old"] } };
+    expect(await handler({ headers, body })).toMatchObject({ status_code: 200 });
+    expect(trigger).toHaveBeenLastCalledWith({ function_id: "mem::selective-context",
+      payload: expect.objectContaining(body) });
+    expect(await handler({ headers, body: { ...body, hermes: { ...body.hermes,
+      verifiedSessionIds: Array(101).fill("old") } } })).toMatchObject({ status_code: 400 });
+    expect(await handler({ headers, body: { ...body, proof: "untrusted" } })).toMatchObject({ status_code: 400 });
+  });
+
   it("protects recall and explicit capture without changing legacy observation access", async () => {
     process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET = "context-only";
     const { handlers, trigger } = setup("");

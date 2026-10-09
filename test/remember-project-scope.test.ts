@@ -141,6 +141,30 @@ describe("mem::remember — cross-project dedup isolation", () => {
     setIndexPersistence(null);
   });
 
+  it("keeps Hermes mirrored records separate from unlabelled and other owners", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    const save = async (mirrorOwner?: string) => sdk.trigger({ function_id: "mem::remember",
+      payload: { content: "Route to port 4180 for this endpoint", project: "home", ...(mirrorOwner ? { mirrorOwner } : {}) },
+    }) as Promise<{ memory: { id: string; isLatest: boolean; mirrorOwner?: string } }>;
+    const foreign = await save();
+    const owned = await save(`hermes:${"a".repeat(32)}:memory`);
+    const other = await save(`hermes:${"b".repeat(32)}:memory`);
+    const secondOwned = await sdk.trigger({ function_id: "mem::remember", payload: {
+      content: "Route to port 4181 for this endpoint", project: "home",
+      mirrorOwner: `hermes:${"a".repeat(32)}:memory`,
+    } }) as { memory: { id: string } };
+    expect(new Set([foreign.memory.id, owned.memory.id, other.memory.id]).size).toBe(3);
+    expect((await kv.get<{ isLatest: boolean }>("mem:memories", foreign.memory.id))?.isLatest).toBe(true);
+    expect((await kv.get<{ isLatest: boolean }>("mem:memories", owned.memory.id))?.isLatest).toBe(true);
+    expect((await kv.get<{ isLatest: boolean }>("mem:memories", secondOwned.memory.id))?.isLatest).toBe(true);
+    expect(await sdk.trigger({ function_id: "mem::forget", payload: {
+      memoryId: owned.memory.id, mirrorOwner: `hermes:${"b".repeat(32)}:memory`,
+    } })).toMatchObject({ success: false, error: "owner_mismatch", deleted: 0 });
+    expect(await kv.get("mem:memories", owned.memory.id)).not.toBeNull();
+  });
+
   it("does not supersede a memory from a different project even when content is similar", async () => {
     const sdk = mockSdk();
     const kv = mockKV();

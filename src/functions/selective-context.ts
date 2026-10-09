@@ -1,7 +1,7 @@
 import type { IIIClient } from "iii-sdk";
 import { z } from "zod";
 import type { StateKV } from "../state/kv.js";
-import type { ContextKnowledgeCatalog, RawObservation, Lesson } from "../types.js";
+import type { ContextKnowledgeCatalog, RawObservation, Lesson, Session, SessionSummary, CompressedObservation, Memory } from "../types.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { selectContext, sameProjectScope, type ContextJudge, type ContextKnowledge } from "../state/selective-context.js";
@@ -9,6 +9,8 @@ import { explicitMemoryText, explicitReplacement, type CaptureJudge } from "../s
 import { safeAudit } from "./audit.js";
 import { knowledgeSchema } from "../state/context-knowledge-backup.js";
 import { findContextLesson, searchContextLessons, searchAllLessons } from "./lessons.js";
+import { stripPrivateData } from "./privacy.js";
+import { getAgentId, isAgentScopeIsolated } from "../config.js";
 
 const id = z.string().trim().min(1).max(200);
 
@@ -23,7 +25,115 @@ export const selectiveContextSchema = z.object({
   previous: z.string().max(8000).default(""),
   project: id.optional(), projectId: id.optional(), task: id.optional(),
   excludedIds: z.array(id).max(100).default([]),
+  recallHistory: z.boolean().optional(), sessionId: id.optional(),
+  excludedSessionIds: z.array(id).max(100).default([]),
+  hermes: z.object({ sessionId: id, ownerId: id, visibility: z.enum(["private", "group"]),
+    verifiedSessionIds: z.array(id).max(100).default([]) }).strict().optional(),
 }).strict();
+
+function completeSpan(text: string): string | null {
+  const clean = text.split(/\s+/).join(" ").trim();
+  if (!clean || clean.length <= 1200) return clean || null;
+  const prefix = clean.slice(0, 1200);
+  const ends = [...prefix.matchAll(/[。！？]|[.!?](?=\s|$)/g)];
+  const end = ends.at(-1)?.index;
+  return end === undefined ? null : prefix.slice(0, end + 1).trim();
+}
+
+function redactJudgeText(text: string): string {
+  return stripPrivateData(text).replace(
+    /-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/g,
+    "[REDACTED_SECRET]",
+  );
+}
+
+function containsCredentials(text: string): boolean {
+  return /-----BEGIN [A-Z ]*PRIVATE KEY-----|\bBearer\s+[A-Za-z0-9._~+/-]{12,}|\bsk-[A-Za-z0-9_-]{16,}|(?:api[_-]?key|password|secret|token)\s*[=:]\s*["']?[^\s"']{12,}/i.test(text);
+}
+
+async function historyCandidates(sdk: IIIClient, kv: StateKV, query: string, sessionId: string, ownerId: string | undefined,
+  verifiedSessionIds: ReadonlySet<string>, excludedSessionIds: ReadonlySet<string>,
+  excludedSourceIds: ReadonlySet<string>, includeSummaries: boolean) {
+  const candidates: ContextKnowledge[] = [];
+  const sources: Array<{ scope: string; key: string; version: string }> = [];
+  const sessions = new Map<string, Session>();
+  const search = await sdk.trigger({ function_id: "mem::smart-search", payload: {
+    query, limit: 100, includeLessons: false, agentId: "*",
+  } }) as { results?: Array<{ obsId: string; sessionId: string }> };
+  const hits = (search.results ?? []).filter(hit => hit.sessionId !== sessionId
+    && !excludedSessionIds.has(hit.sessionId));
+  const telemetryHooks = new Set(["prompt_submit", "session_start", "session_end", "stop",
+    "notification", "subagent_start", "subagent_stop", "task_completed", "pre_compact"]);
+  let observationCount = 0;
+  for (const hit of hits.filter(hit => hit.obsId.startsWith("obs_"))) {
+    const session = sessions.get(hit.sessionId) ?? await kv.get<Session>(KV.sessions, hit.sessionId);
+    if ((ownerId && (!session || (session.agentId && session.agentId !== ownerId)
+      || (!session.agentId && !verifiedSessionIds.has(hit.sessionId))))) continue;
+    if (session) sessions.set(hit.sessionId, session);
+    const observation = await kv.get<CompressedObservation>(KV.observations(hit.sessionId), hit.obsId);
+    if (!observation || observation.id !== hit.obsId || observation.sessionId !== hit.sessionId
+      || (ownerId && observation.agentId && observation.agentId !== ownerId)
+      || (includeSummaries && !(observation.origin?.channel === "agent"
+        || (observation.origin?.channel === "tool" && observation.origin.detail === "conversation")))
+      || (includeSummaries && !["decision", "discovery", "conversation"].includes(observation.type))
+      || (includeSummaries && observation.type === "conversation" && observation.origin?.detail !== "conversation")
+      || observation.type === "notification"
+      || (observation.confidence === 0.3 && typeof observation.title === "string"
+        && telemetryHooks.has(observation.title.split(":")[0]!.trim()))
+      || containsCredentials(observation.narrative) || containsCredentials(observation.title || "")) continue;
+    const span = completeSpan(observation.narrative);
+    if (!span) continue;
+    candidates.push({ id: `observation:${observation.id}`, revision: fingerprintId("observation", JSON.stringify(observation)),
+      status: "active", scope: { namespace: "" }, sourceTitle: observation.title,
+      evidence: { eventId: observation.id, sessionId: hit.sessionId, text: span, adoptedAt: observation.timestamp },
+      spans: [{ id: "narrative", text: span }] });
+    sources.push({ scope: KV.observations(hit.sessionId), key: observation.id, version: JSON.stringify(observation) });
+    if (++observationCount >= 20) break;
+  }
+  let memoryCount = 0;
+  for (const hit of hits.filter(hit => hit.obsId.startsWith("mem_"))) {
+    const memory = await kv.get<Memory>(KV.memories, hit.obsId);
+    if (!memory || memory.id !== hit.obsId || !memory.isLatest || !memory.content
+      || (ownerId && ((memory.agentId && memory.agentId !== ownerId)
+        || (!memory.agentId && (!memory.sessionIds?.length
+          || !memory.sessionIds.every(id => verifiedSessionIds.has(id))))))
+      || memory.sessionIds?.some(id => excludedSessionIds.has(id))
+      || (includeSummaries && (memory.sourceObservationIds ?? []).length > 10)
+      || memory.sourceObservationIds?.some(id => excludedSourceIds.has(id))
+      || containsCredentials(memory.content) || containsCredentials(memory.title || "")) continue;
+    if (ownerId && !memory.agentId && memory.sessionIds.length > 10) continue;
+    const memorySessions = ownerId && !memory.agentId
+      ? await Promise.all(memory.sessionIds.map(id => kv.get<Session>(KV.sessions, id))) : [];
+    if (memorySessions.some(session => !session || (session.agentId && session.agentId !== ownerId))) continue;
+    for (const session of memorySessions) {
+      if (session) sources.push({ scope: KV.sessions, key: session.id, version: JSON.stringify(session) });
+    }
+    const span = completeSpan(memory.content);
+    if (!span) continue;
+    candidates.push({ id: `memory:${memory.id}`, revision: fingerprintId("memory", JSON.stringify(memory)),
+      status: "active", scope: { namespace: "" }, sourceTitle: memory.title,
+      evidence: { eventId: memory.id, text: span, adoptedAt: memory.updatedAt || memory.createdAt },
+      spans: [{ id: "content", text: span }] });
+    sources.push({ scope: KV.memories, key: memory.id, version: JSON.stringify(memory) });
+    if (++memoryCount >= 10) break;
+  }
+  for (const session of includeSummaries ? sessions.values() : []) {
+    if (session.status !== "completed") continue;
+    const summary = await kv.get<SessionSummary>(KV.summaries, session.id);
+    if (!summary || summary.sessionId !== session.id || summary.project !== session.project) continue;
+    const span = completeSpan(summary.narrative);
+    if (!span) continue;
+    candidates.push({ id: `summary:${session.id}`, revision: fingerprintId("summary", JSON.stringify(summary)),
+      status: "active", scope: { namespace: "" },
+      evidence: { eventId: `summary:${session.id}`, sessionId: session.id, text: span, adoptedAt: summary.createdAt },
+      spans: [{ id: "narrative", text: span }] });
+    sources.push({ scope: KV.summaries, key: session.id, version: JSON.stringify(summary) });
+  }
+  for (const session of sessions.values()) {
+    sources.push({ scope: KV.sessions, key: session.id, version: JSON.stringify(session) });
+  }
+  return { candidates, sources };
+}
 
 // iii adds this field to internal invocations. Public HTTP schemas stay strict.
 const workerMetadata = { _caller_worker_id: z.string().optional() };
@@ -250,56 +360,146 @@ export function registerSelectiveContextFunctions(
   sdk.registerFunction("mem::selective-context", async (input: unknown) => {
     const parsed = selectiveContextSchema.extend(workerMetadata).safeParse(input);
     if (!parsed.success) return { status: "unavailable", spans: [], error: "invalid_request" };
-    const catalog = await read();
-    const scoped = catalog.records.filter(r => r.status === "active" && r.scope.namespace === namespace
-      && ((!r.scope.project && !r.scope.projectId) || (r.scope.projectId && r.scope.projectId === parsed.data.projectId))
-      && (!r.scope.task || r.scope.task === parsed.data.task));
-    const lessons = await searchContextLessons(kv, `${parsed.data.prompt}\n${parsed.data.previous}`,
-      new Set(scoped.flatMap(r => r.lessonId ? [r.lessonId] : [])));
-    const lessonIds = new Set(lessons.map(l => l.id));
-    const records = catalog.records.filter(r => !r.lessonId || lessonIds.has(r.lessonId));
-    const validRecords: ContextKnowledge[] = [];
-    const sourceVersions = new Map<string, string>();
-    for (const record of records) {
-      if (record.lessonId) {
-        const lesson = await kv.get<Lesson>(KV.lessons, record.lessonId);
-        if (!lesson || lesson.deleted || lesson.project !== record.scope.project
-          || record.spans.length !== 1 || record.spans[0]!.text !== lesson.content) continue;
-        sourceVersions.set(lesson.id, JSON.stringify(lesson));
+    const hermes = parsed.data.hermes;
+    if (parsed.data.recallHistory && !parsed.data.sessionId) return { status: "unavailable", spans: [], error: "invalid_request" };
+    if (hermes && parsed.data.sessionId && parsed.data.sessionId !== hermes.sessionId) {
+      return { status: "unavailable", spans: [], error: "invalid_request" };
+    }
+    if ((hermes || parsed.data.recallHistory)
+      && (containsCredentials(parsed.data.prompt) || containsCredentials(parsed.data.previous))) {
+      return { status: "unavailable", spans: [], error: "credential_input" };
+    }
+    const isolatedAgent = parsed.data.recallHistory && isAgentScopeIsolated() ? getAgentId() : undefined;
+    if (parsed.data.recallHistory && isAgentScopeIsolated() && !isolatedAgent) {
+      return { status: "unavailable", spans: [], error: "agent_scope_unavailable" };
+    }
+    if (hermes && hermes.visibility !== "private") return { status: "empty", spans: [] };
+    if (hermes && /\b(?:do not (?:send|share|upload|transmit)|local only)\b|不要外傳|不得外送|禁止外送|只限本機/i
+      .test(`${parsed.data.prompt}\n${parsed.data.previous}`)) return { status: "empty", spans: [] };
+    const currentSession = hermes ? await kv.get<Session>(KV.sessions, hermes.sessionId) : null;
+    const verifiedSessionIds = new Set(hermes?.verifiedSessionIds ?? []);
+    if (hermes && (!currentSession || (currentSession.agentId && currentSession.agentId !== hermes.ownerId)
+      || (!currentSession.agentId && !verifiedSessionIds.has(hermes.sessionId)))) {
+      return { status: "unavailable", spans: [], error: "unverified_session" };
+    }
+    const excludedSessions = new Set([hermes?.sessionId, parsed.data.sessionId, ...(parsed.data.excludedSessionIds ?? [])]
+      .filter((value): value is string => Boolean(value)));
+    const deadline = Date.now() + (hermes || parsed.data.recallHistory ? 6500 : 1500);
+    const run = async () => {
+      const catalog = await read();
+      const excludedSourceIds = new Set<string>();
+      if (hermes || parsed.data.recallHistory) {
+        const sourceLists = await Promise.all([...excludedSessions].map(id =>
+          kv.list<{ id: string }>(KV.observations(id))));
+        for (const source of sourceLists.flat()) excludedSourceIds.add(source.id);
       }
-      validRecords.push(record);
-    }
-    // Lessons the catalog already governs keep the catalog's scope; every
-    // other lesson is a candidate regardless of project, and the judge
-    // decides relevance. Same-project lessons are ordered first so the
-    // candidate budget favours them.
-    const governed = new Set(catalog.records.flatMap(r => r.lessonId ? [r.lessonId] : []));
-    const corpus = (await searchAllLessons(kv, `${parsed.data.prompt}\n${parsed.data.previous}`))
-      .filter(l => !governed.has(l.id));
-    const sameProject = (l: Lesson) => l.project === parsed.data.project || l.project === parsed.data.projectId;
-    const lessonRecordsForJudge: ContextKnowledge[] = [
-      ...corpus.filter(sameProject), ...corpus.filter(l => !sameProject(l)),
-    ].map(l => ({
-      id: `lesson:${l.id}`, revision: fingerprintId("lesson", JSON.stringify([l.id, l.updatedAt])),
-      lessonId: l.id, status: "active",
-      scope: { namespace },
-      evidence: { eventId: l.id, text: l.content, adoptedAt: l.createdAt },
-      spans: [{ id: "lesson", text: l.content.slice(0, 1200) }],
-    }));
-    for (const l of corpus) sourceVersions.set(l.id, JSON.stringify(l));
-    const candidates = [...validRecords, ...lessonRecordsForJudge];
-    const result = await selectContext({ ...parsed.data, namespace, asOf: now() },
-      candidates, options.judge);
-    const candidateCounts = { catalog: validRecords.length, lessons: lessonRecordsForJudge.length };
-    const latest = await read();
-    if (latest.revision !== catalog.revision) {
-      return { status: "unavailable", spans: [], error: "knowledge_changed" };
-    }
-    for (const [lessonId, version] of sourceVersions) {
-      if (JSON.stringify(await kv.get<Lesson>(KV.lessons, lessonId)) !== version) {
+      const scoped = catalog.records.filter(r => r.status === "active" && r.scope.namespace === namespace
+        && ((!r.scope.project && !r.scope.projectId) || (r.scope.projectId && r.scope.projectId === parsed.data.projectId))
+        && (!r.scope.task || r.scope.task === parsed.data.task));
+      const lessons = await searchContextLessons(kv, `${parsed.data.prompt}\n${parsed.data.previous}`,
+        new Set(scoped.flatMap(r => r.lessonId ? [r.lessonId] : [])));
+      const lessonIds = new Set(lessons.map(l => l.id));
+      const records = catalog.records.filter(r => !r.lessonId || lessonIds.has(r.lessonId));
+      const validRecords: ContextKnowledge[] = [];
+      const sourceVersions = new Map<string, string>();
+      for (const record of records) {
+        if (record.lessonId) {
+          const lesson = await kv.get<Lesson>(KV.lessons, record.lessonId);
+          if (!lesson || lesson.deleted || lesson.project !== record.scope.project
+            || record.spans.length !== 1 || record.spans[0]!.text !== lesson.content) continue;
+          sourceVersions.set(lesson.id, JSON.stringify(lesson));
+        }
+        validRecords.push(record);
+      }
+      // Lessons the catalog already governs keep the catalog's scope; every
+      // other lesson is a candidate regardless of project, and the judge
+      // decides relevance. Same-project lessons are ordered first so the
+      // candidate budget favours them.
+      const governed = new Set(catalog.records.flatMap(r => r.lessonId ? [r.lessonId] : []));
+      const ungoverned = (await searchAllLessons(kv, `${parsed.data.prompt}\n${parsed.data.previous}`))
+        .filter(l => !governed.has(l.id));
+      const corpus = (hermes ? (await Promise.all(ungoverned.map(async lesson => {
+        if (!currentSession?.startedAt || lesson.createdAt >= currentSession.startedAt
+          || (lesson.sourceIds ?? []).length > 4) return null;
+        return lesson;
+      }))).filter((lesson): lesson is Lesson => lesson !== null) : ungoverned)
+        .filter(lesson => !(hermes || parsed.data.recallHistory)
+          || !lesson.sourceIds?.some(id => excludedSessions.has(id) || excludedSourceIds.has(id)));
+      const sameProject = (l: Lesson) => l.project === parsed.data.project || l.project === parsed.data.projectId;
+      const lessonRecordsForJudge: ContextKnowledge[] = [
+        ...corpus.filter(sameProject), ...corpus.filter(l => !sameProject(l)),
+      ].map(l => ({
+        id: `lesson:${l.id}`, revision: fingerprintId("lesson", JSON.stringify([l.id, l.updatedAt])),
+        lessonId: l.id, status: "active" as const,
+        scope: { namespace },
+        evidence: { eventId: l.id, text: l.content, adoptedAt: l.createdAt },
+        spans: [{ id: "lesson", text: hermes ? completeSpan(l.content) ?? "" : l.content.slice(0, 1200) }],
+      })).filter(record => record.spans[0]!.text);
+      for (const l of corpus) sourceVersions.set(l.id, JSON.stringify(l));
+      const historical = hermes || parsed.data.recallHistory
+        ? await historyCandidates(sdk, kv, `${parsed.data.prompt}\n${parsed.data.previous}`,
+          hermes?.sessionId ?? parsed.data.sessionId!, hermes?.ownerId ?? isolatedAgent,
+          verifiedSessionIds, excludedSessions, excludedSourceIds, Boolean(hermes))
+        : { candidates: [], sources: [] };
+      const sourcePools = [validRecords.filter(record => !record.evidence.sessionId
+        || !excludedSessions.has(record.evidence.sessionId)),
+        lessonRecordsForJudge,
+        historical.candidates.filter(record => record.id.startsWith("memory:")),
+        historical.candidates.filter(record => !record.id.startsWith("memory:"))];
+      const candidates = hermes || parsed.data.recallHistory
+        ? Array.from({ length: Math.max(...sourcePools.map(pool => pool.length)) }, (_, index) =>
+          sourcePools.flatMap(pool => pool[index] ? [{ ...pool[index]!, scope: { namespace } }] : [])).flat()
+        : [...validRecords, ...lessonRecordsForJudge];
+      const eligibleCandidates = candidates.filter(record => !excludedSourceIds.has(record.evidence.eventId)
+        && (!(hermes || parsed.data.recallHistory) || !containsCredentials(record.evidence.text)));
+      const judgeCandidates = hermes || parsed.data.recallHistory ? eligibleCandidates.map(record => ({ ...record,
+        evidence: { ...record.evidence, text: redactJudgeText(record.evidence.text) },
+        spans: record.spans.map(span => ({ ...span, text: redactJudgeText(span.text) })),
+      })) : eligibleCandidates;
+      const request = { project: parsed.data.project, projectId: parsed.data.projectId, task: parsed.data.task,
+        excludedIds: parsed.data.excludedIds, namespace, asOf: now(),
+        prompt: hermes || parsed.data.recallHistory ? redactJudgeText(parsed.data.prompt) : parsed.data.prompt,
+        previous: hermes || parsed.data.recallHistory ? redactJudgeText(parsed.data.previous) : parsed.data.previous };
+      if ((hermes || parsed.data.recallHistory) && Date.now() >= deadline) return { status: "unavailable", spans: [] };
+      const judgeStarted = Date.now();
+      const result = await selectContext(request, judgeCandidates, options.judge,
+        hermes || parsed.data.recallHistory ? { timeoutMs: Math.max(1, deadline - Date.now()),
+          preserveCandidateOrder: true, sourceMetadata: true } : {});
+      const candidateCounts = { catalog: validRecords.length, lessons: lessonRecordsForJudge.length,
+        ...(hermes || parsed.data.recallHistory ? { historical: historical.candidates.length } : {}) };
+      const latest = await read();
+      if (latest.revision !== catalog.revision) {
         return { status: "unavailable", spans: [], error: "knowledge_changed" };
       }
+      for (const [lessonId, version] of sourceVersions) {
+        if (JSON.stringify(await kv.get<Lesson>(KV.lessons, lessonId)) !== version) {
+          return { status: "unavailable", spans: [], error: "knowledge_changed" };
+        }
+      }
+      for (const source of historical.sources) {
+        if (JSON.stringify(await kv.get(source.scope, source.key)) !== source.version) {
+          return { status: "unavailable", spans: [], error: "knowledge_changed" };
+        }
+      }
+      if (hermes && JSON.stringify(await kv.get(KV.sessions, hermes.sessionId)) !== JSON.stringify(currentSession)) {
+        return { status: "unavailable", spans: [], error: "knowledge_changed" };
+      }
+      return { ...result, catalogRevision: catalog.revision, candidates: candidateCounts,
+        ...(hermes || parsed.data.recallHistory ? { timings: {
+          retrievalMs: judgeStarted - (deadline - 6500), judgeMs: Date.now() - judgeStarted,
+          totalMs: 6500 - (deadline - Date.now()),
+        } } : {}) };
+    };
+    if (!hermes && !parsed.data.recallHistory) return run();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([run(), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Historical recall deadline")), Math.max(1, deadline - Date.now()));
+      })]);
+    } catch {
+      return { status: "unavailable", spans: [] };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    return { ...result, catalogRevision: catalog.revision, candidates: candidateCounts };
   });
 }

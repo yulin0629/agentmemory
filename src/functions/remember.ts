@@ -30,6 +30,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       sourceObservationIds?: string[];
       agentId?: string;
       project?: string;
+      mirrorOwner?: string;
     }) => {
       if (
         !data.content ||
@@ -46,6 +47,10 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       }
       if (data.sourceObservationIds && !Array.isArray(data.sourceObservationIds)) {
         return { success: false, error: "sourceObservationIds must be an array" };
+      }
+      if (data.mirrorOwner !== undefined && (typeof data.mirrorOwner !== "string"
+        || !/^hermes:[a-f0-9]{32}:(?:user|memory)$/.test(data.mirrorOwner))) {
+        return { success: false, error: "invalid mirrorOwner" };
       }
       const validTypes = new Set([
         "pattern",
@@ -115,6 +120,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
         const lowerContent = data.content.toLowerCase();
         for (const existing of candidateMemories) {
           if (existing.isLatest === false) continue;
+          if (data.mirrorOwner || existing.mirrorOwner) continue;
           // Never supersede a memory that belongs to a different project.
           // Both sides must have an explicit project for the guard to engage;
           // an unscoped memory (legacy, no project field) is treated as a
@@ -170,6 +176,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           origin: { channel: "agent", capturedAt: now },
           ...(callAgentId ? { agentId: callAgentId } : {}),
           ...(project !== undefined && { project }),
+          ...(data.mirrorOwner ? { mirrorOwner: data.mirrorOwner } : {}),
         };
 
         if (data.ttlDays && typeof data.ttlDays === "number" && data.ttlDays > 0) {
@@ -249,6 +256,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       sessionId?: string;
       observationIds?: string[];
       memoryId?: string;
+      mirrorOwner?: string;
     }) => {
       let deleted = 0;
       const deletedMemoryIds: string[] = [];
@@ -258,6 +266,9 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
 
       if (data.memoryId) {
         const mem = await kv.get<Memory>(KV.memories, data.memoryId);
+        if (data.mirrorOwner && mem?.mirrorOwner !== data.mirrorOwner) {
+          return { success: false, error: "owner_mismatch", deleted: 0 };
+        }
         if (mem) {
           await kv.delete(KV.memories, data.memoryId);
           if (mem.imageRef) {

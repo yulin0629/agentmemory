@@ -1183,6 +1183,7 @@ export function registerApiTriggers(
         sourceObservationIds?: string[];
         project?: string;
         agentId?: string;
+        mirrorOwner?: string;
       }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
@@ -1200,6 +1201,10 @@ export function registerApiTriggers(
       ) {
         return { status_code: 400, body: { error: "project must be a non-empty string" } };
       }
+      if (req.body.mirrorOwner !== undefined && (typeof req.body.mirrorOwner !== "string"
+        || !/^hermes:[a-f0-9]{32}:(?:user|memory)$/.test(req.body.mirrorOwner))) {
+        return { status_code: 400, body: { error: "invalid mirrorOwner" } };
+      }
       const result = await sdk.trigger({
         function_id: "mem::remember",
         payload: {
@@ -1210,6 +1215,7 @@ export function registerApiTriggers(
           ...(req.body.ttlDays !== undefined && { ttlDays: req.body.ttlDays }),
           ...(req.body.sourceObservationIds !== undefined && { sourceObservationIds: req.body.sourceObservationIds }),
           ...(req.body.project !== undefined && { project: req.body.project }),
+          ...(req.body.mirrorOwner !== undefined && { mirrorOwner: req.body.mirrorOwner }),
           ...(typeof req.body.agentId === "string" && req.body.agentId.trim()
             ? { agentId: req.body.agentId.trim() }
             : {}),
@@ -1230,6 +1236,7 @@ export function registerApiTriggers(
         sessionId?: string;
         observationIds?: string[];
         memoryId?: string;
+        mirrorOwner?: string;
       }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
@@ -1240,7 +1247,16 @@ export function registerApiTriggers(
           body: { error: "sessionId or memoryId is required" },
         };
       }
-      const result = await sdk.trigger({ function_id: "mem::forget", payload: req.body });
+      if (req.body?.mirrorOwner !== undefined && (typeof req.body.mirrorOwner !== "string"
+        || !/^hermes:[a-f0-9]{32}:(?:user|memory)$/.test(req.body.mirrorOwner))) {
+        return { status_code: 400, body: { error: "invalid mirrorOwner" } };
+      }
+      const result = await sdk.trigger({ function_id: "mem::forget", payload: {
+        ...(req.body.sessionId ? { sessionId: req.body.sessionId } : {}),
+        ...(req.body.observationIds ? { observationIds: req.body.observationIds } : {}),
+        ...(req.body.memoryId ? { memoryId: req.body.memoryId } : {}),
+        ...(req.body.mirrorOwner ? { mirrorOwner: req.body.mirrorOwner } : {}),
+      } });
       return { status_code: 200, body: result };
     },
   );

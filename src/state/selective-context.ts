@@ -2,6 +2,7 @@ export interface ContextKnowledge {
   id: string;
   revision: string;
   lessonId?: string;
+  sourceTitle?: string;
   status: "candidate" | "active" | "superseded" | "retracted";
   captureDisposition?: "project_rule" | "task_only" | "unclear" | "unavailable";
   supersedes?: { id: string; revision: string };
@@ -37,6 +38,7 @@ export interface ContextSpan {
   spanId: string;
   text: string;
   evidenceEventId: string;
+  source?: { title?: string; timestamp: string; sessionId?: string; excerpt?: boolean };
 }
 
 export type ContextJudge = (
@@ -49,12 +51,14 @@ function boundCandidates(
   records: ContextKnowledge[],
   maxCharacters: number,
   maxCandidates: number,
+  preserveOrder = false,
 ): ContextKnowledge[] {
   let characters = 0;
   const bounded: ContextKnowledge[] = [];
-  for (const record of [...records].sort((a, b) =>
+  const ordered = preserveOrder ? records : [...records].sort((a, b) =>
     Date.parse(b.evidence.adoptedAt) - Date.parse(a.evidence.adoptedAt)
-      || a.id.localeCompare(b.id))) {
+      || a.id.localeCompare(b.id));
+  for (const record of ordered) {
     const spans = record.spans.filter((span) => {
       if (characters + span.text.length > maxCharacters) return false;
       characters += span.text.length;
@@ -99,6 +103,8 @@ export async function selectContext(
     maxSpans?: number;
     maxCandidateCharacters?: number;
     maxCandidates?: number;
+    preserveCandidateOrder?: boolean;
+    sourceMetadata?: boolean;
   } = {},
 ): Promise<{ status: "selected" | "empty" | "unavailable"; spans: ContextSpan[] }> {
   const maxCharacters = options.maxCharacters ?? 1200;
@@ -115,7 +121,8 @@ export async function selectContext(
   if (new Set(eligibleCandidates.map(c => c.id)).size !== eligibleCandidates.length) {
     return { status: "unavailable", spans: [] };
   }
-  const candidates = boundCandidates(eligibleCandidates, maxCandidateCharacters, maxCandidates);
+  const candidates = boundCandidates(eligibleCandidates, maxCandidateCharacters, maxCandidates,
+    options.preserveCandidateOrder);
   if (!request.prompt.trim() || !candidates.length) return { status: "empty", spans: [] };
 
   const controller = new AbortController();
@@ -166,7 +173,12 @@ export async function selectContext(
     ]))!;
     if (selectedTexts.has(span.text) || characters + span.text.length > maxCharacters) continue;
     spans.push({ knowledgeId: record.id, revision: record.revision, spanId: span.id,
-      text: span.text, evidenceEventId: record.evidence.eventId });
+      text: span.text, evidenceEventId: record.evidence.eventId,
+      ...(options.sourceMetadata ? { source: { timestamp: record.evidence.adoptedAt,
+        ...(record.evidence.sessionId ? { sessionId: record.evidence.sessionId } : {}),
+        ...(record.sourceTitle ? { title: record.sourceTitle } : {}),
+        ...(record.evidence.text !== span.text ? { excerpt: true } : {}),
+      } } : {}) });
     selectedTexts.add(span.text);
     characters += span.text.length;
     if (spans.length === maxSpans) break;
