@@ -4,7 +4,7 @@ DevSpace tool completion events flow through a local JSONL spool to `/agentmemor
 
 ## Build
 
-Use the existing Node.js (22.19 or newer) and npm:
+Use the existing Node.js (22.19 or newer) and npm. The integration sources, guide and service templates are included under `integrations/devspace-forwarder/` in the server package and repository; build this standalone bundle separately:
 
 ```sh
 cd integrations/devspace-forwarder
@@ -31,11 +31,11 @@ Run one forwarder per machine/state directory. After `401`/`403`, correct protec
 
 The default spool is `~/.local/share/devspace/events/`. Reads include active segments, consume only newline-terminated records, and are snapshot-bounded. Records are limited to 16 KiB including the newline. Files are rechecked before idle closure.
 
-The checkpoint is `~/.local/share/agentmemory/devspace-forwarder/checkpoint.json`. Random `segment_id` values are saved before delivery, including after a local persistence failure. Session IDs are `devspace:{machine_id}:{workspace_id}:{segment_id}`; identity components are percent-encoded so spaces/colons cannot change the component boundaries. The original UUID is sent as top-level `event_id`. Offsets advance only after acknowledgement or durable dead-letter quarantine. Checkpoint replacement is atomic and file-synced. State files are `0600`; their directory is `0700`.
+The checkpoint is `~/.local/share/agentmemory/devspace-forwarder/checkpoint.json`. Random `segment_id` values are saved before delivery, including after a local persistence failure. Session IDs are `devspace:{machine_id}:{workspace_id}:{segment_id}`; identity components are percent-encoded so spaces/colons cannot change the component boundaries. The original UUID is sent as top-level `event_id`. Offsets advance only after acknowledgement or durable dead-letter quarantine. Checkpoint replacement syncs the file and its containing directory after atomic rename; initialization also syncs newly created directory entries. Filesystems that reject directory sync block delivery rather than weaken this barrier. State files are `0600`; their directory is `0700`.
 
-Network errors, timeouts, `429` and `5xx` retry. Invalid JSON/schema/oversized lines and `400`/`404`/`413`/`422` observation rejections go to `dead-letter.jsonl`, allowing later events to proceed. Malformed raw input is never copied there; valid rejected events contain only sanitized whitelist fields. Unknown protocol failures pause. Do not reset checkpoints to repair an incident.
+Network errors, timeouts, `429` and `5xx` retry. Invalid JSON/schema/oversized lines and `400`/`404`/`413`/`422` observation rejections go to `dead-letter.jsonl`, allowing later events to proceed. Timestamps must be calendar-valid ISO UTC values ending in `Z`. Malformed raw input is never copied there; valid rejected events contain only sanitized whitelist fields. Acknowledgements must include the deterministic Observation ID for the submitted UUID; a UUID-unaware server pauses delivery without advancing the checkpoint. Unknown protocol failures also pause. Checkpoint entries for removed segments are pruned after a successful spool directory snapshot. Do not reset checkpoints to repair an incident.
 
-Sessions with delivered observations end after 30 minutes without activity, once all valid complete events are acknowledged and rejected records quarantined. Incomplete tails or outstanding delivery failures defer closure. A later event starts a new segment. The forwarder calls the unchanged `/session/end`; existing server processing creates summaries.
+Sessions with delivered observations end after 30 minutes without activity, once all valid complete events are acknowledged and rejected records quarantined. Incomplete tails or outstanding delivery failures defer closure. A later event starts a new segment. Outage backlogs also split at 30-minute event-time gaps: the preceding segment ends before the later event is sent, and a failed end keeps that later event uncheckpointed for retry. The forwarder calls the unchanged `/session/end`; existing server processing creates summaries.
 
 ## Privacy and limitations
 

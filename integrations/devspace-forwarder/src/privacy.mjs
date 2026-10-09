@@ -48,6 +48,11 @@ export function sanitizeEvent(raw) {
     || typeof raw.occurred_at !== "string" || raw.occurred_at.length > 40 || !Number.isFinite(Date.parse(raw.occurred_at))) {
     throw new Error("invalid_event_envelope");
   }
+  const timestamp = raw.occurred_at;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(timestamp)
+    || new Date(timestamp).toISOString() !== timestamp.replace(/(?:\.(\d{1,3}))?Z$/, (_, fraction) => `.${(fraction ?? "").padEnd(3, "0")}Z`)) {
+    throw new Error("invalid_event_timestamp");
+  }
   for (const key of ["machine_id", "workspace_id", "project", "cwd", "tool"]) {
     if (typeof raw[key] !== "string" || !raw[key].trim() || raw[key].length > 2048) throw new Error("invalid_event_fields");
   }

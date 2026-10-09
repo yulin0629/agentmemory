@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { appendFile, chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, mkdir, open, readFile, readdir, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import test from "node:test";
 import { Forwarder, IDLE_MS, main, readProtected } from "../src/index.mjs";
 import { sanitizeEvent } from "../src/privacy.mjs";
@@ -13,6 +16,9 @@ const event = (fields = {}) => ({
   outcome: { status: "success", duration_ms: 1 }, details: { path: "file.ts", read_bytes: 42 }, ...fields,
 });
 const response = (status = 201, body = { observationId: "obs_fixture" }, headers = {}) => new Response(JSON.stringify(body), { status, headers });
+const acknowledged = (request, fields = {}) => response(201, {
+  observationId: `obs_event_${JSON.parse(request.body).event_id.toLowerCase().replace(/-/g, "")}`, ...fields,
+});
 
 async function fixture(t, fetchImpl) {
   const dir = await mkdtemp(join(tmpdir(), "devspace-forwarder-"));
@@ -26,7 +32,7 @@ async function fixture(t, fetchImpl) {
     spoolDir, stateDir, now: () => time, alert: (message) => alerts.push(message),
     fetchImpl: async (url, request) => {
       calls.push({ url, body: JSON.parse(request.body) });
-      return fetchImpl ? fetchImpl(url, request, calls) : response(url.endsWith("session/end") ? 200 : 201, url.endsWith("session/end") ? { success: true } : { observationId: "obs_fixture" });
+      return fetchImpl ? fetchImpl(url, request, calls) : url.endsWith("session/end") ? response(200, { success: true }) : acknowledged(request);
     },
   };
   const forwarder = new Forwarder(options);
@@ -59,7 +65,7 @@ test("persists the segment before delivery and reuses it after a lost acknowledg
   assert.ok(Object.values(checkpoint.sessions)[0].segment_id);
   const restarted = new Forwarder({ ...f.options, fetchImpl: async (url, request) => {
     f.calls.push({ url, body: JSON.parse(request.body) });
-    return response(201, { deduplicated: true });
+    return acknowledged(request, { deduplicated: true });
   } });
   await restarted.init();
   await restarted.poll();
@@ -69,12 +75,12 @@ test("persists the segment before delivery and reuses it after a lost acknowledg
 });
 
 test("resumes at the last acknowledged event after interruption", async (t) => {
-  const f = await fixture(t, (_url, _req, calls) => calls.length === 2 ? response(503) : response());
+  const f = await fixture(t, (_url, request, calls) => calls.length === 2 ? response(503) : acknowledged(request));
   const first = JSON.stringify(event()) + "\n";
   await writeFile(f.file, first + JSON.stringify(event()) + "\n");
   await f.forwarder.poll();
   assert.equal(f.forwarder.state.files["0001.jsonl"].offset, Buffer.byteLength(first));
-  const restarted = new Forwarder({ ...f.options, fetchImpl: async () => response() });
+  const restarted = new Forwarder({ ...f.options, fetchImpl: async (_url, request) => acknowledged(request) });
   await restarted.init();
   await restarted.poll();
   assert.equal(restarted.state.files["0001.jsonl"].offset, (await stat(f.file)).size);
@@ -84,17 +90,41 @@ test("persists an allocated session again after a local checkpoint write failure
   const f = await fixture(t, async (_url, _request, calls) => {
     const disk = JSON.parse(await readFile(join(f.options.stateDir, "checkpoint.json"), "utf8"));
     assert.equal(Object.values(disk.sessions)[0].id, calls[0].body.sessionId);
-    return response();
+    return acknowledged(_request);
   });
   await writeFile(f.file, JSON.stringify(event()) + "\n");
-  await chmod(f.options.stateDir, 0o500);
-  try { await assert.rejects(f.forwarder.poll()); } finally { await chmod(f.options.stateDir, 0o700); }
+  const handle = await open(f.options.stateDir, "r");
+  const prototype = Object.getPrototypeOf(handle);
+  await handle.close();
+  const write = t.mock.method(prototype, "writeFile", async () => { throw new Error("checkpoint_write_failure"); });
+  await assert.rejects(f.forwarder.poll(), /checkpoint_write_failure/);
+  write.mock.restore();
   assert.equal(f.calls.length, 0);
   const allocated = Object.values(f.forwarder.state.sessions)[0].id;
   await f.forwarder.poll();
   assert.equal(f.calls.length, 1);
   assert.equal(f.calls[0].body.sessionId, allocated);
   assert.equal(f.forwarder.state.files["0001.jsonl"].offset, (await stat(f.file)).size);
+});
+
+test("requires directory sync before delivery and retries with the same allocated segment", async (t) => {
+  const f = await fixture(t);
+  await writeFile(f.file, JSON.stringify(event()) + "\n");
+  const handle = await open(f.options.stateDir, "r");
+  const prototype = Object.getPrototypeOf(handle);
+  const originalSync = prototype.sync;
+  await handle.close();
+  const sync = t.mock.method(prototype, "sync", async function () {
+    if ((await this.stat()).isDirectory()) throw Object.assign(new Error("directory_sync_unavailable"), { code: "EINVAL" });
+    return originalSync.call(this);
+  });
+  await assert.rejects(f.forwarder.poll(), /directory_sync_unavailable/);
+  assert.equal(f.calls.length, 0);
+  const allocated = Object.values(f.forwarder.state.sessions)[0].id;
+  sync.mock.restore();
+  await f.forwarder.poll();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].body.sessionId, allocated);
 });
 
 test("preserves human machine names without ambiguous session delimiters", async (t) => {
@@ -105,7 +135,7 @@ test("preserves human machine names without ambiguous session delimiters", async
 });
 
 test("quarantines malformed, oversized and rejected events without blocking later events", async (t) => {
-  const f = await fixture(t, (_url, _req, calls) => calls.length === 1 ? response(422, { error: "invalid" }) : response());
+  const f = await fixture(t, (_url, request, calls) => calls.length === 1 ? response(422, { error: "invalid" }) : acknowledged(request));
   await writeFile(f.file, "malformed password=fixture\n" + "x".repeat(128 * 1024) + "\n" + JSON.stringify(event()) + "\n" + JSON.stringify(event()) + "\n");
   await f.forwarder.poll();
   assert.equal(f.calls.length, 2);
@@ -118,7 +148,7 @@ test("quarantines malformed, oversized and rejected events without blocking late
 });
 
 test("quarantines a non-JSON permanent rejection and still delivers the following event", async (t) => {
-  const f = await fixture(t, (_url, _request, calls) => calls.length === 1 ? new Response("request too large", { status: 413 }) : response());
+  const f = await fixture(t, (_url, request, calls) => calls.length === 1 ? new Response("request too large", { status: 413 }) : acknowledged(request));
   await writeFile(f.file, JSON.stringify(event()) + "\n" + JSON.stringify(event()) + "\n");
   await f.forwarder.poll();
   assert.equal(f.calls.length, 2);
@@ -127,7 +157,7 @@ test("quarantines a non-JSON permanent rejection and still delivers the followin
 });
 
 for (const status of [429, 500, 503]) test(`retries HTTP ${status} with backoff and no offset advancement`, async (t) => {
-  const f = await fixture(t, (_url, _req, calls) => calls.length === 1 ? response(status, {}, { "retry-after": "3" }) : response());
+  const f = await fixture(t, (_url, request, calls) => calls.length === 1 ? response(status, {}, { "retry-after": "3" }) : acknowledged(request));
   await writeFile(f.file, JSON.stringify(event()) + "\n");
   await f.forwarder.poll();
   await f.forwarder.poll();
@@ -171,6 +201,43 @@ test("ends a fully delivered session at 30 minutes, persists closure and starts 
   assert.match(f.calls[2].body.sessionId, /^devspace:host:workspace:/);
 });
 
+test("splits an outage backlog at the event-time idle gap before delivering the next segment", async (t) => {
+  const f = await fixture(t);
+  const gap = new Date(Date.parse(event().occurred_at) + IDLE_MS).toISOString();
+  await writeFile(f.file, JSON.stringify(event()) + "\n" + JSON.stringify(event({ occurred_at: gap })) + "\n");
+  f.tick(IDLE_MS);
+  await f.forwarder.poll();
+  assert.deepEqual(f.calls.map((call) => call.url.split("/").at(-1)), ["observe", "end", "observe"]);
+  assert.equal(f.calls[1].body.sessionId, f.calls[0].body.sessionId);
+  assert.notEqual(f.calls[2].body.sessionId, f.calls[0].body.sessionId);
+  const restarted = new Forwarder(f.options);
+  await restarted.init();
+  await restarted.poll();
+  assert.equal(f.calls.length, 3);
+  assert.equal(Object.values(restarted.state.sessions)[0].id, f.calls[2].body.sessionId);
+});
+
+test("keeps a backlog gap checkpointed when session end fails before the next observation", async (t) => {
+  let failEnd = true;
+  const f = await fixture(t, (url, request) => url.endsWith("session/end")
+    ? failEnd ? response(503) : response(200, { success: true }) : acknowledged(request));
+  const first = JSON.stringify(event()) + "\n";
+  const next = event({ occurred_at: new Date(Date.parse(event().occurred_at) + IDLE_MS).toISOString() });
+  await writeFile(f.file, first + JSON.stringify(next) + "\n");
+  f.tick(IDLE_MS);
+  await f.forwarder.poll();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.forwarder.state.files["0001.jsonl"].offset, Buffer.byteLength(first));
+  failEnd = false;
+  f.tick(1001);
+  const restarted = new Forwarder(f.options);
+  await restarted.init();
+  await restarted.poll();
+  assert.equal(f.calls.length, 4);
+  assert.equal(f.calls[3].body.event_id, next.event_id);
+  assert.notEqual(f.calls[3].body.sessionId, f.calls[0].body.sessionId);
+});
+
 test("does not end sessions while delivery is failing or a segment has an incomplete tail", async (t) => {
   const f = await fixture(t);
   await writeFile(f.file, JSON.stringify(event()) + "\n{");
@@ -212,4 +279,53 @@ test("disabled CLI adds no spool or checkpoint and rejects broadly readable sett
   await chmod(settings, 0o644);
   await assert.rejects(readProtected(settings), /unprotected_settings/);
   assert.throws(() => new Forwarder({ apiUrl: "http://remote.example:3111" }), /loopback/);
+});
+
+test("starts the CLI through a symlinked entry path", async (t) => {
+  const f = await fixture(t);
+  const entry = join(f.dir, "entry.mjs"), settings = join(f.dir, "settings.json");
+  await symlink(fileURLToPath(new URL("../src/index.mjs", import.meta.url)), entry);
+  await writeFile(settings, '{"enabled":false}', { mode: 0o600 });
+  const result = await promisify(execFile)(process.execPath, [entry, settings]);
+  assert.match(result.stderr, /\[devspace-forwarder\] disabled/);
+  assert.deepEqual(await readdir(f.options.stateDir), []);
+});
+
+test("pauses without advancing against a server that does not acknowledge the fixed UUID ID", async (t) => {
+  for (const body of [{ observationId: "obs_legacy" }, { deduplicated: true }]) {
+    const f = await fixture(t, () => response(201, body));
+    await writeFile(f.file, JSON.stringify(event()) + "\n");
+    await f.forwarder.poll();
+    assert.equal(f.forwarder.paused, true);
+    assert.equal(f.forwarder.state.files["0001.jsonl"], undefined);
+    assert.match(f.alerts[0], /protocol_paused/);
+  }
+});
+
+test("prunes removed segments from the durable checkpoint without resending retained events", async (t) => {
+  const f = await fixture(t);
+  await writeFile(f.file, JSON.stringify(event()) + "\n");
+  await f.forwarder.poll();
+  await unlink(f.file);
+  await f.forwarder.poll();
+  assert.deepEqual(f.forwarder.state.files, {});
+  const restarted = new Forwarder(f.options);
+  await restarted.init();
+  assert.deepEqual(restarted.state.files, {});
+  await writeFile(f.file, JSON.stringify(event()) + "\n");
+  await restarted.poll();
+  assert.equal(f.calls.length, 2);
+  assert.equal(restarted.paused, false);
+});
+
+test("dead-letters noncanonical and invalid calendar timestamps while retaining valid UTC events", async (t) => {
+  const f = await fixture(t);
+  const invalid = ["1", "Fri, 09 Oct 2026 00:00:00 GMT", "2026-02-31T00:00:00Z", "2026-10-09T25:00:00Z"];
+  await writeFile(f.file, [...invalid.map((occurred_at) => event({ occurred_at })), event()]
+    .map((value) => JSON.stringify(value) + "\n").join(""));
+  await f.forwarder.poll();
+  assert.equal(f.calls.length, 1);
+  assert.equal((await readFile(join(f.options.stateDir, "dead-letter.jsonl"), "utf8")).trim().split("\n").length, invalid.length);
+  assert.equal(f.forwarder.state.files["0001.jsonl"].offset, (await stat(f.file)).size);
+  assert.equal(sanitizeEvent(event({ occurred_at: "2026-10-09T00:00:00.001Z" })).occurred_at, "2026-10-09T00:00:00.001Z");
 });

@@ -1,8 +1,8 @@
-import { constants, createReadStream } from "node:fs";
+import { constants, createReadStream, realpathSync } from "node:fs";
 import { chmod, mkdir, open, readdir, rename, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_EVENT_BYTES, sanitizeEvent } from "./privacy.mjs";
 
@@ -17,6 +17,11 @@ export async function readProtected(path) {
   } finally { await file.close(); }
 }
 
+async function syncDirectory(path) {
+  const directory = await open(path, "r");
+  try { await directory.sync(); } finally { await directory.close(); }
+}
+
 async function saveState(path, state) {
   const temporary = `${path}.${randomUUID()}.tmp`;
   const file = await open(temporary, "wx", 0o600);
@@ -25,6 +30,7 @@ async function saveState(path, state) {
     await file.sync();
   } finally { await file.close(); }
   await rename(temporary, path);
+  await syncDirectory(dirname(path));
 }
 
 export async function* readRecords(path, start, size) {
@@ -71,8 +77,15 @@ export class Forwarder {
   }
 
   async init() {
-    await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
+    const created = await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
     await chmod(this.stateDir, 0o700);
+    if (created) {
+      const existingParent = resolve(dirname(created));
+      for (let directory = resolve(this.stateDir); ; directory = dirname(directory)) {
+        await syncDirectory(directory);
+        if (directory === existingParent) break;
+      }
+    }
     try {
       this.state = JSON.parse(await readProtected(this.checkpointPath));
       if (this.state.version !== 1 || !this.state.files || !this.state.sessions) throw new Error("invalid_checkpoint");
@@ -120,7 +133,7 @@ export class Forwarder {
       return { retry: true };
     }
     if (response.ok && (path === "observe"
-      ? (typeof body?.observationId === "string" || body?.deduplicated === true) && body?.success !== false
+      ? body?.observationId === `obs_event_${payload.event_id.toLowerCase().replace(/-/g, "")}` && body?.success !== false
       : body?.success === true)) {
       this.failures = 0;
       this.nextAttemptAt = 0;
@@ -145,6 +158,10 @@ export class Forwarder {
   async sessionFor(event) {
     const key = JSON.stringify([event.machine_id, event.workspace_id]);
     let session = this.state.sessions[key];
+    if (session && !session.ended && session.delivered
+      && Date.parse(event.occurred_at) - session.lastActivityAt >= IDLE_MS) {
+      if (!await this.endSession(session)) return;
+    }
     if (!session || session.ended) {
       const segment_id = randomUUID();
       session = { segment_id, id: `devspace:${encodeURIComponent(event.machine_id)}:${encodeURIComponent(event.workspace_id)}:${segment_id}`, lastActivityAt: Date.parse(event.occurred_at), delivered: false, ended: false };
@@ -154,6 +171,17 @@ export class Forwarder {
     return session;
   }
 
+  async endSession(session) {
+    const result = await this.request("session/end", { sessionId: session.id });
+    if (!result.success) {
+      if (result.error) { this.paused = true; this.alert(`session_end_paused ${result.error}`); }
+      return false;
+    }
+    session.ended = true;
+    await saveState(this.checkpointPath, this.state);
+    return true;
+  }
+
   async poll() {
     if (this.running || this.paused || this.now() < this.nextAttemptAt) return;
     this.running = true;
@@ -161,6 +189,13 @@ export class Forwarder {
       let files;
       try { files = (await readdir(this.spoolDir)).filter((file) => file.endsWith(".jsonl")).sort(); }
       catch (error) { if (error.code === "ENOENT") return; throw error; }
+      const present = new Set(files);
+      const previousFiles = this.state.files;
+      if (Object.keys(previousFiles).some((file) => !present.has(file))) {
+        this.state.files = Object.fromEntries(Object.entries(previousFiles).filter(([file]) => present.has(file)));
+        try { await saveState(this.checkpointPath, this.state); }
+        catch (error) { this.state.files = previousFiles; throw error; }
+      }
       let partial = false;
       for (const file of files) {
         const path = join(this.spoolDir, file);
@@ -183,6 +218,7 @@ export class Forwarder {
           if (error) await this.deadLetter(file, record, error);
           else {
             const session = await this.sessionFor(event);
+            if (!session) return;
             const acknowledgement = await this.request("observe", {
               event_id: event.event_id, sessionId: session.id,
               hookType: event.outcome.status === "success" ? "post_tool_use" : "post_tool_failure",
@@ -207,13 +243,7 @@ export class Forwarder {
       }
       for (const session of Object.values(this.state.sessions)) {
         if (session.delivered && !session.ended && this.now() - session.lastActivityAt >= IDLE_MS) {
-          const result = await this.request("session/end", { sessionId: session.id });
-          if (!result.success) {
-            if (result.error) { this.paused = true; this.alert(`session_end_paused ${result.error}`); }
-            return;
-          }
-          session.ended = true;
-          await saveState(this.checkpointPath, this.state);
+          if (!await this.endSession(session)) return;
         }
       }
     } finally { this.running = false; }
@@ -236,6 +266,6 @@ export async function main(configPath = join(homedir(), ".config/agentmemory/dev
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(resolve(process.argv[1]))) {
   main(process.argv[2]).catch(() => { console.error("[devspace-forwarder] startup_failed; inspect protected settings"); process.exitCode = 1; });
 }

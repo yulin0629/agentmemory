@@ -48,6 +48,7 @@
     "dist/",
     "plugin/",
     "integrations/pi/",
+    "integrations/devspace-forwarder/",
     "iii-config.yaml",
     "iii-config.docker.yaml",
     "docker-compose.yml",
