@@ -75,6 +75,16 @@
 
 ## Install
 
+DevSpace completion events can also be ingested through the optional
+[JSONL forwarder](integrations/devspace-forwarder/README.md). Deploy and verify
+the UUID-aware server before enabling either event production or forwarding.
+
+`POST /agentmemory/observe` accepts optional top-level UUID `event_id`. The
+existing observation row supplies deduplication: repeated IDs in
+the same session return `deduplicated: true` without repeating processing.
+Omitted IDs preserve legacy hooks, whose dedup hash now uses the complete
+input. See the integration guide for crash windows and deployment acceptance.
+
 Requirements:
 
 - Node.js 20 or newer with npm and npx (`node -v`, `npm -v`, and `npx -v`).

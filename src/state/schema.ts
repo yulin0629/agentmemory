@@ -92,6 +92,10 @@ export function generateId(prefix: string): string {
   return `${prefix}_${ts}_${rand}`;
 }
 
+export function isEventId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 export function fingerprintId(prefix: string, content: string): string {
   const hash = createHash("sha256").update(content).digest("hex");
   return `${prefix}_${hash.slice(0, 16)}`;
