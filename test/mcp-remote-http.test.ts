@@ -301,6 +301,38 @@ describe("remote MCP HTTP endpoint", () => {
       ["remote-mcp"],
     ]);
     expect(saved[0]).toMatchObject({ content: "use DCR", source: "manual" });
+    expect(tools.find((tool) => tool.name === "memory_lesson_save")!.annotations.idempotentHint).toBe(false);
+  });
+
+  it("rejects oversized or malformed remote lesson saves before storing them", async () => {
+    const sdk = mockSdk();
+    const saved: unknown[] = [];
+    sdk.stub("mem::lesson-save", async (payload) => {
+      saved.push(payload);
+      return { success: true };
+    });
+    registerMcpEndpoints(sdk as never, mockKv() as never, undefined, "chatgpt-secret", true);
+    const handler = sdk.getFunction("mcp::remote")!;
+    const save = (args: Record<string, unknown>) =>
+      handler(
+        req(
+          { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "memory_lesson_save", arguments: args } },
+          "chatgpt-secret",
+        ),
+      );
+
+    const tooLong = await save({ content: "x".repeat(10_001) });
+    expect(tooLong.body.result.isError).toBe(true);
+    expect(tooLong.body.result.content[0].text).toContain("content exceeds 10000");
+
+    const longContext = await save({ content: "ok", context: "y".repeat(2_001) });
+    expect(longContext.body.result.isError).toBe(true);
+
+    const objectContext = await save({ content: "ok", context: { nested: true } });
+    expect(objectContext.body.result.isError).toBe(true);
+    expect(objectContext.body.result.content[0].text).toContain("context must be a string");
+
+    expect(saved).toEqual([]);
   });
 
   it("bounds memory_sessions at the requested limit and returns newest sessions first", async () => {

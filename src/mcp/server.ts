@@ -35,6 +35,8 @@ const REMOTE_MCP_LESSON_SAVE = "memory_lesson_save";
 
 const REMOTE_MCP_CLIENT_TAG = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
+const REMOTE_LESSON_LIMITS = { content: 10_000, context: 2_000, tags: 500 };
+
 const REMOTE_MCP_PROTOCOL_VERSIONS = [
   "2026-07-28",
   "2025-11-25",
@@ -55,10 +57,20 @@ function remoteMcpTools(allowLessonSave: boolean) {
       annotations: {
         readOnlyHint: tool.name !== REMOTE_MCP_LESSON_SAVE,
         destructiveHint: false,
-        idempotentHint: true,
+        idempotentHint: tool.name !== REMOTE_MCP_LESSON_SAVE,
         openWorldHint: false,
       },
     }));
+}
+
+function remoteLessonTooLarge(args: Record<string, unknown>): string | undefined {
+  for (const [field, max] of Object.entries(REMOTE_LESSON_LIMITS)) {
+    const value = args[field];
+    if (typeof value === "string" && value.length > max) {
+      return `${field} exceeds ${max} characters`;
+    }
+  }
+  return undefined;
 }
 
 function remoteLessonTags(
@@ -1181,6 +1193,9 @@ export function registerMcpEndpoints(
             if (typeof args.content !== "string" || !args.content.trim()) {
               return { status_code: 400, body: { error: "content is required" } };
             }
+            if (args.context !== undefined && typeof args.context !== "string") {
+              return { status_code: 400, body: { error: "context must be a string" } };
+            }
             const lessonTags = typeof args.tags === "string" && args.tags.trim()
               ? args.tags.split(",").map((t: string) => t.trim()).filter(Boolean)
               : [];
@@ -1967,6 +1982,10 @@ export function registerMcpEndpoints(
             !Array.isArray(params.arguments)
               ? (params.arguments as Record<string, unknown>)
               : {};
+          const oversized = lessonSave ? remoteLessonTooLarge(requestedArgs) : undefined;
+          if (oversized) {
+            return rpcResult(id, { content: [{ type: "text", text: oversized }], isError: true });
+          }
           const args = lessonSave
             ? { ...requestedArgs, tags: remoteLessonTags(requestedArgs.tags, req.headers) }
             : requestedArgs;
