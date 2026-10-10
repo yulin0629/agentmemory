@@ -228,6 +228,7 @@ async function main() {
   const selectiveContext = getSelectiveContextConfig();
   const selectiveSecret = secret || selectiveContext.secret;
   const remoteMcpSecret = getEnvVar("AGENTMEMORY_MCP_BEARER_TOKEN");
+  const remoteMcpLessonSave = getEnvVar("AGENTMEMORY_MCP_REMOTE_LESSON_SAVE") === "true";
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
@@ -407,7 +408,7 @@ async function main() {
 
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
-  registerMcpEndpoints(sdk, kv, secret, remoteMcpSecret);
+  registerMcpEndpoints(sdk, kv, secret, remoteMcpSecret, remoteMcpLessonSave);
 
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
@@ -526,7 +527,7 @@ async function main() {
   );
   if (remoteMcpSecret) {
     bootLog(
-      `Remote MCP: 8 read-only tools at http://localhost:${config.restPort}/mcp`,
+      `Remote MCP: 8 read-only tools${remoteMcpLessonSave ? " + memory_lesson_save" : ""} at http://localhost:${config.restPort}/mcp`,
     );
   }
 

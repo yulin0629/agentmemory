@@ -1160,6 +1160,8 @@ AGENTMEMORY_MCP_BEARER_TOKEN=<random-secret> agentmemory
 
 The server then exposes `POST /mcp` on the same loopback REST port (`GET`/`DELETE /mcp` answer 405: the endpoint is stateless and has no SSE stream). The endpoint supports both the legacy initialize lifecycle and the stateless MCP `2026-07-28` discovery lifecycle. Result sizes are bounded at the MCP boundary (`memory_recall` and `memory_lesson_recall` limit 1–100, `memory_sessions` limit 1–100 with a `total` field, `memory_timeline` before/after ≤ 50). It intentionally exposes only eight read-only tools: `memory_recall`, `memory_file_history`, `memory_sessions`, `memory_smart_search`, `memory_timeline`, `memory_commit_lookup`, `memory_graph_query`, and `memory_lesson_recall`.
 
+Set `AGENTMEMORY_MCP_REMOTE_LESSON_SAVE=true` to also expose `memory_lesson_save`, the only write tool the remote endpoint can offer. Lessons saved through `/mcp` always carry the `remote-mcp` tag, plus the value of an `X-AgentMemory-MCP-Client` header (lowercase letters, digits and hyphens, at most 32 characters) when a gateway in front of the endpoint sets one, so remote writes can be found and removed later.
+
 `AGENTMEMORY_MCP_BEARER_TOKEN` is separate from `AGENTMEMORY_SECRET`: use the former for the hosted MCP client and keep the broader REST API private. When publishing through a reverse proxy or tunnel, route only `/mcp` to port `3111` and return 404 for every other path on that public hostname. Do not expose the whole Agent Memory REST API just to support a remote MCP client.
 
 ### Standalone MCP
@@ -1568,6 +1570,7 @@ Create `~/.agentmemory/.env`:
 # Auth
 # AGENTMEMORY_SECRET=your-secret
 # AGENTMEMORY_MCP_BEARER_TOKEN=your-remote-mcp-token  # Optional: enables read-only POST /mcp
+# AGENTMEMORY_MCP_REMOTE_LESSON_SAVE=true  # Optional: adds memory_lesson_save to POST /mcp
 
 # Ports (defaults: 3111 API, 3113 viewer)
 # III_REST_PORT=3111

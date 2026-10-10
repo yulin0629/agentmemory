@@ -239,6 +239,70 @@ describe("remote MCP HTTP endpoint", () => {
     expect(sdk.trigger).not.toHaveBeenCalled();
   });
 
+  it("keeps memory_lesson_save off the remote surface unless explicitly enabled", async () => {
+    const sdk = mockSdk();
+    registerMcpEndpoints(sdk as never, mockKv() as never, undefined, "chatgpt-secret");
+    const handler = sdk.getFunction("mcp::remote")!;
+
+    const listed = await handler(req({ jsonrpc: "2.0", id: 1, method: "tools/list" }, "chatgpt-secret"));
+    expect(listed.body.result.tools.some((tool: { name: string }) => tool.name === "memory_lesson_save")).toBe(false);
+
+    const result = await handler(
+      req(
+        {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: { name: "memory_lesson_save", arguments: { content: "nope" } },
+        },
+        "chatgpt-secret",
+      ),
+    );
+    expect(result.body.result.isError).toBe(true);
+    expect(sdk.trigger).not.toHaveBeenCalled();
+  });
+
+  it("exposes memory_lesson_save as the only write tool when enabled and tags its provenance", async () => {
+    const sdk = mockSdk();
+    const saved: Record<string, unknown>[] = [];
+    sdk.stub("mem::lesson-save", async (payload) => {
+      saved.push(payload);
+      return { success: true, action: "created", lesson: { id: "lsn_1" } };
+    });
+    registerMcpEndpoints(sdk as never, mockKv() as never, undefined, "chatgpt-secret", true);
+    const handler = sdk.getFunction("mcp::remote")!;
+
+    const listed = await handler(req({ jsonrpc: "2.0", id: 1, method: "tools/list" }, "chatgpt-secret"));
+    const tools = listed.body.result.tools as Array<{ name: string; annotations: Record<string, unknown> }>;
+    const writable = tools.filter((tool) => tool.annotations.readOnlyHint !== true).map((tool) => tool.name);
+    expect(writable).toEqual(["memory_lesson_save"]);
+    expect(tools).toHaveLength(9);
+
+    const call = (headers: Record<string, string>, tags?: string) =>
+      handler({
+        body: {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: { name: "memory_lesson_save", arguments: { content: "use DCR", ...(tags ? { tags } : {}) } },
+        },
+        headers: { authorization: "Bearer chatgpt-secret", ...headers },
+        query_params: {},
+      });
+
+    const result = await call({ "x-agentmemory-mcp-client": "claude-web" }, "mcp, oauth");
+    expect(result.body.result.isError).toBeUndefined();
+    await call({ "x-agentmemory-mcp-client": "Not A Tag!" });
+    await call({}, "remote-mcp");
+
+    expect(saved.map((payload) => payload.tags)).toEqual([
+      ["mcp", "oauth", "remote-mcp", "claude-web"],
+      ["remote-mcp"],
+      ["remote-mcp"],
+    ]);
+    expect(saved[0]).toMatchObject({ content: "use DCR", source: "manual" });
+  });
+
   it("bounds memory_sessions at the requested limit and returns newest sessions first", async () => {
     const sdk = mockSdk();
     const kv = mockKv();
