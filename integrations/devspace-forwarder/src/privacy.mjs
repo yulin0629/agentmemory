@@ -7,7 +7,7 @@ export function redact(value, limit = 2048) {
     .replace(/data:[^,\s]+;base64,[A-Za-z0-9+/_=-]+/gi, "[attachment omitted]")
     .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/g, "[redacted]")
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[redacted]@")
-    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=-]+/gi, "[redacted]")
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=~-]+/gi, "[redacted]")
     .replace(/((?:password|passwd|secret|token|api[-_]?key|authorization|credential)["']?\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi, "$1[redacted]")
     .replace(/\b(?:sk-|gh[pousr]_|github_pat_|AKIA|ASIA)[A-Za-z0-9_/-]+/g, "[redacted]")
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "")

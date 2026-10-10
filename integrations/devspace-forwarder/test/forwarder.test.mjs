@@ -365,6 +365,7 @@ test("whitelists and redacts event metadata, retaining benign paths and metrics"
   assert.equal(shell.details.command_summary, "curl; git status");
   assert.equal(shell.details.output, "PASS");
   assert.equal(sanitizeEvent(event({ tool: "other", details: { arbitrary: "value" } })).details, undefined);
+  assert.equal(sanitizeEvent(event({ details: { path: "Bearer abc~fixture/_.+-==" } })).details.path, "[redacted]");
 });
 
 test("keeps redacted machine and workspace identities distinct across restart", async (t) => {
