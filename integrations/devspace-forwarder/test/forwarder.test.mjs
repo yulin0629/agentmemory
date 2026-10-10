@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { Forwarder, IDLE_MS, main, readProtected } from "../src/index.mjs";
+import { Forwarder, IDLE_MS, SESSION_RETENTION_MS, main, readProtected } from "../src/index.mjs";
 import { sanitizeEvent } from "../src/privacy.mjs";
 
 const event = (fields = {}) => ({
@@ -215,6 +215,104 @@ test("splits an outage backlog at the event-time idle gap before delivering the 
   await restarted.poll();
   assert.equal(f.calls.length, 3);
   assert.equal(Object.values(restarted.state.sessions)[0].id, f.calls[2].body.sessionId);
+});
+
+test("treats an unknown session end as closed and delivers later events without pausing", async (t) => {
+  const f = await fixture(t, (url, request) => url.endsWith("session/end")
+    ? response(404, { error: "unknown session", sessionId: JSON.parse(request.body).sessionId }) : acknowledged(request));
+  await writeFile(f.file, JSON.stringify(event()) + "\n");
+  await f.forwarder.poll();
+  f.tick(IDLE_MS);
+  await f.forwarder.poll();
+  assert.equal(f.forwarder.paused, false);
+  assert.equal(Object.values(f.forwarder.state.sessions)[0].ended, true);
+  assert.match(f.alerts[0], /session_end_unknown_session/);
+  const restarted = new Forwarder(f.options);
+  await restarted.init();
+  await appendFile(f.file, JSON.stringify(event({ occurred_at: new Date(Date.parse(event().occurred_at) + IDLE_MS).toISOString() })) + "\n");
+  await restarted.poll();
+  assert.deepEqual(f.calls.map((call) => call.url.split("/").at(-1)), ["observe", "end", "observe"]);
+  assert.notEqual(f.calls[2].body.sessionId, f.calls[0].body.sessionId);
+  assert.equal(restarted.state.files["0001.jsonl"].offset, (await stat(f.file)).size);
+  await assert.rejects(stat(join(f.options.stateDir, "dead-letter.jsonl")), { code: "ENOENT" });
+});
+
+test("pauses on an observe 404 without dead-lettering or advancing the event", async (t) => {
+  const f = await fixture(t, () => response(404, { error: "not found" }));
+  await writeFile(f.file, JSON.stringify(event()) + "\n");
+  await f.forwarder.poll();
+  await f.forwarder.poll();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.forwarder.paused, true);
+  assert.match(f.alerts[0], /protocol_paused observe http_404/);
+  assert.equal(f.forwarder.state.files["0001.jsonl"], undefined);
+  await assert.rejects(stat(join(f.options.stateDir, "dead-letter.jsonl")), { code: "ENOENT" });
+});
+
+test("does not mistake a missing session-end route for an unknown session", async (t) => {
+  const f = await fixture(t, (url, request) => url.endsWith("session/end")
+    ? new Response("Not Found", { status: 404 }) : acknowledged(request));
+  await writeFile(f.file, JSON.stringify(event()) + "\n");
+  await f.forwarder.poll();
+  f.tick(IDLE_MS);
+  await f.forwarder.poll();
+  assert.equal(f.forwarder.paused, true);
+  assert.equal(Object.values(f.forwarder.state.sessions)[0].ended, false);
+  assert.match(f.alerts[0], /protocol_paused session\/end http_404/);
+});
+
+test("writes one allocation checkpoint per session and one acknowledgement checkpoint per event", async (t) => {
+  const f = await fixture(t);
+  const handle = await open(f.options.stateDir, "r");
+  const prototype = Object.getPrototypeOf(handle), originalWrite = prototype.writeFile;
+  await handle.close();
+  const writes = t.mock.method(prototype, "writeFile", originalWrite);
+  await writeFile(f.file, Array.from({ length: 10 }, () => JSON.stringify(event()) + "\n").join(""));
+  await f.forwarder.poll();
+  assert.equal(f.calls.length, 10);
+  assert.equal(writes.mock.callCount(), 11);
+  assert.deepEqual(f.calls[0].body.data.tool_output, { outcome: { status: "success", duration_ms: 1 } });
+  await f.forwarder.sessionFor(event());
+  assert.equal(writes.mock.callCount(), 11);
+  f.tick(IDLE_MS);
+  await f.forwarder.poll();
+  assert.equal(writes.mock.callCount(), 12);
+});
+
+test("durably prunes 1,000 sessions closed over seven days ago while retaining active and recent sessions", async (t) => {
+  const f = await fixture(t), time = Date.parse(event().occurred_at);
+  const closed = (endedAt) => ({ id: randomUUID(), segment_id: randomUUID(), ended: true, endedAt, delivered: true, lastActivityAt: 0 });
+  for (let i = 0; i < 1000; i++) f.forwarder.state.sessions[`expired-${i}`] = closed(time - SESSION_RETENTION_MS - 1);
+  f.forwarder.state.sessions.recent = closed(time);
+  f.forwarder.state.sessions.boundary = closed(time - SESSION_RETENTION_MS);
+  f.forwarder.state.sessions.active = { ...closed(0), ended: false, delivered: false };
+  await f.forwarder.saveCheckpoint();
+  await f.forwarder.poll();
+  assert.deepEqual(Object.keys(f.forwarder.state.sessions).sort(), ["active", "boundary", "recent"]);
+  const restarted = new Forwarder(f.options);
+  await restarted.init();
+  assert.deepEqual(restarted.state.sessions, f.forwarder.state.sessions);
+  f.tick(1);
+  await restarted.poll();
+  assert.deepEqual(Object.keys(restarted.state.sessions).sort(), ["active", "recent"]);
+  assert.equal(f.calls.length, 0);
+});
+
+test("migrates legacy closure timestamps once without prematurely expiring them", async (t) => {
+  const f = await fixture(t), time = Date.parse(event().occurred_at);
+  f.forwarder.state.sessions.legacy = { id: "legacy", segment_id: "legacy", ended: true, lastActivityAt: 0 };
+  await f.forwarder.saveCheckpoint();
+  const migrated = new Forwarder(f.options);
+  await migrated.init();
+  assert.equal(migrated.state.sessions.legacy.endedAt, time);
+  f.tick(SESSION_RETENTION_MS);
+  const restarted = new Forwarder(f.options);
+  await restarted.init();
+  await restarted.poll();
+  assert.equal(restarted.state.sessions.legacy.endedAt, time);
+  f.tick(1);
+  await restarted.poll();
+  assert.deepEqual(restarted.state.sessions, {});
 });
 
 test("keeps a backlog gap checkpointed when session end fails before the next observation", async (t) => {

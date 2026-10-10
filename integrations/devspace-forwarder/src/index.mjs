@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { MAX_EVENT_BYTES, sanitizeEvent } from "./privacy.mjs";
 
 export const IDLE_MS = 30 * 60 * 1000;
+export const SESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export async function readProtected(path) {
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -74,6 +75,7 @@ export class Forwarder {
     this.failures = 0;
     this.nextAttemptAt = 0;
     this.running = false;
+    this.checkpointPending = false;
   }
 
   async init() {
@@ -93,6 +95,21 @@ export class Forwarder {
       if (error.code !== "ENOENT") throw error;
       this.state = { version: 1, files: {}, sessions: {} };
     }
+    // Older checkpoints lack closure times; retain those sessions for seven days from migration.
+    let migrated = false;
+    for (const session of Object.values(this.state.sessions)) {
+      if (session.ended && !Number.isFinite(session.endedAt)) {
+        session.endedAt = this.now();
+        migrated = true;
+      }
+    }
+    if (migrated) await this.saveCheckpoint();
+  }
+
+  async saveCheckpoint() {
+    this.checkpointPending = true;
+    await saveState(this.checkpointPath, this.state);
+    this.checkpointPending = false;
   }
 
   retry() {
@@ -125,7 +142,22 @@ export class Forwarder {
       this.alert(`delivery_retry http_${response.status}`);
       return { retry: true };
     }
-    if ([400, 404, 413, 422].includes(response.status)) return { error: `rejected_http_${response.status}` };
+    if (response.status === 404) {
+      if (path === "session/end") {
+        let missing;
+        try { missing = await response.json(); } catch { /* A missing route is not an unknown session. */ }
+        if (missing?.error === "unknown session" && (!missing.sessionId || missing.sessionId === payload.sessionId)) {
+          this.failures = 0;
+          this.nextAttemptAt = 0;
+          this.alert("session_end_unknown_session; treating as ended");
+          return { success: true };
+        }
+      }
+      this.paused = true;
+      this.alert(`protocol_paused ${path} http_404; inspect service configuration`);
+      return { retry: true };
+    }
+    if ([400, 413, 422].includes(response.status)) return { error: `rejected_http_${response.status}` };
     let body;
     try { body = await response.json(); } catch {
       this.retry();
@@ -166,8 +198,8 @@ export class Forwarder {
       const segment_id = randomUUID();
       session = { segment_id, id: `devspace:${encodeURIComponent(event.machine_id)}:${encodeURIComponent(event.workspace_id)}:${segment_id}`, lastActivityAt: Date.parse(event.occurred_at), delivered: false, ended: false };
       this.state.sessions[key] = session;
+      await this.saveCheckpoint();
     }
-    await saveState(this.checkpointPath, this.state);
     return session;
   }
 
@@ -178,14 +210,23 @@ export class Forwarder {
       return false;
     }
     session.ended = true;
-    await saveState(this.checkpointPath, this.state);
+    session.endedAt = this.now();
+    await this.saveCheckpoint();
     return true;
   }
 
   async poll() {
-    if (this.running || this.paused || this.now() < this.nextAttemptAt) return;
+    if (this.running) return;
     this.running = true;
     try {
+      if (this.checkpointPending) await this.saveCheckpoint();
+      const expired = Object.entries(this.state.sessions).filter(([, session]) =>
+        session.ended && this.now() - session.endedAt > SESSION_RETENTION_MS);
+      if (expired.length) {
+        for (const [key] of expired) delete this.state.sessions[key];
+        await this.saveCheckpoint();
+      }
+      if (this.paused || this.now() < this.nextAttemptAt) return;
       let files;
       try { files = (await readdir(this.spoolDir)).filter((file) => file.endsWith(".jsonl")).sort(); }
       catch (error) { if (error.code === "ENOENT") return; throw error; }
@@ -193,7 +234,7 @@ export class Forwarder {
       const previousFiles = this.state.files;
       if (Object.keys(previousFiles).some((file) => !present.has(file))) {
         this.state.files = Object.fromEntries(Object.entries(previousFiles).filter(([file]) => present.has(file)));
-        try { await saveState(this.checkpointPath, this.state); }
+        try { await this.saveCheckpoint(); }
         catch (error) { this.state.files = previousFiles; throw error; }
       }
       let partial = false;
@@ -223,7 +264,7 @@ export class Forwarder {
               event_id: event.event_id, sessionId: session.id,
               hookType: event.outcome.status === "success" ? "post_tool_use" : "post_tool_failure",
               project: event.project, cwd: event.cwd, timestamp: event.occurred_at,
-              data: { tool_name: event.tool, tool_input: event.details ?? {}, tool_output: { outcome: event.outcome, event } },
+              data: { tool_name: event.tool, tool_input: event.details ?? {}, tool_output: { outcome: event.outcome } },
             });
             if (acknowledgement.retry) return;
             if (acknowledgement.error) await this.deadLetter(file, record, acknowledgement.error, event);
@@ -231,7 +272,7 @@ export class Forwarder {
             session.lastActivityAt = Math.max(session.lastActivityAt, Date.parse(event.occurred_at));
           }
           this.state.files[file] = { inode: String(info.ino), offset: record.nextOffset };
-          await saveState(this.checkpointPath, this.state);
+          await this.saveCheckpoint();
         }
       }
       if (partial) return;
