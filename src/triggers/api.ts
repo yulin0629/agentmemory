@@ -3,7 +3,7 @@ import type { HttpRequest } from "@iii-dev/helpers/http";
 import { randomBytes } from "node:crypto";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { KV } from "../state/schema.js";
+import { KV, isEventId } from "../state/schema.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
 import { getLatestHealth } from "../health/monitor.js";
@@ -446,6 +446,9 @@ export function registerApiTriggers(
       const project = asNonEmptyString(body.project);
       const cwd = asNonEmptyString(body.cwd);
       const timestamp = asNonEmptyString(body.timestamp);
+      if (body.event_id !== undefined && !isEventId(body.event_id)) {
+        return { status_code: 400, body: { error: "event_id must be a UUID" } };
+      }
       if (!hookType || !sessionId || !project || !cwd || !timestamp) {
         return {
           status_code: 400,
@@ -456,6 +459,7 @@ export function registerApiTriggers(
         };
       }
       const payload: HookPayload = {
+        ...(body.event_id !== undefined ? { event_id: body.event_id as string } : {}),
         hookType: hookType as HookPayload["hookType"],
         sessionId,
         project,

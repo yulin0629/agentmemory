@@ -157,6 +157,7 @@ export type HookType =
   | "session_end";
 
 export interface HookPayload {
+  event_id?: string;
   hookType: HookType;
   sessionId: string;
   project: string;

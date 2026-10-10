@@ -75,6 +75,23 @@
 
 ## Install
 
+DevSpace completion events can also be ingested through the optional
+[JSONL forwarder](integrations/devspace-forwarder/README.md). Deploy and verify
+the UUID-aware server before enabling either event production or forwarding.
+
+`POST /agentmemory/observe` accepts optional top-level UUID `event_id`. The
+existing observation row supplies deduplication: repeated IDs in
+the same session return `deduplicated: true` without repeating processing.
+Omitted IDs preserve legacy hooks, whose dedup hash now uses the complete
+input. See the integration guide for crash windows and deployment acceptance.
+
+Maintain the three privacy filters together: DevSpace's `src/events/privacy.ts`,
+this repository's `integrations/devspace-forwarder/src/privacy.mjs`, and
+`src/functions/privacy.ts`. DevSpace observations carry less context than CLI
+hooks and omit `contextProjectId`. The existing iii file store has a five-second
+periodic persistence window, so an engine/host crash can lose recently
+acknowledged observations. See the [forwarder limitations](integrations/devspace-forwarder/README.md#privacy-and-limitations).
+
 Requirements:
 
 - Node.js 20 or newer with npm and npx (`node -v`, `npm -v`, and `npx -v`).

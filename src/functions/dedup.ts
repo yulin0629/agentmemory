@@ -20,8 +20,8 @@ export class DedupMap {
   computeHash(sessionId: string, toolName: string, toolInput: unknown): string {
     const input =
       typeof toolInput === "string"
-        ? toolInput.slice(0, 500)
-        : JSON.stringify(toolInput ?? "").slice(0, 500);
+        ? toolInput
+        : JSON.stringify(toolInput ?? "");
     const raw = `${sessionId}:${toolName}:${input}`;
     return createHash("sha256").update(raw).digest("hex");
   }
