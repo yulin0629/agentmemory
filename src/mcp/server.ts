@@ -35,7 +35,7 @@ const REMOTE_MCP_LESSON_SAVE = "memory_lesson_save";
 
 const REMOTE_MCP_CLIENT_TAG = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
-const REMOTE_LESSON_LIMITS = { content: 10_000, context: 2_000, tags: 500 };
+const REMOTE_LESSON_LIMITS = { content: 10_000, context: 2_000, project: 200, tags: 500 };
 
 const REMOTE_MCP_PROTOCOL_VERSIONS = [
   "2026-07-28",
@@ -65,7 +65,7 @@ function remoteMcpTools(allowLessonSave: boolean) {
 
 function remoteLessonTooLarge(args: Record<string, unknown>): string | undefined {
   for (const [field, max] of Object.entries(REMOTE_LESSON_LIMITS)) {
-    const value = args[field];
+    const value = field === "tags" ? parseCsvList(args.tags).join(",") : args[field];
     if (typeof value === "string" && value.length > max) {
       return `${field} exceeds ${max} characters`;
     }
@@ -1195,6 +1195,9 @@ export function registerMcpEndpoints(
             }
             if (args.context !== undefined && typeof args.context !== "string") {
               return { status_code: 400, body: { error: "context must be a string" } };
+            }
+            if (args.project !== undefined && typeof args.project !== "string") {
+              return { status_code: 400, body: { error: "project must be a string" } };
             }
             const lessonTags = typeof args.tags === "string" && args.tags.trim()
               ? args.tags.split(",").map((t: string) => t.trim()).filter(Boolean)

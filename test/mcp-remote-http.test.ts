@@ -332,6 +332,17 @@ describe("remote MCP HTTP endpoint", () => {
     expect(objectContext.body.result.isError).toBe(true);
     expect(objectContext.body.result.content[0].text).toContain("context must be a string");
 
+    const arrayTags = await save({ content: "ok", tags: ["a".repeat(300), "b".repeat(300)] });
+    expect(arrayTags.body.result.isError).toBe(true);
+    expect(arrayTags.body.result.content[0].text).toContain("tags exceeds 500");
+
+    const longProject = await save({ content: "ok", project: "p".repeat(201) });
+    expect(longProject.body.result.isError).toBe(true);
+
+    const objectProject = await save({ content: "ok", project: { name: "x" } });
+    expect(objectProject.body.result.isError).toBe(true);
+    expect(objectProject.body.result.content[0].text).toContain("project must be a string");
+
     expect(saved).toEqual([]);
   });
 
