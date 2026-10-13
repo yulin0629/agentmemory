@@ -1526,6 +1526,11 @@ Create `~/.agentmemory/.env`:
 #                                          # api-key header + api-version query param.
 # OPENAI_API_VERSION=2024-08-01-preview    # Optional: Azure api-version query param
 # OPENAI_MODEL=gpt-5.6-luna                # Optional: default model
+# OPENAI_SYSTEM_ROLE=system               # Optional: exact values "system" (default) | "developer".
+#                                          # Opt in to developer only when the chat endpoint accepts it.
+#                                          # Applies to OpenAI-compatible compression and summaries,
+#                                          # including Azure; keeps instructions separate from user data.
+#                                          # Any other value (including empty) fails provider construction.
 # OPENAI_TIMEOUT_MS=60000                  # Optional: OpenAI-scoped alias for the outbound fetch
 #                                          # timeout. Takes precedence over AGENTMEMORY_LLM_TIMEOUT_MS
 #                                          # for back-compat with v0.9.17. New configs should
