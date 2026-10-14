@@ -1,5 +1,5 @@
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import type {
   Session,
   CompressedObservation,
@@ -59,7 +59,7 @@ async function runChunked<T>(
   }
 }
 
-export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
+export function registerExportImportFunction(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction("mem::export", 
     async (data?: { maxSessions?: number; offset?: number }) => {
       const rawMax = Number(data?.maxSessions);

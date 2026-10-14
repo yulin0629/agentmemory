@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk } from "iii-sdk";
+import { TriggerAction, type IIIClient } from "iii-sdk";
 import type { Memory } from "../types.js";
 import { KV, generateId, jaccardSimilarity } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -6,7 +6,7 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { memoryToObservation } from "../state/memory-utils.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
-import { getSearchIndex, isMemoryIndexReady, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { getSearchIndex, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 
@@ -19,7 +19,7 @@ function safeSlice(text: string, length: number): string {
   return /[\uD800-\uDBFF]$/.test(sliced) ? sliced.slice(0, -1) : sliced;
 }
 
-export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
+export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction("mem::remember", 
     async (data: {
       content: string;
@@ -197,6 +197,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         // restart-time rebuild will pick the memory up either way.
         try {
           getSearchIndex().add(memoryToObservation(memory));
+          scheduleIndexSave();
         } catch (err) {
           logger.warn("Failed to index saved memory into BM25", {
             memId: memory.id,

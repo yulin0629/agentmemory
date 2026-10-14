@@ -21,10 +21,10 @@ import {
   createImageEmbeddingProvider,
 } from "./providers/index.js";
 import { StateKV } from "./state/kv.js";
-import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
+import { SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_HARD_EXIT_MS, settleWithin } from "./shutdown.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
@@ -34,12 +34,14 @@ import { registerDiskSizeManager } from "./functions/disk-size-manager.js";
 import { registerCompressFunction } from "./functions/compress.js";
 import {
   registerSearchFunction,
-  rebuildIndex,
+  backfillVectors,
+  rebuildKeywordIndex,
   getSearchIndex,
   setVectorIndex,
   setEmbeddingProvider,
   setIndexPersistence,
   setHybridRanker,
+  setPendingVectorBackfillCount,
 } from "./functions/search.js";
 import { registerContextFunction } from "./functions/context.js";
 import { registerSummarizeFunction } from "./functions/summarize.js";
@@ -394,23 +396,13 @@ async function main() {
 
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
-  const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex);
-  // Wire the persistence hook so delete paths can flush BM25/vector
-  // index mutations to disk. Without this, an in-memory remove can be
-  // lost across a hard process exit and the persisted snapshot
-  // restores the deleted entry at next boot.
+  const indexPersistence = new IndexPersistence(kv, vectorIndex);
   setIndexPersistence(indexPersistence);
 
   const loaded = await indexPersistence.load().catch((err) => {
-    console.warn(`[agentmemory] Failed to load persisted index:`, err);
+    console.warn(`[agentmemory] Failed to load persisted vector index:`, err);
     return null;
   });
-  if (loaded?.bm25 && loaded.bm25.size > 0) {
-    bm25Index.restoreFrom(loaded.bm25);
-    bootLog(
-      `Loaded persisted BM25 index (${bm25Index.size} docs)`,
-    );
-  }
   if (loaded?.vector && vectorIndex && loaded.vector.size > 0) {
     // Persisted vectors carry whatever dimension the provider had when
     // they were written. If the active provider declares a different
@@ -435,6 +427,7 @@ async function main() {
       const distinct = Array.from(seenDimensions).sort((a, b) => a - b).join(", ");
       const dropStale = isDropStaleIndexEnabled();
       if (dropStale) {
+        for (const [obsId] of loaded.vector.entries()) vectorIndex.markRemoved(obsId);
         console.warn(
           `[agentmemory] Persisted vector index has ${mismatches.length} of ` +
             `${loaded.vector.size} vectors with the wrong dimension. Active ` +
@@ -465,68 +458,42 @@ async function main() {
     }
   }
 
-  const needsRebuild = bm25Index.size === 0;
-
-  if (needsRebuild) {
-    // Fire-and-forget. rebuildIndex iterates every observation across
-    // every session and AWAITS an embedding-provider call per record.
-    // On a large corpus + rate-limited embedding endpoint that can
-    // take HOURS; awaiting it here blocks every subsequent boot step
-    // (including startViewerServer below, leaving the viewer port
-    // unbound for the duration). The index lazily fills in over time
-    // and search degrades gracefully — partial coverage > no viewer
-    // for hours. Errors still surface via the inner .catch.
-    void rebuildIndex(kv)
-      .then((indexCount) => {
-        if (indexCount > 0) {
-          bootLog(`Search index rebuilt: ${indexCount} entries`);
-          indexPersistence.scheduleSave();
-        }
-      })
-      .catch((err) => {
-        console.warn(`[agentmemory] Failed to rebuild search index:`, err);
-      });
-  } else {
-    // Backfill memories into BM25 for users upgrading from <0.9.5: prior
-    // versions of mem::remember never indexed memories, so the persisted
-    // BM25 covers observations only and `memory_smart_search` returns
-    // empty for everything saved via memory_save (#257). Walk KV.memories
-    // and add the ones missing from the restored index. Idempotent on
-    // re-runs because SearchIndex.has() short-circuits already-indexed
-    // ids.
-    try {
-      const memories = await kv.list<import("./types.js").Memory>(KV.memories);
-      let backfilled = 0;
-      for (const memory of memories) {
-        if (memory.isLatest === false) continue;
-        if (!memory.title || !memory.content) continue;
-        if (bm25Index.has(memory.id)) continue;
-        bm25Index.add({
-          id: memory.id,
-          sessionId: memory.sessionIds?.[0] ?? "memory",
-          timestamp: memory.createdAt,
-          type: "decision",
-          title: memory.title,
-          facts: [memory.content],
-          narrative: memory.content,
-          concepts: memory.concepts,
-          files: memory.files,
-          importance: memory.strength,
-        });
-        backfilled++;
-      }
-      if (backfilled > 0) {
-        bootLog(
-          `Backfilled ${backfilled} memories into BM25 (legacy index gap)`,
-        );
-        indexPersistence.scheduleSave();
-      }
-    } catch (err) {
-      console.warn(
-        `[agentmemory] Failed to backfill memories into BM25:`,
-        err,
+  const vectorCountShortfall =
+    Boolean(loaded?.vector) &&
+    loaded?.expectedCount !== undefined &&
+    loaded.vector!.size < loaded.expectedCount;
+  const vectorBackfillSince =
+    !loaded || loaded.state === "unavailable"
+      ? undefined
+      : loaded.state === "none" || vectorCountShortfall
+        ? null
+        : loaded.savedAt;
+  const keywordStart = Date.now();
+  try {
+    const keyword = await rebuildKeywordIndex(kv, vectorBackfillSince);
+    bootLog(
+      `Rebuilt BM25 index from stored content (${keyword.documents} docs in ${Date.now() - keywordStart} ms)`,
+    );
+    setPendingVectorBackfillCount(keyword.vectorJobs.length + keyword.fullBackfillPending);
+    if (keyword.fullBackfillPending > 0) {
+      bootLog(
+        `Vector backfill needs ${keyword.fullBackfillPending} embeddings but a full backfill was not started ` +
+          `(set AGENTMEMORY_VECTOR_BACKFILL=all to opt in). See /agentmemory/status.`,
       );
     }
+    if (keyword.vectorJobs.length > 0) {
+      bootLog(`Backfilling ${keyword.vectorJobs.length} missing vectors in the background`);
+      void backfillVectors(keyword.vectorJobs)
+        .then((count) => {
+          setPendingVectorBackfillCount(keyword.fullBackfillPending);
+          if (count > 0) bootLog(`Vector index backfilled: ${count} entries`);
+        })
+        .catch((err) => {
+          console.warn(`[agentmemory] Failed to backfill vectors:`, err);
+        });
+    }
+  } catch (err) {
+    console.warn(`[agentmemory] Failed to rebuild the BM25 index:`, err);
   }
 
   // Ready / Endpoints lines are emitted via `bootLog` so they're
@@ -537,7 +504,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 130 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 132 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
@@ -612,29 +579,36 @@ async function main() {
     bootLog(`Auto-consolidation: enabled (every ${consolidationIntervalMs / 60000}m)`);
   }
 
-  // Every step of shutdown below can await the engine (viewer close, index
-  // save via kv.set, sdk/otel shutdown). When the engine is already gone,
-  // iii-sdk queues the writes and reconnects forever, so without a deadline
-  // the worker hangs until systemd's 90s SIGKILL (observed 2026-09-13/14 on
-  // every stop). Healthy flush is ~3s; 15s leaves headroom for a large index.
-  const SHUTDOWN_DEADLINE_MS = 15_000;
   const shutdown = async () => {
     console.log(`\n[agentmemory] Shutting down...`);
-    setTimeout(() => {
+    const hardExit = setTimeout(() => {
       console.warn(
-        `[agentmemory] Shutdown exceeded ${SHUTDOWN_DEADLINE_MS}ms (engine unreachable?); exiting without full index flush`,
+        `[agentmemory] Shutdown still blocked after ${SHUTDOWN_HARD_EXIT_MS}ms; exiting now.`,
       );
       clearWorkerPidfile();
       process.exit(1);
-    }, SHUTDOWN_DEADLINE_MS);
+    }, SHUTDOWN_HARD_EXIT_MS);
+    hardExit.unref();
     healthMonitor.stop();
     dedupMap.stop();
     indexPersistence.stop();
-    await new Promise<void>((resolve) => viewerServer.close(() => resolve()));
-    await indexPersistence.save().catch((err) => {
-      console.warn(`[agentmemory] Failed to save index on shutdown:`, err);
+    const viewerClosed = new Promise<void>((resolve) =>
+      viewerServer.close(() => resolve()),
+    );
+    viewerServer.closeAllConnections();
+    await viewerClosed;
+    const flushed = await settleWithin(
+      indexPersistence.save(),
+      SHUTDOWN_FLUSH_TIMEOUT_MS,
+    );
+    if (!flushed) {
+      console.warn(
+        `[agentmemory] Search index flush did not finish within ${SHUTDOWN_FLUSH_TIMEOUT_MS}ms; the engine is probably gone. Observations are already in the engine's state store and the index reconciles them on the next boot.`,
+      );
+    }
+    await settleWithin(sdk.shutdown(), SHUTDOWN_FLUSH_TIMEOUT_MS).catch((err) => {
+      console.warn(`[agentmemory] SDK shutdown failed:`, err);
     });
-    await sdk.shutdown();
     clearWorkerPidfile();
     process.exit(0);
   };

@@ -1,4 +1,84 @@
-import { join } from "node:path";
+import { readFileSync, rmSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+
+const SEEDED_BUILTIN_WORKERS = [
+  "http",
+  "iii-http",
+  "state",
+  "iii-state",
+  "queue",
+  "iii-queue",
+  "pubsub",
+  "iii-pubsub",
+  "cron",
+  "iii-cron",
+  "iii-stream",
+  "iii-observability",
+  "iii-worker-manager",
+];
+
+export function configuredPersistDir(renderedConfig: string): string | null {
+  const lines = renderedConfig.split("\n");
+  const block = workerBlock(lines, "configuration");
+  if (!block) return null;
+  for (let i = block.start + 1; i < block.end; i++) {
+    const match = lines[i]!.trim().match(/^directory:\s*(.+?)\s*$/);
+    if (match) return match[1]!.replace(/^(['"])(.*)\1$/, "$2");
+  }
+  return null;
+}
+
+export function persistedBuiltinConfigDirs(
+  engineCwd: string,
+  configPath: string,
+  renderedConfig?: string,
+): string[] {
+  const dirs = [
+    join(engineCwd, "config"),
+    join(dirname(configPath), "config"),
+    join(engineCwd, "data", "configuration"),
+  ];
+  const custom = renderedConfig ? configuredPersistDir(renderedConfig) : null;
+  if (custom) dirs.unshift(resolve(engineCwd, custom));
+  return [...new Set(dirs)];
+}
+
+export function persistedBuiltinConfigPaths(
+  engineCwd: string,
+  configPath: string,
+  renderedConfig?: string,
+): string[] {
+  return persistedBuiltinConfigDirs(engineCwd, configPath, renderedConfig).flatMap((dir) =>
+    SEEDED_BUILTIN_WORKERS.map((id) => join(dir, `${id}.yaml`)),
+  );
+}
+
+export function isPersistedBuiltinEntry(content: string, id: string): boolean {
+  const firstLine = content.split("\n").find((line) => line.trim() !== "");
+  return firstLine?.trim() === `id: ${id}`;
+}
+
+export function clearPersistedBuiltinConfig(
+  engineCwd: string,
+  configPath: string,
+  renderedConfig?: string,
+): string[] {
+  const cleared: string[] = [];
+  for (const path of persistedBuiltinConfigPaths(engineCwd, configPath, renderedConfig)) {
+    try {
+      const content = readFileSync(path, "utf8");
+      if (!isPersistedBuiltinEntry(content, basename(path, ".yaml"))) continue;
+      rmSync(path);
+      cleared.push(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new Error(
+        `could not remove persisted engine config ${path}: ${String(err)}`,
+      );
+    }
+  }
+  return cleared;
+}
 
 export interface EngineConfigOptions {
   dataDir: string;

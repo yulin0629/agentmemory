@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk } from "iii-sdk";
+import { TriggerAction, type IIIClient } from "iii-sdk";
 import { readFileSync } from "node:fs";
 import { isManagedImagePath } from "../utils/image-store.js";
 import type {
@@ -15,7 +15,7 @@ import {
 } from "../prompts/compression.js";
 import { VISION_DESCRIPTION_PROMPT } from "../prompts/vision.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
-import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
+import { getSearchIndex, scheduleIndexSave, vectorIndexAddGuarded } from "./search.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { CompressOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
@@ -97,7 +97,7 @@ async function persistIfPresent(
 }
 
 async function persistSyntheticFallback(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
   data: { observationId: string; sessionId: string; raw: RawObservation },
   reason: string,
@@ -115,6 +115,7 @@ async function persistSyntheticFallback(
 
     try {
       getSearchIndex().add(synthetic);
+      scheduleIndexSave();
     } catch (err) {
       logger.warn("Failed to index synthetic fallback observation into BM25", {
         obsId: synthetic.id,
@@ -185,7 +186,7 @@ async function persistSyntheticFallback(
 }
 
 export function registerCompressFunction(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
@@ -314,6 +315,7 @@ export function registerCompressFunction(
 
         try {
           getSearchIndex().add(compressed);
+          scheduleIndexSave();
         } catch (err) {
           logger.warn("Failed to index compressed observation into BM25", {
             obsId: compressed.id,
