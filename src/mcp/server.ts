@@ -52,8 +52,12 @@ function remoteMcpTools() {
     }));
 }
 
-function rpcResult(id: unknown, result: unknown): McpResponse {
-  return { status_code: 200, body: { jsonrpc: "2.0", id, result } };
+// MCP 2026-07-28 requires resultType on every result; earlier clients ignore it.
+function rpcResult(id: unknown, result: Record<string, unknown>): McpResponse {
+  return {
+    status_code: 200,
+    body: { jsonrpc: "2.0", id, result: { resultType: "complete", ...result } },
+  };
 }
 
 function rpcError(
@@ -1965,7 +1969,7 @@ export function registerMcpEndpoints(
               isError: true,
             });
           }
-          return rpcResult(id, result.body);
+          return rpcResult(id, result.body as Record<string, unknown>);
         }
 
         default:
