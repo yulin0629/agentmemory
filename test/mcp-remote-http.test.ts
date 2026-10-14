@@ -217,6 +217,43 @@ describe("remote MCP HTTP endpoint", () => {
     expect(payload.total).toBe(1);
   });
 
+  it("marks every result with resultType for 2026-07-28 clients", async () => {
+    const sdk = mockSdk();
+    const kv = mockKv();
+    kv.sessions.push({ id: "session-1", startedAt: "2026-03-01T00:00:00Z" });
+    registerMcpEndpoints(sdk as never, kv as never, undefined, "chatgpt-secret");
+    const handler = sdk.getFunction("mcp::remote")!;
+    const call = (id: number, method: string, params?: unknown) =>
+      handler(req({ jsonrpc: "2.0", id, method, params }, "chatgpt-secret"));
+
+    const initialized = await call(1, "initialize", { protocolVersion: "2026-07-28" });
+    expect(initialized.body.result.protocolVersion).toBe("2026-07-28");
+    expect(initialized.body.result.resultType).toBe("complete");
+    expect((await call(2, "server/discover")).body.result.resultType).toBe("complete");
+    expect((await call(3, "tools/list")).body.result.resultType).toBe("complete");
+    expect((await call(4, "ping")).body.result).toEqual({ resultType: "complete" });
+
+    const success = await call(5, "tools/call", { name: "memory_sessions", arguments: { limit: 1 } });
+    expect(success.body.result.resultType).toBe("complete");
+    expect(success.body.result.isError).toBeUndefined();
+    expect(JSON.parse(success.body.result.content[0].text).sessions).toHaveLength(1);
+
+    const notExposed = await call(6, "tools/call", { name: "memory_save", arguments: {} });
+    expect(notExposed.body.result).toMatchObject({ resultType: "complete", isError: true });
+
+    sdk.stub("mcp::tools::call", async () => ({ status_code: 500, body: { error: "boom" } }));
+    const failed = await call(7, "tools/call", { name: "memory_recall", arguments: { query: "x" } });
+    expect(failed.body.result).toMatchObject({ resultType: "complete", isError: true });
+    expect(failed.body.result.content[0].text).toBe("boom");
+
+    sdk.stub("mcp::tools::call", async () => ({
+      status_code: 200,
+      body: { resultType: "input_required", inputRequests: {} },
+    }));
+    const pending = await call(8, "tools/call", { name: "memory_recall", arguments: { query: "x" } });
+    expect(pending.body.result.resultType).toBe("input_required");
+  });
+
   it("rejects write tools before dispatching to the internal MCP surface", async () => {
     const sdk = mockSdk();
     registerMcpEndpoints(sdk as never, mockKv() as never, undefined, "chatgpt-secret");
