@@ -69,12 +69,13 @@ describe.runIf(process.env["AGENTMEMORY_LIVE_JEV_EVAL"] === "true")("live select
   const results: Array<Record<string, unknown>> = [];
   let judge: ContextJudge;
   let usage: unknown;
+  const model = process.env["TYPESAFE_MODEL"]?.trim() || "jev-preview";
 
   beforeAll(() => {
     const file = process.env["TYPESAFE_API_KEY_FILE"];
     const key = process.env["TYPESAFE_API_KEY"]?.trim() || (file ? readFileSync(file, "utf8").trim() : "");
     if (!key) throw new Error("Live eval requires TYPESAFE_API_KEY or TYPESAFE_API_KEY_FILE");
-    judge = createJevContextJudge(key, async (url, init) => {
+    judge = createJevContextJudge(key, model, async (url, init) => {
       const response = await fetch(url, init);
       usage = ((await response.clone().json()) as { usage?: unknown }).usage;
       return response;
@@ -84,7 +85,7 @@ describe.runIf(process.env["AGENTMEMORY_LIVE_JEV_EVAL"] === "true")("live select
   afterAll(() => {
     const reportPath = process.env["AGENTMEMORY_EVAL_REPORT"];
     if (reportPath) writeFileSync(reportPath, JSON.stringify({ at: new Date().toISOString(),
-      model: "jev-1.13.0", results }, null, 2), { mode: 0o600 });
+      model, results }, null, 2), { mode: 0o600 });
   });
 
   it.each(cases)("$name", async c => {

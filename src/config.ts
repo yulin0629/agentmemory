@@ -459,6 +459,7 @@ export function getSelectiveContextConfig(): {
   enabled: boolean;
   namespace?: string;
   apiKey?: string;
+  model: string;
   secret?: string;
 } {
   const env = getMergedEnv();
@@ -468,6 +469,8 @@ export function getSelectiveContextConfig(): {
     enabled: env["AGENTMEMORY_SELECTIVE_CONTEXT"] === "true",
     namespace,
     apiKey,
+    // Alias or pinned id (jev-x.y.z); jev-preview tracks the newest Jev release.
+    model: env["TYPESAFE_MODEL"]?.trim() || "jev-preview",
     secret: env["AGENTMEMORY_SELECTIVE_CONTEXT_SECRET"]?.trim() || undefined,
   };
 }
