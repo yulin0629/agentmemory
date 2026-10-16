@@ -1601,6 +1601,7 @@ Create `~/.agentmemory/.env`:
 # AGENTMEMORY_SELECTIVE_CONTEXT_SECRET=... # Optional dedicated credential for selective recall/capture; global secret takes precedence.
 # AGENTMEMORY_CONTEXT_NAMESPACE=personal # Fixed server namespace; callers cannot choose it per request.
 # TYPESAFE_API_KEY=...                  # Fast Jev judge key. Keep it out of source control.
+# TYPESAFE_MODEL=jev-preview           # Jev alias or pinned id (jev-x.y.z) for recall/capture judges.
 # AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=false # OFF by default. Ordinary recall waits at most 2s; explicit saves wait at most 5s for acknowledgement.
 # AGENTMEMORY_CONTEXT_PROJECT=shared-repo-alias # Optional CLIENT/hook environment setting for deliberately sharing one repo identity.
 # When enabled, the hook sends up to four recent dialogue messages (8,000 characters)

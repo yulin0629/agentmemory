@@ -176,6 +176,7 @@ export async function selectContext(
 
 export function createJevContextJudge(
   apiKey: string,
+  model: string,
   requestFetch: typeof fetch = fetch,
 ): ContextJudge {
   return async (request, candidates, signal) => {
@@ -202,7 +203,7 @@ export function createJevContextJudge(
     const response = await requestFetch("https://api.typesafe.ai/v1/systemone", {
       method: "POST", signal,
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "jev-1.13.0", state: {
+      body: JSON.stringify({ model, state: {
         current_prompt: request.prompt, previous: request.previous,
         candidates: slots.map(({ text }) => ({ text })),
       }, questions }),

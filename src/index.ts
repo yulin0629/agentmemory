@@ -333,8 +333,8 @@ async function main() {
   if (selectiveContext.enabled && selectiveContext.namespace && selectiveContext.apiKey) {
     registerSelectiveContextFunctions(sdk, kv, {
       namespace: selectiveContext.namespace,
-      judge: createJevContextJudge(selectiveContext.apiKey),
-      captureJudge: selectiveSecret ? createJevCaptureJudge(selectiveContext.apiKey) : undefined,
+      judge: createJevContextJudge(selectiveContext.apiKey, selectiveContext.model),
+      captureJudge: selectiveSecret ? createJevCaptureJudge(selectiveContext.apiKey, selectiveContext.model) : undefined,
     });
     bootLog(`Selective context: enabled for namespace ${selectiveContext.namespace}`);
   }
