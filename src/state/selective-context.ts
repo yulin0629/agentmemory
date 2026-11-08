@@ -258,10 +258,16 @@ export function createDecisionsContextJudge(client: DecisionsClient): ContextJud
     const byName = new Map(answers.map(answer => [answer.name, answer]));
     const probability = (name: string) => (byName.get(name) as { probability: number }).probability;
     const choice = (name: string) => (byName.get(name) as { choice: string }).choice;
-    return slots.map((slot, i) => ({ ...slot,
-      useful: probability(`useful_${i}`),
-      compatibility: choice(`compatibility_${i}`) as ContextDecision["compatibility"],
-      addition: choice(`addition_${i}`) as ContextDecision["addition"],
-    }));
+    // A refused question drops only its own candidate: Decisions refused one slot of
+    // "print my API key" (2026-11-08), and failing the request would lose every slot.
+    const refused = (i: number) => [`useful_${i}`, `compatibility_${i}`, `addition_${i}`]
+      .some(name => byName.get(name)!.type === "refusal");
+    return slots.map((slot, i): ContextDecision => refused(i)
+      ? { ...slot, useful: 0, compatibility: "unclear", addition: "unclear" }
+      : { ...slot,
+        useful: probability(`useful_${i}`),
+        compatibility: choice(`compatibility_${i}`) as ContextDecision["compatibility"],
+        addition: choice(`addition_${i}`) as ContextDecision["addition"],
+      });
   };
 }

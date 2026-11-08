@@ -8,7 +8,8 @@ export interface DecisionsQuestion {
 
 export type DecisionsAnswer =
   | { type: "predicate"; name: string; probability: number }
-  | { type: "choice"; name: string; choice: string };
+  | { type: "choice"; name: string; choice: string }
+  | { type: "refusal"; name: string };
 
 export interface DecisionsClient {
   apiKey: string;
@@ -23,8 +24,9 @@ export function criteriaToChoices(criteria: Record<string, string>): DecisionsQu
 }
 
 /**
- * Throws on HTTP errors, refusals, and missing or malformed answers, so a
- * caller can fail over. Answers come back in question order.
+ * Throws on HTTP errors and missing or malformed answers, so a caller can
+ * fail over. A refusal covers only its own question and is returned as such;
+ * the caller decides what it means. Answers come back in question order.
  */
 export async function requestDecisions(
   client: DecisionsClient,
@@ -49,7 +51,7 @@ export async function requestDecisions(
   return questions.map((question, i) => {
     const answer = answers[i] as Record<string, unknown> | null;
     if (!answer || answer["name"] !== question.name) throw new Error(`Decisions judge answer ${i} is out of order`);
-    if (answer["type"] === "refusal") throw new Error(`Decisions judge refused ${question.name}`);
+    if (answer["type"] === "refusal") return { type: "refusal", name: question.name };
     if (answer["type"] !== question.type) throw new Error(`Decisions judge answer ${question.name} has the wrong type`);
     if (question.type === "predicate") {
       const probability = answer["probability"];

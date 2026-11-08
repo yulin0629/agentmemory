@@ -54,6 +54,7 @@ export function createDecisionsCaptureJudge(client: DecisionsClient): CaptureJud
     const [answer] = await requestDecisions(client, { user_prompt: prompt, existing_project_rules: existingRules }, [{
       name: "disposition", type: "choice", instructions: CAPTURE_INSTRUCTIONS, choices: criteriaToChoices(CAPTURE_CRITERIA),
     }], signal);
+    if (answer!.type === "refusal") throw new Error("Decisions judge refused disposition");
     return (answer as { choice: string }).choice as CaptureDisposition;
   };
 }

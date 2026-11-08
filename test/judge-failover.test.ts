@@ -72,12 +72,21 @@ describe("Decisions context judge", () => {
     ]);
   });
 
-  it("throws on a refusal, a missing answer, an unknown choice, or an HTTP error", async () => {
+  it("drops only the candidate whose question was refused", async () => {
+    const { fn } = stubFetch({ [DECISIONS]: body => {
+      const r = decisionsContextAnswers(body); r.answers[2] = { type: "refusal", name: "addition_0" }; return json(r);
+    } });
+    const decisions = await createDecisionsContextJudge({ apiKey: "dk", model: "gpt-6-luna", baseUrl: "https://api.openai.com/v1", fetch: fn })(
+      request, candidates, signal());
+    expect(decisions.map(d => [d.spanId, d.useful, d.compatibility, d.addition])).toEqual([
+      ["s1", 0, "unclear", "unclear"], ["s2", 0.12, "compatible", "restates"],
+    ]);
+  });
+
+  it("throws on a missing answer, an unknown choice, or an HTTP error", async () => {
     const judge = (respond: (body: Record<string, any>) => Response) =>
       createDecisionsContextJudge({ apiKey: "dk", model: "gpt-6-luna", baseUrl: "https://api.openai.com/v1",
         fetch: stubFetch({ [DECISIONS]: respond }).fn })(request, candidates, signal());
-    await expect(judge(body => { const r = decisionsContextAnswers(body); r.answers[2] = { type: "refusal", name: "addition_0" }; return json(r); }))
-      .rejects.toThrow(/refused/);
     await expect(judge(body => { const r = decisionsContextAnswers(body); r.answers.pop(); return json(r); })).rejects.toThrow();
     await expect(judge(body => { const r = decisionsContextAnswers(body); r.answers[1].choice = "maybe"; return json(r); })).rejects.toThrow();
     await expect(judge(() => json({ error: {} }, 429))).rejects.toThrow(/429/);
