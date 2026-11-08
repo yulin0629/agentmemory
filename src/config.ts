@@ -460,17 +460,32 @@ export function getSelectiveContextConfig(): {
   namespace?: string;
   apiKey?: string;
   model: string;
+  decisionsApiKey?: string;
+  decisionsBaseUrl: string;
+  decisionsModel: string;
+  judgeOrder: string[];
+  hasJudge: boolean;
   secret?: string;
 } {
   const env = getMergedEnv();
   const namespace = env["AGENTMEMORY_CONTEXT_NAMESPACE"]?.trim() || undefined;
   const apiKey = env["TYPESAFE_API_KEY"]?.trim() || undefined;
+  const decisionsApiKey = env["OPENAI_DECISIONS_API_KEY"]?.trim() || undefined;
+  // Providers are tried in this order; ones without a key are skipped.
+  const judgeOrder = (env["AGENTMEMORY_JUDGE_ORDER"]?.trim() || "typesafe,decisions")
+    .split(",").map(name => name.trim().toLowerCase()).filter(Boolean);
   return {
     enabled: env["AGENTMEMORY_SELECTIVE_CONTEXT"] === "true",
     namespace,
     apiKey,
     // Alias or pinned id (jev-x.y.z); jev-preview tracks the newest Jev release.
     model: env["TYPESAFE_MODEL"]?.trim() || "jev-preview",
+    decisionsApiKey,
+    decisionsBaseUrl: env["OPENAI_DECISIONS_BASE_URL"]?.trim() || "https://api.openai.com/v1",
+    decisionsModel: env["OPENAI_DECISIONS_MODEL"]?.trim() || "gpt-6-luna",
+    judgeOrder,
+    hasJudge: (Boolean(apiKey) && judgeOrder.includes("typesafe"))
+      || (Boolean(decisionsApiKey) && judgeOrder.includes("decisions")),
     secret: env["AGENTMEMORY_SELECTIVE_CONTEXT_SECRET"]?.trim() || undefined,
   };
 }

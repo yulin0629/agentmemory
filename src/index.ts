@@ -85,8 +85,7 @@ import { registerVerifyFunction } from "./functions/verify.js";
 import { registerCascadeFunction } from "./functions/cascade.js";
 import { registerLessonsFunctions } from "./functions/lessons.js";
 import { registerSelectiveContextFunctions } from "./functions/selective-context.js";
-import { createJevContextJudge } from "./state/selective-context.js";
-import { createJevCaptureJudge } from "./state/explicit-memory.js";
+import { createFailoverCaptureJudge, createFailoverContextJudge } from "./state/judge-failover.js";
 import { registerObsidianExportFunction } from "./functions/obsidian-export.js";
 import { registerReflectFunctions } from "./functions/reflect.js";
 import { registerWorkingMemoryFunctions } from "./functions/working-memory.js";
@@ -245,7 +244,7 @@ async function main() {
 
   registerPrivacyFunction(sdk);
   registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession,
-    Boolean(selectiveSecret && selectiveContext.enabled && selectiveContext.namespace && selectiveContext.apiKey));
+    Boolean(selectiveSecret && selectiveContext.enabled && selectiveContext.namespace && selectiveContext.hasJudge));
   registerImageQuotaCleanup(sdk, kv);
   registerVisionSearchFunctions(sdk, kv, imageEmbeddingProvider);
   if (isSlotsEnabled()) {
@@ -333,11 +332,11 @@ async function main() {
   registerFacetsFunction(sdk, kv);
   registerVerifyFunction(sdk, kv);
   registerLessonsFunctions(sdk, kv);
-  if (selectiveContext.enabled && selectiveContext.namespace && selectiveContext.apiKey) {
+  if (selectiveContext.enabled && selectiveContext.namespace && selectiveContext.hasJudge) {
     registerSelectiveContextFunctions(sdk, kv, {
       namespace: selectiveContext.namespace,
-      judge: createJevContextJudge(selectiveContext.apiKey, selectiveContext.model),
-      captureJudge: selectiveSecret ? createJevCaptureJudge(selectiveContext.apiKey, selectiveContext.model) : undefined,
+      judge: createFailoverContextJudge(selectiveContext),
+      captureJudge: selectiveSecret ? createFailoverCaptureJudge(selectiveContext) : undefined,
     });
     bootLog(`Selective context: enabled for namespace ${selectiveContext.namespace}`);
   }

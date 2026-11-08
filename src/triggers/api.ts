@@ -134,7 +134,7 @@ function selectiveContextDisabledResponse(): Response {
   const missing = [
     !config.enabled ? "AGENTMEMORY_SELECTIVE_CONTEXT=true" : "",
     !config.namespace ? "AGENTMEMORY_CONTEXT_NAMESPACE" : "",
-    !config.apiKey ? "TYPESAFE_API_KEY" : "",
+    !config.hasJudge ? "TYPESAFE_API_KEY or OPENAI_DECISIONS_API_KEY" : "",
   ].filter(Boolean);
   return flagDisabledResponse({
     error: "Selective context is not configured",
@@ -3485,7 +3485,7 @@ export function registerApiTriggers(
     const denied = authorizeSelective(req);
     if (denied) return denied;
     if (!getSelectiveContextConfig().enabled || !getSelectiveContextConfig().namespace
-      || !getSelectiveContextConfig().apiKey) {
+      || !getSelectiveContextConfig().hasJudge) {
       return selectiveContextDisabledResponse();
     }
     const parsed = contextKnowledgePutSchema.safeParse(req.body);
@@ -3508,7 +3508,7 @@ export function registerApiTriggers(
     const denied = authorizeSelective(req);
     if (denied) return denied;
     if (!getSelectiveContextConfig().enabled || !getSelectiveContextConfig().namespace
-      || !getSelectiveContextConfig().apiKey) {
+      || !getSelectiveContextConfig().hasJudge) {
       return selectiveContextDisabledResponse();
     }
     const parsed = selectiveContextSchema.safeParse(req.body);
