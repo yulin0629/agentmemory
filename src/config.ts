@@ -461,6 +461,8 @@ export function getSelectiveContextConfig(): {
   apiKey?: string;
   model: string;
   decisionsApiKey?: string;
+  decisionsKeyFile?: string;
+  decisionsKeyState: string;
   decisionsBaseUrl: string;
   decisionsModel: string;
   judgeOrder: string[];
@@ -471,6 +473,8 @@ export function getSelectiveContextConfig(): {
   const namespace = env["AGENTMEMORY_CONTEXT_NAMESPACE"]?.trim() || undefined;
   const apiKey = env["TYPESAFE_API_KEY"]?.trim() || undefined;
   const decisionsApiKey = env["OPENAI_DECISIONS_API_KEY"]?.trim() || undefined;
+  // agent.env-style file of org keys (OPENAI_API_KEY[_LABEL]); rotates and takes precedence over the single key.
+  const decisionsKeyFile = env["OPENAI_DECISIONS_KEY_FILE"]?.trim() || undefined;
   // Providers are tried in this order; ones without a key are skipped.
   const judgeOrder = (env["AGENTMEMORY_JUDGE_ORDER"]?.trim() || "typesafe,decisions")
     .split(",").map(name => name.trim().toLowerCase()).filter(Boolean);
@@ -481,11 +485,15 @@ export function getSelectiveContextConfig(): {
     // Alias or pinned id (jev-x.y.z); jev-preview tracks the newest Jev release.
     model: env["TYPESAFE_MODEL"]?.trim() || "jev-preview",
     decisionsApiKey,
+    decisionsKeyFile,
+    // run.py's per-label bench state, read only.
+    decisionsKeyState: env["OPENAI_DECISIONS_KEY_STATE"]?.trim()
+      || join(homedir(), ".local", "state", "openai-api-access", "keys.json"),
     decisionsBaseUrl: env["OPENAI_DECISIONS_BASE_URL"]?.trim() || "https://api.openai.com/v1",
     decisionsModel: env["OPENAI_DECISIONS_MODEL"]?.trim() || "gpt-6-luna",
     judgeOrder,
     hasJudge: (Boolean(apiKey) && judgeOrder.includes("typesafe"))
-      || (Boolean(decisionsApiKey) && judgeOrder.includes("decisions")),
+      || (Boolean(decisionsApiKey || decisionsKeyFile) && judgeOrder.includes("decisions")),
     secret: env["AGENTMEMORY_SELECTIVE_CONTEXT_SECRET"]?.trim() || undefined,
   };
 }

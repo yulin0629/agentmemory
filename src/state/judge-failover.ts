@@ -2,11 +2,14 @@ import { logger } from "../logger.js";
 import { createDecisionsCaptureJudge, createJevCaptureJudge, type CaptureJudge } from "./explicit-memory.js";
 import { createDecisionsContextJudge, createJevContextJudge, type ContextJudge } from "./selective-context.js";
 import type { DecisionsClient } from "./decisions-api.js";
+import { sharedDecisionsKeyPool } from "./decisions-key-pool.js";
 
 export interface JudgeProviderConfig {
   apiKey?: string;
   model: string;
   decisionsApiKey?: string;
+  decisionsKeyFile?: string;
+  decisionsKeyState?: string;
   decisionsBaseUrl: string;
   decisionsModel: string;
   judgeOrder: string[];
@@ -22,9 +25,11 @@ function providers<J>(
   for (const name of new Set(config.judgeOrder)) {
     if (name === "typesafe" && config.apiKey) {
       result.push({ name, judge: build.typesafe(config.apiKey, config.model) });
-    } else if (name === "decisions" && config.decisionsApiKey) {
+    } else if (name === "decisions" && (config.decisionsKeyFile || config.decisionsApiKey)) {
       result.push({ name, judge: build.decisions({
         apiKey: config.decisionsApiKey, model: config.decisionsModel, baseUrl: config.decisionsBaseUrl,
+        keyPool: config.decisionsKeyFile
+          ? sharedDecisionsKeyPool(config.decisionsKeyFile, config.decisionsKeyState ?? "") : undefined,
       }) });
     } else if (name !== "typesafe" && name !== "decisions") {
       logger.warn("judge failover: unknown provider in AGENTMEMORY_JUDGE_ORDER", { provider: name });

@@ -1,4 +1,7 @@
 /** Minimal client for OpenAI's Decisions API (POST {base}/decisions). */
+import { logger } from "../logger.js";
+import { isKeyFailure, type DecisionsKeyPool } from "./decisions-key-pool.js";
+
 export interface DecisionsQuestion {
   name: string;
   type: "predicate" | "choice";
@@ -12,7 +15,9 @@ export type DecisionsAnswer =
   | { type: "refusal"; name: string };
 
 export interface DecisionsClient {
-  apiKey: string;
+  /** Single key; ignored when keyPool is set. */
+  apiKey?: string;
+  keyPool?: DecisionsKeyPool;
   model: string;
   baseUrl: string;
   fetch?: typeof fetch;
@@ -24,6 +29,8 @@ export function criteriaToChoices(criteria: Record<string, string>): DecisionsQu
 }
 
 /**
+ * With a key pool, a key that is refused or out of credit is cooled and the
+ * next key is tried within the same signal.
  * Throws on HTTP errors and missing or malformed answers, so a caller can
  * fail over. A refusal covers only its own question and is returned as such;
  * the caller decides what it means. Answers come back in question order.
@@ -34,15 +41,24 @@ export async function requestDecisions(
   questions: DecisionsQuestion[],
   signal: AbortSignal,
 ): Promise<DecisionsAnswer[]> {
-  const response = await (client.fetch ?? fetch)(`${client.baseUrl.replace(/\/+$/, "")}/decisions`, {
-    method: "POST", signal,
-    headers: { Authorization: `Bearer ${client.apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: client.model,
-      input: [{ role: "user", content: [{ type: "input_json", data }] }],
-      questions,
-    }),
+  const body = JSON.stringify({
+    model: client.model,
+    input: [{ role: "user", content: [{ type: "input_json", data }] }],
+    questions,
   });
+  const keys = client.keyPool ? client.keyPool.order() : [client.apiKey ?? ""];
+  let response!: Response;
+  for (const [index, key] of keys.entries()) {
+    response = await (client.fetch ?? fetch)(`${client.baseUrl.replace(/\/+$/, "")}/decisions`, {
+      method: "POST", signal,
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body,
+    });
+    if (response.ok || !client.keyPool || index === keys.length - 1) break;
+    if (!isKeyFailure(response.status, await response.clone().text())) break;
+    client.keyPool.cool(key);
+    logger.warn("Decisions key refused or out of credit; trying the next org key", { status: response.status });
+  }
   if (!response.ok) throw new Error(`Decisions judge HTTP ${response.status}`);
   const { answers } = await response.json() as { answers?: unknown };
   if (!Array.isArray(answers) || answers.length !== questions.length) {
