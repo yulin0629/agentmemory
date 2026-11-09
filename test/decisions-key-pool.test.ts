@@ -37,8 +37,17 @@ describe("Decisions org key pool", () => {
     await expect(judge(key => key === "sk-a" ? noCredit() : ok())).resolves.toBe("task_only");
     expect(used).toEqual(["sk-a", "sk-b"]);
     used.length = 0;
-    await judge(() => ok()); await judge(() => ok());
+    // Three calls over three keys would reach sk-a by round-robin alone, so its absence proves the cooldown.
+    await judge(() => ok()); await judge(() => ok()); await judge(() => ok());
     expect(used).not.toContain("sk-a");
+  });
+
+  it("moves to the next org key when one is refused (401 or 403)", async () => {
+    for (const status of [401, 403]) {
+      const { judge, used } = setup(ENV);
+      await expect(judge(key => key === "sk-a" ? new Response("{}", { status }) : ok())).resolves.toBe("task_only");
+      expect(used).toEqual(["sk-a", "sk-b"]);
+    }
   });
 
   it("does not switch keys on a plain rate limit or a server error", async () => {

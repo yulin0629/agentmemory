@@ -9,7 +9,7 @@ npx tsx scripts/judge-eval/run.mts /path/to/outdir   # copy dataset.json there f
 python3 scripts/judge-eval/analyze.py /path/to/outdir
 ```
 
-Keys come from `~/.agentmemory/.env` (TYPESAFE_API_KEY, OPENAI_DECISIONS_API_KEY).
+Keys come from `~/.agentmemory/.env` (TYPESAFE_API_KEY, and OPENAI_DECISIONS_KEY_FILE or OPENAI_DECISIONS_API_KEY).
 One run is 50 TypeSafe calls and 50 Decisions calls (about USD 0.02 for Decisions).
 Labels: `[prompt, previous, must, ok]`; lesson 3 (reply language) is allowed everywhere
 except the case that asks for English.
