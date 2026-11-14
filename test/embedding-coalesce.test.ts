@@ -78,6 +78,25 @@ describe("embedding coalescer", () => {
     expect(save).toHaveBeenCalledTimes(1);
   });
 
+  it("does not wait for batches that start after the flush was requested", async () => {
+    const finishes: Array<(vectors: Float32Array[]) => void> = [];
+    embedBatch.mockImplementation(() => new Promise((resolve) => { finishes.push(resolve); }));
+    const save = vi.fn().mockResolvedValue(undefined);
+    search.setIndexPersistence({ save, scheduleSave: vi.fn() });
+    const first = search.vectorIndexAddGuarded("a", "s", "one", context);
+    await vi.advanceTimersByTimeAsync(1200);
+    const flushing = search.flushIndexSave();
+    const later = search.vectorIndexAddGuarded("b", "s", "two", context);
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(finishes).toHaveLength(2);
+    finishes[0]!([new Float32Array([1, 0])]);
+    await flushing;
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(await first).toBe(true);
+    finishes[1]!([new Float32Array([0, 1])]);
+    expect(await later).toBe(true);
+  });
+
   it("does not restore an entry deleted before the batch starts", async () => {
     embedBatch.mockResolvedValue([new Float32Array([1, 0])]);
     const pending = search.vectorIndexAddGuarded("a", "s", "one", context);

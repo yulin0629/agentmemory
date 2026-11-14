@@ -143,7 +143,7 @@ async function main() {
     else post(OBSERVE_TIMEOUT_MS).catch(() => {});
   }
 
-  if (SELECTIVE_CONTEXT_INJECT && prompt.trim()) {
+  if (SELECTIVE_CONTEXT_INJECT && prompt.trim() && process.env.AGENTMEMORY_PROMPT_CAPTURE_ONLY !== "1") {
     const started = performance.now();
     try {
       const response = await fetch(`${REST_URL}/agentmemory/selective-context`, {

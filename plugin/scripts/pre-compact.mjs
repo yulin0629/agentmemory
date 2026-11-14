@@ -81,9 +81,6 @@ function readStoredSecret(env = process.env) {
 	const legacyPaths = legacyDataDirSecretPaths(env);
 	return readSecretFile(canonicalPath) || (localPath === canonicalPath ? "" : readSecretFile(localPath)) || legacyPaths.map(readSecretFile).find(Boolean) || "";
 }
-function explicitSecret(env = process.env) {
-	return usable(env[SECRET_KEY]) || readEnvFileSecret();
-}
 function isLoopbackUrl(url) {
 	let hostname;
 	try {
@@ -206,7 +203,7 @@ function selectiveSettings() {
 	return {
 		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
 		url,
-		secret: explicitSecret() || local?.secret || resolveClientSecret(url),
+		secret: process.env.AGENTMEMORY_SECRET || local?.secret || resolveClientSecret(url),
 		selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
 		owner: local?.owner
 	};

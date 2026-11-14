@@ -11,6 +11,7 @@ import { deleteAccessLog } from "./access-tracker.js";
 import { deleteFacetsForTargets } from "./facets.js";
 import { recordAudit } from "./audit.js";
 import { getSearchIndex, getVectorIndex, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { requestSummaryRefresh } from "./summary-state.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 
@@ -398,7 +399,11 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           // gone leaves the summary alone.
           if (deletedObservationIds.length === before) return 0;
           await kv.delete(KV.summaries, sessionId);
-          return (await kv.list(KV.observations(sessionId))).length;
+          const left = (await kv.list(KV.observations(sessionId))).length;
+          // Durable record first, so summary recovery retries the rebuild below
+          // if it fails.
+          if (left > 0) await requestSummaryRefresh(kv, sessionId);
+          return left;
         }));
         // Outside the locks: summarize takes obs-write:<sid> to write, and
         // mocked SDKs run triggers inline.

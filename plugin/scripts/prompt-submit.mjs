@@ -276,9 +276,6 @@ function readStoredSecret(env = process.env) {
 	const legacyPaths = legacyDataDirSecretPaths(env);
 	return readSecretFile(canonicalPath) || (localPath === canonicalPath ? "" : readSecretFile(localPath)) || legacyPaths.map(readSecretFile).find(Boolean) || "";
 }
-function explicitSecret(env = process.env) {
-	return usable(env[SECRET_KEY]) || readEnvFileSecret();
-}
 function isLoopbackUrl(url) {
 	let hostname;
 	try {
@@ -310,7 +307,7 @@ function selectiveSettings() {
 	return {
 		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
 		url,
-		secret: explicitSecret() || local?.secret || resolveClientSecret(url),
+		secret: process.env.AGENTMEMORY_SECRET || local?.secret || resolveClientSecret(url),
 		selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
 		owner: local?.owner
 	};
@@ -414,7 +411,7 @@ async function main() {
 	}
 	if (!SHARED_CLIENT || isRememberRequest(prompt)) if (DURABLE_CAPTURE) captureObservation(withEventId(body, data), OBSERVE_TIMEOUT_MS);
 	else post(OBSERVE_TIMEOUT_MS).catch(() => {});
-	if (SELECTIVE_CONTEXT_INJECT && prompt.trim()) {
+	if (SELECTIVE_CONTEXT_INJECT && prompt.trim() && process.env.AGENTMEMORY_PROMPT_CAPTURE_ONLY !== "1") {
 		const started = performance.now();
 		try {
 			const response = await fetch(`${REST_URL$1}/agentmemory/selective-context`, {

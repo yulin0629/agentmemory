@@ -58,10 +58,12 @@ export async function restoreIndexEntries(obs: CompressedObservation): Promise<v
   }
   const vectors = getVectorIndex();
   if (vectors && !vectors.has(obs.id)) {
-    await vectorIndexAddGuarded(obs.id, obs.sessionId, observationEmbedText(obs), {
+    // Not awaited: the coalescing window would hold callers (and the obs: lock)
+    // for up to EMBED_COALESCE_MS. The add's revision guard rejects a stale write.
+    void Promise.resolve(vectorIndexAddGuarded(obs.id, obs.sessionId, observationEmbedText(obs), {
       kind: "synthetic",
       logId: obs.id,
-    });
+    })).catch(() => {});
   }
 }
 

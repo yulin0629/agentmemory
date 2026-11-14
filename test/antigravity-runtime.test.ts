@@ -149,4 +149,47 @@ describe("bundled Antigravity bridge", () => {
     const prompts = posts.filter((p) => p.body.hookType === "prompt_submit");
     expect(prompts.map((p) => p.body.data.prompt)).toEqual(["記住：回歸測試命令是 npm test。"]);
   }, 30_000);
+
+  it("submits each user turn once across the model calls that re-read it", async () => {
+    root = mkdtempSync(join(tmpdir(), "am-agy-once-"));
+    const plugin = join(root, "plugin");
+    symlinkSync(resolve(__dirname, "../plugin"), plugin, process.platform === "win32" ? "junction" : "dir");
+    const posts: Array<{ path: string; body: any }> = [];
+    server = createServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      posts.push({ path: req.url!, body: JSON.parse(raw || "{}") });
+      res.setHeader("content-type", "application/json");
+      res.end("{}");
+    });
+    await new Promise<void>((done) => server!.listen(0, "127.0.0.1", done));
+    const port = (server.address() as { port: number }).port;
+    mkdirSync(join(root, "ag-once"));
+    const transcriptPath = join(root, "ag-once", "transcript.jsonl");
+    const turn = (text: string) => JSON.stringify({ type: "USER_INPUT", source: "USER_EXPLICIT", content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>` });
+    const reply = JSON.stringify({ type: "PLANNER_RESPONSE", source: "MODEL", content: "ok" });
+    const invoke = async (invocationNum: number) => {
+      const child = exec(process.execPath, [join(plugin, "scripts/antigravity-bridge.mjs"), "PreInvocation"], {
+        env: {
+          ...process.env,
+          AGENTMEMORY_URL: `http://127.0.0.1:${port}`,
+          AGENTMEMORY_DATA_DIR: join(root, "capture"),
+          AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true",
+        },
+        timeout: 15_000,
+      });
+      child.child.stdin!.end(JSON.stringify({ conversationId: "ag-once", workspacePaths: [root], transcriptPath, invocationNum }));
+      await child;
+    };
+    writeFileSync(transcriptPath, `${turn("same words")}\n`);
+    await invoke(0);
+    writeFileSync(transcriptPath, `${turn("same words")}\n${reply}\n`);
+    await invoke(1);
+    writeFileSync(transcriptPath, `${turn("same words")}\n${reply}\n${turn("same words")}\n`);
+    await invoke(2);
+    await invoke(3);
+    const prompts = posts.filter((p) => p.body.hookType === "prompt_submit");
+    expect(prompts.map((p) => p.body.data.prompt)).toEqual(["same words", "same words"]);
+    expect(posts.filter((p) => p.path.endsWith("/selective-context"))).toHaveLength(0);
+  }, 30_000);
 });

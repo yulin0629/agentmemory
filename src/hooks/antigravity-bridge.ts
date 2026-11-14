@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openSync, closeSync, fstatSync, readSync } from "node:fs";
+import { resolveDataDir } from "../cli-data-dir.js";
 
 // Antigravity CLI (`agy`) bridge — sits in front of the canonical hooks
 // because three parts of agy's contract make them unusable as direct
@@ -17,6 +19,9 @@ import { openSync, closeSync, fstatSync, readSync } from "node:fs";
 // Sources: antigravity.google/docs/hooks, antigravity.google/docs/cli/using
 
 const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
+
+// Set by normalizePayload when the transcript yields the latest explicit user turn.
+let promptStepKey: string | undefined;
 
 // Antigravity inherits Cascade-style tool names. Map them onto the tool
 // vocabulary pre-tool-use.ts / post-tool-use.ts already understand so the
@@ -108,16 +113,23 @@ export function normalizePayload(event: string, raw: Json): Json {
       fd = openSync(transcriptPath, "r");
       const size = fstatSync(fd).size;
       const buffer = Buffer.alloc(Math.min(size, 65536));
-      readSync(fd, buffer, 0, buffer.length, size - buffer.length);
-      const lines = buffer.toString("utf8").split("\n");
-      if (size > buffer.length) lines.shift();
-      for (const line of lines.reverse()) {
+      const base = size - buffer.length;
+      readSync(fd, buffer, 0, buffer.length, base);
+      let end = buffer.length;
+      while (end > 0) {
+        const newline = buffer.lastIndexOf(0x0a, end - 1);
+        if (newline < 0 && base > 0) break;
+        const line = buffer.toString("utf8", newline + 1, end);
+        end = Math.max(newline, 0);
         if (!line.trim()) continue;
         const step = JSON.parse(line);
         // Same rule as session-end's transcript backfill.
         if (step.type === "USER_INPUT" && step.source === "USER_EXPLICIT" && typeof step.content === "string") {
           const match = step.content.match(/<USER_REQUEST>\n?([\s\S]*?)\n?<\/USER_REQUEST>/);
           out["prompt"] = (match ? match[1] : step.content).trim();
+          // The transcript only grows, so the step's byte offset names this turn
+          // across the model calls that re-read it.
+          promptStepKey = `${sessionId}:${base + newline + 1}`;
           break;
         }
       }
@@ -204,10 +216,14 @@ async function main() {
   const payload = JSON.stringify(normalized);
   let context = "";
   const targets = targetsFor(event, raw);
-  // Fork addition: when the transcript yields the latest user turn, run
-  // prompt-submit so an explicit save (記住：) is captured during the turn.
-  // The server deduplicates repeats across invocations.
-  if (event === "PreInvocation" && typeof normalized["prompt"] === "string" && normalized["prompt"].trim()) {
+  // Fork addition: when the transcript yields a user turn not yet submitted,
+  // run prompt-submit so an explicit save (記住：) is captured during the turn.
+  // PreInvocation fires on every model call, and the server does not dedup
+  // these posts, so each turn is submitted once.
+  const turnMarker = promptStepKey ? join(resolveDataDir({ args: [], env: process.env }).dataDir,
+    "antigravity-turns", createHash("sha256").update(String(normalized["session_id"])).digest("hex").slice(0, 32)) : "";
+  if (event === "PreInvocation" && typeof normalized["prompt"] === "string" && normalized["prompt"].trim()
+    && turnMarker && readMarker(turnMarker) !== promptStepKey) {
     targets.push("prompt-submit.mjs");
   }
 
@@ -220,12 +236,29 @@ async function main() {
       encoding: "utf8",
       timeout: 6500,
       stdio: ["pipe", "pipe", "ignore"],
+      // The bridge injects only session-start's context, so prompt-submit
+      // skips the selective-context call whose output would be discarded.
+      ...(script === "prompt-submit.mjs" ? { env: { ...process.env, AGENTMEMORY_PROMPT_CAPTURE_ONLY: "1" } } : {}),
     });
     if (event === "PreInvocation" && script === "session-start.mjs" && child.status === 0) {
       context = child.stdout?.trim() ?? "";
     }
+    if (script === "prompt-submit.mjs" && child.status === 0) writeMarker(turnMarker, promptStepKey!);
   }
   return context;
+}
+
+function readMarker(path: string): string {
+  try { return readFileSync(path, "utf8"); } catch { return ""; }
+}
+
+function writeMarker(path: string, value: string): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const staging = `${path}.${process.pid}.tmp`;
+    writeFileSync(staging, value, { mode: 0o600 });
+    renameSync(staging, path);
+  } catch { /* A lost marker only repeats one submission. */ }
 }
 
 // Guarded so the pure helpers above stay importable from tests without the

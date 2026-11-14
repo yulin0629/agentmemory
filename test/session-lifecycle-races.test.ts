@@ -394,4 +394,66 @@ describe("session lifecycle races", () => {
     expect(await kv.list(KV.observations(SID))).toEqual([]);
     expect(await kv.get(KV.summaries, SID)).toBeNull();
   });
+
+  it("a summarize that outlives its timeout does not overwrite a newer summary", async () => {
+    vi.stubEnv("AGENTMEMORY_SUMMARY_TIMEOUT_MS", "30");
+    try {
+      const sdk = mockSdk();
+      const kv = mockKV();
+      const slow = gate();
+      let call = 0;
+      const provider: MemoryProvider = {
+        name: "mock",
+        compress: async () => "",
+        summarize: async () => {
+          call += 1;
+          if (call === 1) {
+            slow.entered();
+            await slow.opened;
+            return summaryXml("turn 1 only");
+          }
+          return summaryXml("turns 1 and 2");
+        },
+      };
+      registerSummarizeFunction(sdk as never, kv as never, provider);
+      await seedSession(kv);
+      await kv.set(KV.observations(SID), "obs_1", compressedObs(1));
+      const first = sdk.trigger("mem::summarize", { sessionId: SID });
+      await slow.reached;
+      await first;
+      await kv.set(KV.observations(SID), "obs_2", compressedObs(2));
+      await sdk.trigger("mem::summarize", { sessionId: SID });
+      slow.open();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(await kv.get(KV.summaries, SID)).toMatchObject({ title: "turns 1 and 2", observationCount: 2 });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("a partial forget leaves a durable summary repair when the rebuild fails", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    let fail = false;
+    const provider: MemoryProvider = {
+      name: "mock",
+      compress: async () => "",
+      summarize: async () => {
+        if (fail) throw new Error("provider down");
+        return summaryXml("both turns");
+      },
+    };
+    registerSummarizeFunction(sdk as never, kv as never, provider);
+    registerRememberFunction(sdk as never, kv as never);
+    await seedSession(kv);
+    await kv.set(KV.observations(SID), "obs_1", compressedObs(1));
+    await kv.set(KV.observations(SID), "obs_2", compressedObs(2));
+    await sdk.trigger("mem::summarize", { sessionId: SID });
+    expect(await kv.get(KV.summaries, SID)).toMatchObject({ title: "both turns" });
+    fail = true;
+    await sdk.trigger("mem::forget", { sessionId: SID, observationIds: ["obs_2"] });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(await kv.get(KV.summaries, SID)).toBeNull();
+    expect(await kv.get(KV.summaryRepairs, SID)).toMatchObject({ sessionId: SID, attempts: 0 });
+  });
 });

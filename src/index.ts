@@ -61,6 +61,7 @@ import {
   setHybridRanker,
   setPendingVectorBackfillCount,
   setVectorBackfillState,
+  flushIndexSave,
 } from "./functions/search.js";
 import { registerContextFunction } from "./functions/context.js";
 import { registerSessionIndexMaintenanceFunction } from "./functions/session-index-maintenance.js";
@@ -843,8 +844,9 @@ async function main() {
     );
     viewerServer.closeAllConnections();
     await viewerClosed;
+    // flushIndexSave also embeds adds still waiting in the coalescing window.
     const flushed = await settleWithin(
-      indexPersistence.save(),
+      flushIndexSave(),
       SHUTDOWN_FLUSH_TIMEOUT_MS,
     );
     if (!flushed) {

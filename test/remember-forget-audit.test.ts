@@ -6,6 +6,7 @@ vi.mock("../src/logger.js", () => ({
 
 vi.mock("../src/state/keyed-mutex.js", () => ({
   withKeyedLock: <T>(_key: string, fn: () => Promise<T>) => fn(),
+  isKeyedLockHeld: () => false,
 }));
 
 const decrementImageRef = vi.fn(async () => {});

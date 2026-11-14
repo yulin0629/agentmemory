@@ -188,8 +188,11 @@ export function scheduleIndexSave(): void {
 // flush as a fatal error on the delete itself (the KV delete already
 // committed before this is invoked).
 export async function flushIndexSave(): Promise<void> {
+  // Batches started after this call are not awaited: under steady traffic that
+  // wait would never end, and their late adds are saved by their own schedule.
+  const running = [...inFlightEmbeds]
   await flushPendingEmbeds()
-  while (inFlightEmbeds.size > 0) await Promise.all([...inFlightEmbeds])
+  await Promise.all(running)
   await indexPersistence?.save();
 }
 
