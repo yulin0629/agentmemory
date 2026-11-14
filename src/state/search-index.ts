@@ -4,6 +4,11 @@ import { stem } from "./stemmer.js";
 import { getSynonyms } from "./synonyms.js";
 import { segmentCjk, hasCjk } from "./cjk-segmenter.js";
 
+const MIN_PREFIX_TERM_LENGTH = 3;
+const COMMON_TERM_DOC_RATIO = 0.5;
+const COMMON_TERM_MIN_DOCS = 1000;
+const MAX_QUERY_TERMS = 32;
+
 interface IndexEntry {
   obsId: string;
   sessionId: string;
@@ -204,7 +209,7 @@ export class SearchIndex {
     const scores = new Map<string, number>();
     const sorted = this.getSortedTerms();
 
-    for (const { term, weight } of queryTerms) {
+    for (const { term, weight } of this.costBoundedTerms(queryTerms, N)) {
       const matchingDocs = this.invertedIndex.get(term);
       if (matchingDocs) {
         const df = matchingDocs.size;
@@ -227,7 +232,8 @@ export class SearchIndex {
       }
 
       const prefixScores = new Map<string, number>();
-      const startIdx = this.lowerBound(sorted, term);
+      const expandPrefix = hasCjk(term) || Array.from(term).length >= MIN_PREFIX_TERM_LENGTH;
+      const startIdx = expandPrefix ? this.lowerBound(sorted, term) : sorted.length;
       for (let si = startIdx; si < sorted.length; si++) {
         const indexTerm = sorted[si];
         if (!indexTerm.startsWith(term)) break;
@@ -264,6 +270,27 @@ export class SearchIndex {
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
+  }
+
+  // Each term walks its whole posting list synchronously, so a pasted prompt
+  // (a Hermes cron job sends ~1.8k chars) held the event loop for 15-35 s.
+  // In an index of COMMON_TERM_MIN_DOCS or more, terms in more than half of
+  // all documents add an idf below ln 2 and are dropped while another term
+  // still matches; a long query keeps its rarest terms.
+  private costBoundedTerms(
+    queryTerms: Array<{ term: string; weight: number }>,
+    docCount: number,
+  ): Array<{ term: string; weight: number }> {
+    const ranked = queryTerms.map((q, order) => ({ ...q, order, df: this.invertedIndex.get(q.term)?.size ?? 0 }));
+    const informative = docCount >= COMMON_TERM_MIN_DOCS
+      ? ranked.filter((q) => q.df <= docCount * COMMON_TERM_DOC_RATIO)
+      : ranked;
+    const pool = informative.some((q) => q.df > 0) ? informative : ranked;
+    if (pool.length <= MAX_QUERY_TERMS) return pool;
+    return [...pool]
+      .sort((a, b) => a.df - b.df || a.order - b.order)
+      .slice(0, MAX_QUERY_TERMS)
+      .sort((a, b) => a.order - b.order);
   }
 
   get size(): number {

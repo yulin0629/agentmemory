@@ -55,6 +55,49 @@ describe("SearchIndex", () => {
     expect(index.search("database")).toEqual([]);
   });
 
+  describe("query cost", () => {
+    const bare = { title: "", subtitle: "", concepts: [], facts: [], files: [] };
+    const common = Array.from({ length: 60 }, (_, i) => `common${String.fromCharCode(97 + (i % 26))}${Math.floor(i / 26)}`);
+
+    it("answers a pasted prompt full of common words quickly and still finds its rare word", () => {
+      for (let i = 0; i < 5000; i++) {
+        index.add(makeObs({ ...bare, id: `obs_${i}`, narrative: `${common.join(" ")} unique${i} co${i}` }));
+      }
+      index.add(makeObs({ ...bare, id: "target", narrative: `${common.join(" ")} zebra` }));
+      const query = `${common.join(" ")} co to ${common.join(" ")} zebra`;
+      index.search("warm", 1);
+
+      const started = performance.now();
+      const results = index.search(query, 5);
+      const elapsed = performance.now() - started;
+
+      expect(results[0].obsId).toBe("target");
+      expect(elapsed).toBeLessThan(100);
+    });
+
+    it("keeps the rarest terms of a query longer than the term limit", () => {
+      const fillers = Array.from({ length: 40 }, (_, i) => `filler${String.fromCharCode(97 + (i % 26))}${Math.floor(i / 26)}`);
+      for (let i = 0; i < 3; i++) {
+        index.add(makeObs({ ...bare, id: `filler_${i}`, narrative: fillers.join(" ") }));
+      }
+      index.add(makeObs({ ...bare, id: "target", narrative: "quokka" }));
+
+      const ids = index.search(`${fillers.join(" ")} quokka`, 10).map((r) => r.obsId);
+
+      expect(ids).toContain("target");
+    });
+
+    it("matches a two-letter term only as a whole word", () => {
+      index.add(makeObs({ ...bare, id: "word", narrative: "re run the job" }));
+      index.add(makeObs({ ...bare, id: "prefixed", narrative: "redis restart" }));
+
+      const ids = index.search("re").map((r) => r.obsId);
+
+      expect(ids).toEqual(["word"]);
+      expect(index.search("red").map((r) => r.obsId)).toEqual(["prefixed"]);
+    });
+  });
+
   it("scores exact matches higher than prefix matches", () => {
     index.add(
       makeObs({
