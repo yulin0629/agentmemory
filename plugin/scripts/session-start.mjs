@@ -1,8 +1,75 @@
 #!/usr/bin/env node
-import { execSync } from "node:child_process";
-import { basename, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { basename, join } from "node:path";
+import { execSync } from "node:child_process";
+//#region src/secret-store.ts
+const SECRET_KEY = "AGENTMEMORY_SECRET";
+function agentmemoryHomeDir() {
+	return join(homedir(), ".agentmemory");
+}
+function secretFilePath() {
+	return join(agentmemoryHomeDir(), "secret");
+}
+function usable(value) {
+	if (typeof value !== "string") return "";
+	const trimmed = value.trim();
+	if (!trimmed) return "";
+	if (trimmed.startsWith("${") && trimmed.endsWith("}")) return "";
+	return trimmed;
+}
+function unquote(value) {
+	const quote = value[0];
+	if ((quote === "\"" || quote === "'") && value.length > 1) {
+		const close = value.indexOf(quote, 1);
+		if (close !== -1) return value.slice(1, close);
+	}
+	const hash = value.indexOf(" #");
+	return hash === -1 ? value : value.slice(0, hash).trim();
+}
+function readEnvFileSecret() {
+	let content;
+	try {
+		content = readFileSync(join(agentmemoryHomeDir(), ".env"), "utf-8");
+	} catch {
+		return "";
+	}
+	if (typeof content !== "string") return "";
+	let found = "";
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		if (trimmed.startsWith("#")) continue;
+		const eq = trimmed.indexOf("=");
+		if (eq === -1) continue;
+		if (trimmed.slice(0, eq).replace(/^export\s+/, "").trim() !== SECRET_KEY) continue;
+		found = usable(unquote(trimmed.slice(eq + 1).trim()));
+	}
+	return found;
+}
+function readStoredSecret() {
+	try {
+		return usable(readFileSync(secretFilePath(), "utf-8"));
+	} catch {
+		return "";
+	}
+}
+function isLoopbackUrl(url) {
+	let hostname;
+	try {
+		hostname = new URL(url).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	const bare = hostname.replace(/^\[|\]$/g, "");
+	return bare === "localhost" || bare === "::1" || /^127(?:\.\d{1,3}){3}$/.test(bare);
+}
+function resolveClientSecret(baseUrl, env = process.env) {
+	const fromEnv = usable(env[SECRET_KEY]);
+	if (fromEnv) return fromEnv;
+	if (!isLoopbackUrl(baseUrl)) return "";
+	return readEnvFileSecret() || readStoredSecret();
+}
+//#endregion
 //#region src/hooks/_project.ts
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
@@ -39,10 +106,11 @@ function selectiveSettings() {
 	try {
 		local = JSON.parse(readFileSync(join(homedir(), ".config", "agentmemory", "selective-context.json"), "utf8"));
 	} catch {}
+	const url = process.env.AGENTMEMORY_URL || local?.url || "http://localhost:3111";
 	return {
 		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
-		url: process.env.AGENTMEMORY_URL || local?.url || "http://localhost:3111",
-		secret: process.env.AGENTMEMORY_SECRET || local?.secret || "",
+		url,
+		secret: process.env.AGENTMEMORY_SECRET || local?.secret || resolveClientSecret(url),
 		selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
 		owner: local?.owner
 	};
@@ -60,7 +128,7 @@ function isSdkChildContext(payload) {
 }
 const INJECT_CONTEXT = process.env["AGENTMEMORY_INJECT_CONTEXT"] === "true" && !sharedSelectiveRecall();
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
+const SECRET = resolveClientSecret(REST_URL);
 const INJECT_TIMEOUT_MS = 1500;
 const REGISTER_TIMEOUT_MS = 800;
 function authHeaders() {
@@ -68,9 +136,17 @@ function authHeaders() {
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
 	return h;
 }
+function isPlainTextHost() {
+	return Boolean(process.env["FACTORY_PROJECT_DIR"] || process.env["DROID_PLUGIN_ROOT"]);
+}
+function wantsStructuredOutput(data) {
+	if (process.env["DEVIN_PROJECT_DIR"] || data.prompt_id !== void 0) return true;
+	return data.hook_event_name === "SessionStart" && !isPlainTextHost();
+}
 function contextPayload(data, context) {
+	if (process.env["COPILOT_PLUGIN_ROOT"] && !data.hook_event_name) return JSON.stringify({ additionalContext: context });
 	if (typeof data.cursor_version === "string" || data.hook_event_name === "sessionStart") return JSON.stringify({ additional_context: context });
-	if (process.env["DEVIN_PROJECT_DIR"] || data.prompt_id !== void 0 || data.hook_event_name === "SessionStart") return JSON.stringify({ hookSpecificOutput: {
+	if (wantsStructuredOutput(data)) return JSON.stringify({ hookSpecificOutput: {
 		hookEventName: "SessionStart",
 		additionalContext: context
 	} });

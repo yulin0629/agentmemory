@@ -44,7 +44,7 @@ describe("IndexPersistence save throttling", () => {
     vi.useRealTimers();
   });
 
-  it("saves at most once per interval however often changes are scheduled", async () => {
+  it("checkpoints the first burst early, then saves at most once per interval", async () => {
     const vector = new VectorIndex();
     const persistence = new IndexPersistence(kv as never, vector, { saveIntervalMs: 60_000, bucketSize: 16 });
 
@@ -52,7 +52,7 @@ describe("IndexPersistence save throttling", () => {
       touch(vector, `obs_${i}`);
       persistence.scheduleSave();
     }
-    await vi.advanceTimersByTimeAsync(59_000);
+    await vi.advanceTimersByTimeAsync(4_000);
     expect(metaSaves(kv)).toBe(0);
 
     await vi.advanceTimersByTimeAsync(1_000);
@@ -91,6 +91,7 @@ describe("IndexPersistence save throttling", () => {
     const slowKv = {
       ...kv,
       set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === "mem:index:vec-pending") return kv.set(scope, key, data);
         inFlight++;
         maxInFlight = Math.max(maxInFlight, inFlight);
         if (gate) await gate;

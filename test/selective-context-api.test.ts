@@ -15,6 +15,9 @@ function setup(secret = "test-secret") {
     if (input.function_id === "mem::context-knowledge-put") {
       return { success: true, action: "saved", revision: 1 };
     }
+    if (input.function_id === "mem::capture") {
+      return { status: "accepted", state: "completed", eventId: "evs_test", observationId: "obs_test", attempts: 1 };
+    }
     return { status: "empty", spans: [], catalogRevision: 1 };
   });
   const sdk = {

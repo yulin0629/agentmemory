@@ -377,7 +377,7 @@ describe("selective context", () => {
     expect(await sdk.trigger("mem::context-knowledge-put", input)).toMatchObject({
       success: true, action: "replayed", revision: 1,
     });
-    expect(await kv.list(KV.audit)).toMatchObject([{
+    expect(await kv.list(KV.auditMonth(new Date().toISOString().slice(0, 7)))).toMatchObject([{
       operation: "context_knowledge_put",
       targetIds: ["knowledge-ascii-diagrams"],
       details: { evidenceEventId: "evt-user-1", knowledgeRevision: "rev-1" },

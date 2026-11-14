@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { createHash } from "node:crypto";
+import { REST_URL, authHeaders, captureObservation, isDrainChild, runDrainChild, withEventId } from "./_capture.mjs";
 //#region src/hooks/_project.ts
 /** Selective memory identity is separate from legacy human-readable project labels. */
 function resolveContextProjectId(cwd) {
@@ -96,8 +97,12 @@ const SECRET_PATTERN_SOURCES = [
 	/glpat-[A-Za-z0-9\-_]{20,}/g,
 	/dop_v1_[A-Za-z0-9]{64}/g
 ];
+const PRIVATE_KEY_BLOCK_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/g;
+const URL_CREDENTIALS_RE = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@:"'<>]*:[^\s/?#@"'<>]+@/gi;
 function stripPrivateData(input) {
 	let result = input.replace(PRIVATE_TAG_RE, "[REDACTED]");
+	result = result.replace(new RegExp(PRIVATE_KEY_BLOCK_RE.source, PRIVATE_KEY_BLOCK_RE.flags), "[REDACTED_SECRET]");
+	result = result.replace(new RegExp(URL_CREDENTIALS_RE.source, URL_CREDENTIALS_RE.flags), "$1[REDACTED_SECRET]@");
 	for (const source of SECRET_PATTERN_SOURCES) {
 		const pattern = new RegExp(source.source, source.flags);
 		result = result.replace(pattern, "[REDACTED_SECRET]");
@@ -171,16 +176,84 @@ function isRememberRequest(prompt) {
 	return typeof prompt === "string" && /^(?:(?:請)?記住|確認取代)[：:]/u.test(prompt.trim());
 }
 //#endregion
+//#region src/secret-store.ts
+const SECRET_KEY = "AGENTMEMORY_SECRET";
+function agentmemoryHomeDir() {
+	return join(homedir(), ".agentmemory");
+}
+function secretFilePath() {
+	return join(agentmemoryHomeDir(), "secret");
+}
+function usable(value) {
+	if (typeof value !== "string") return "";
+	const trimmed = value.trim();
+	if (!trimmed) return "";
+	if (trimmed.startsWith("${") && trimmed.endsWith("}")) return "";
+	return trimmed;
+}
+function unquote(value) {
+	const quote = value[0];
+	if ((quote === "\"" || quote === "'") && value.length > 1) {
+		const close = value.indexOf(quote, 1);
+		if (close !== -1) return value.slice(1, close);
+	}
+	const hash = value.indexOf(" #");
+	return hash === -1 ? value : value.slice(0, hash).trim();
+}
+function readEnvFileSecret() {
+	let content;
+	try {
+		content = readFileSync(join(agentmemoryHomeDir(), ".env"), "utf-8");
+	} catch {
+		return "";
+	}
+	if (typeof content !== "string") return "";
+	let found = "";
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		if (trimmed.startsWith("#")) continue;
+		const eq = trimmed.indexOf("=");
+		if (eq === -1) continue;
+		if (trimmed.slice(0, eq).replace(/^export\s+/, "").trim() !== SECRET_KEY) continue;
+		found = usable(unquote(trimmed.slice(eq + 1).trim()));
+	}
+	return found;
+}
+function readStoredSecret() {
+	try {
+		return usable(readFileSync(secretFilePath(), "utf-8"));
+	} catch {
+		return "";
+	}
+}
+function isLoopbackUrl(url) {
+	let hostname;
+	try {
+		hostname = new URL(url).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	const bare = hostname.replace(/^\[|\]$/g, "");
+	return bare === "localhost" || bare === "::1" || /^127(?:\.\d{1,3}){3}$/.test(bare);
+}
+function resolveClientSecret(baseUrl, env = process.env) {
+	const fromEnv = usable(env[SECRET_KEY]);
+	if (fromEnv) return fromEnv;
+	if (!isLoopbackUrl(baseUrl)) return "";
+	return readEnvFileSecret() || readStoredSecret();
+}
+//#endregion
 //#region src/hooks/_selective-settings.ts
 function selectiveSettings() {
 	let local = {};
 	try {
 		local = JSON.parse(readFileSync(join(homedir(), ".config", "agentmemory", "selective-context.json"), "utf8"));
 	} catch {}
+	const url = process.env.AGENTMEMORY_URL || local?.url || "http://localhost:3111";
 	return {
 		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
-		url: process.env.AGENTMEMORY_URL || local?.url || "http://localhost:3111",
-		secret: process.env.AGENTMEMORY_SECRET || local?.secret || "",
+		url,
+		secret: process.env.AGENTMEMORY_SECRET || local?.secret || resolveClientSecret(url),
 		selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
 		owner: local?.owner
 	};
@@ -193,23 +266,26 @@ function isSdkChildContext(payload) {
 	return payload.entrypoint === "sdk-ts";
 }
 const settings = selectiveSettings();
-const REST_URL = settings.url;
+const REST_URL$1 = settings.url;
 const SECRET = settings.secret;
 const SHARED_CLIENT = process.env.AGENTMEMORY_SHARED_CLIENT === "1";
 const SELECTIVE_CONTEXT_INJECT = settings.enabled && (settings.owner !== "agent-hooks" || SHARED_CLIENT);
 const SELECTIVE_CONTEXT_TIMEOUT_MS = 2e3;
+const OBSERVE_TIMEOUT_MS = 3e3;
+const EXIT_CAP_MS = 3500;
 function diagnostic(reason, fields = {}) {
 	if (process.env.AGENTMEMORY_RECALL_DIAGNOSTICS === "1") process.stderr.write(`AGENTMEMORY_RECALL ${JSON.stringify({
 		reason,
 		...fields
 	})}\n`);
 }
-function authHeaders() {
+function authHeaders$1() {
 	const h = { "Content-Type": "application/json" };
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
 	if (settings.selectiveSecret) h["X-AgentMemory-Selective-Secret"] = settings.selectiveSecret;
 	return h;
 }
+const DURABLE_CAPTURE = REST_URL$1 === REST_URL && authHeaders$1()["Authorization"] === authHeaders()["Authorization"];
 function contextPayload(data, context) {
 	if (typeof data.cursor_version === "string" || data.hook_event_name === "UserPromptSubmit") return JSON.stringify({ hookSpecificOutput: {
 		hookEventName: "UserPromptSubmit",
@@ -228,6 +304,7 @@ function renderSelectedContext(result) {
 	return `[Verified background relevant to this request]\n${texts.map((text) => `- ${text}`).join("\n")}`;
 }
 async function main() {
+	if (isDrainChild()) return runDrainChild();
 	let input = "";
 	for await (const chunk of process.stdin) input += chunk;
 	let data;
@@ -243,27 +320,29 @@ async function main() {
 	const project = resolveProject(cwd);
 	const projectId = SELECTIVE_CONTEXT_INJECT ? resolveContextProjectId(cwd) : void 0;
 	const prompt = typeof data.prompt === "string" ? data.prompt : typeof data.userPrompt === "string" ? data.userPrompt : "";
-	const observation = SHARED_CLIENT && !isRememberRequest(prompt) ? Promise.resolve(null) : fetch(`${REST_URL}/agentmemory/observe`, {
+	const explicit = SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt);
+	const body = {
+		hookType: "prompt_submit",
+		sessionId,
+		project,
+		cwd,
+		timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+		data: {
+			prompt,
+			...projectId ? { contextProjectId: projectId } : {},
+			...explicit ? { explicitMemoryRequest: true } : {}
+		}
+	};
+	const post = (timeoutMs) => fetch(`${REST_URL$1}/agentmemory/observe`, {
 		method: "POST",
-		headers: authHeaders(),
-		body: JSON.stringify({
-			hookType: "prompt_submit",
-			sessionId,
-			project,
-			cwd,
-			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-			data: {
-				prompt,
-				...projectId ? { contextProjectId: projectId } : {},
-				...SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt) ? { explicitMemoryRequest: true } : {}
-			}
-		}),
-		signal: AbortSignal.timeout(SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt) ? 5e3 : 3e3)
+		headers: authHeaders$1(),
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(timeoutMs)
 	});
-	if (SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt)) {
+	if (explicit) {
 		let notice = "[Memory update] Storage could not be confirmed. Do not claim this request was saved.";
 		try {
-			const response = await observation;
+			const response = await post(5e3);
 			const saved = (response?.ok ? await response.json() : null)?.knowledgeCapture;
 			diagnostic(saved?.success ? "capture_acknowledged" : "capture_unconfirmed");
 			if (saved?.success && saved.action === "replaced" && saved.status === "active") notice = "[Memory update] The exact old project rule was superseded by the new rule. Both sources and their replacement link are retained. Only the new rule is eligible for future recall.";
@@ -276,13 +355,14 @@ async function main() {
 		process.stdout.write(contextPayload(data, notice));
 		return;
 	}
-	observation.catch(() => {});
+	if (!SHARED_CLIENT || isRememberRequest(prompt)) if (DURABLE_CAPTURE) captureObservation(withEventId(body, data), OBSERVE_TIMEOUT_MS);
+	else post(OBSERVE_TIMEOUT_MS).catch(() => {});
 	if (SELECTIVE_CONTEXT_INJECT && prompt.trim()) {
 		const started = performance.now();
 		try {
-			const response = await fetch(`${REST_URL}/agentmemory/selective-context`, {
+			const response = await fetch(`${REST_URL$1}/agentmemory/selective-context`, {
 				method: "POST",
-				headers: authHeaders(),
+				headers: authHeaders$1(),
 				body: JSON.stringify({
 					prompt,
 					project,
@@ -310,7 +390,7 @@ async function main() {
 			diagnostic(error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name) ? "api_timeout" : error instanceof SyntaxError ? "invalid_response" : "network_error", { api_ms: Math.round(performance.now() - started) });
 		}
 	} else diagnostic("disabled_or_empty_prompt");
-	setTimeout(() => process.exit(0), 1500).unref();
+	setTimeout(() => process.exit(0), EXIT_CAP_MS).unref();
 }
 main().catch(() => process.exit(0));
 //#endregion

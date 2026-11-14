@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
 import { registerObserveFunction } from "../src/functions/observe.js";
+import { registerCaptureFunctions } from "../src/functions/capture.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import { DedupMap } from "../src/functions/dedup.js";
 import { KV } from "../src/state/schema.js";
@@ -22,6 +23,7 @@ function setup(kv = mockKV(), limit?: number) {
   const map = new DedupMap();
   maps.push(map);
   registerObserveFunction(sdk as never, kv as never, map, limit);
+  registerCaptureFunctions(sdk as never, kv as never);
   registerApiTriggers(sdk as never, kv as never);
   return { sdk, kv };
 }

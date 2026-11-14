@@ -161,7 +161,7 @@ describe("mem::compress synthetic fallback on LLM failure", () => {
     expect(getSearchIndex().has(raw.id)).toBe(true);
   });
 
-  it("publishes the degraded observation to both stream groups", async () => {
+  it("publishes the degraded observation to the viewer stream group", async () => {
     const sdk = mockSdk();
     const kv = await kvWithRawObservation();
     registerCompressFunction(
@@ -175,11 +175,7 @@ describe("mem::compress synthetic fallback on LLM failure", () => {
     await sdk.trigger("mem::compress", payload);
 
     const streamSets = sdk.triggered.filter((t) => t.id === "stream::set");
-    expect(streamSets).toHaveLength(2);
-    const groups = streamSets.map(
-      (t) => (t.data as { group_id: string }).group_id,
-    );
-    expect(new Set(groups).size).toBe(2);
+    expect(streamSets.map((t) => (t.data as { group_id: string }).group_id)).toEqual(["viewer"]);
   });
 
   it("keeps the LLM result when compression succeeds", async () => {

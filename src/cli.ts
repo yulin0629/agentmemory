@@ -55,6 +55,8 @@ import {
   type ConnectManifest,
   type RemoveOptions,
 } from "./cli/remove-plan.js";
+import { portFlagSuffix } from "./cli/ready-hint.js";
+import { expectedIiiSha256, iiiManualInstallCommand, installIiiArchive } from "./cli/engine-install.js";
 import {
   dockerComposeArgs,
   dockerProjectName,
@@ -64,11 +66,15 @@ import {
   rewriteBundledConfig,
   runtimeConfigPath,
   engineChildEnv,
+  resolveLaunchRenderFailure,
+  redactCredentialUrls,
 } from "./cli/engine-launch.js";
 import { runtimeMetadataPath } from "./runtime-paths.js";
 import { createStartupStderrCapture } from "./cli/startup-stderr.js";
 import {
   clearPersistedBuiltinConfig,
+  engineFlushWaitMs,
+  engineStateConfigPaths,
   renderEngineConfig,
 } from "./cli/engine-config.js";
 import { SHUTDOWN_HARD_EXIT_MS } from "./shutdown.js";
@@ -78,7 +84,7 @@ import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
 import { setBootVerbose } from "./logger.js";
-import { hydrateProcessEnvFromFile } from "./config.js";
+import { getRedisUrl, getStateBackend, getStateSaveIntervalMs, hydrateProcessEnvFromFile } from "./config.js";
 import { III_PINNED_VERSION, VERSION } from "./version.js";
 import { getAllTools, ESSENTIAL_TOOLS } from "./mcp/tools-registry.js";
 import { knownAgents } from "./cli/connect/index.js";
@@ -86,6 +92,8 @@ import { knownAgents } from "./cli/connect/index.js";
 const ALL_TOOLS_COUNT = getAllTools().length;
 const CORE_TOOLS_COUNT = getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name)).length;
 import { resolveDataDir } from "./cli-data-dir.js";
+import { runCaptureCommand } from "./cli/capture.js";
+import { bearerHeaders, resolveClientSecret } from "./secret-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -222,6 +230,9 @@ Commands:
                      the engine was started natively but state file is missing).
   mcp                Start standalone MCP shim — opt-in surface for MCP-only clients
                      (Cursor, Gemini CLI, etc). REST always available at :3111.
+  capture [--drain]  Show capture health: the local offline spool and the server
+                     inbox (pending, retrying, dead letters). --drain sends
+                     spooled observations now. --json for machine output.
   import-jsonl [p]   Import Claude Code JSONL transcripts (default: ~/.claude/projects)
                      --max-files <N> | --max-files=<N>: override scan cap (default 200, max 1000;
                      out-of-range is rejected; for trees >1000 files, batch by subdirectory)
@@ -248,6 +259,9 @@ Environment:
                                native iii-engine binary on first run.
   AGENTMEMORY_III_VERSION      Override pinned iii-engine version (default ${IIPINNED_VERSION}).
   AGENTMEMORY_READY_TIMEOUT_MS How long start waits for the worker (default 120000).
+  AGENTMEMORY_III_CONFIG       Engine config to start from (default: ./iii-config.yaml,
+                               then ~/.agentmemory/iii-config.yaml, then the bundled
+                               loopback-only config).
   AGENTMEMORY_FOLLOWUP_WINDOW_SECONDS
                                Window (seconds) for the smart-search follow-up diagnostic
                                (default 30). Long values overcount, short values undercount.
@@ -275,7 +289,7 @@ if (toolsIdx !== -1 && args[toolsIdx + 1]) {
   process.env["AGENTMEMORY_TOOLS"] = toolsMode;
 }
 
-const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp"]);
+const URL_CLIENT_COMMANDS = new Set(["status", "doctor", "mcp", "capture"]);
 let hasExplicitLocalPortOverride = false;
 let selectedInstance = 0;
 
@@ -1312,6 +1326,7 @@ async function runIiiInstaller(): Promise<{ ok: boolean; binPath: string | null 
     p.log.info(
       `Auto-install unavailable on ${platform()} — ${asset} isn't tar-compatible. Install manually:\n` +
         `  1. Download ${releaseUrl}\n` +
+        `     Its SHA-256 must be ${expectedIiiSha256(IIPINNED_VERSION, asset ?? "") ?? `the value in ${releaseUrl.replace(/\.zip$/, ".sha256")}`}\n` +
         `  2. Extract iii.exe and place it on PATH (e.g. %USERPROFILE%\\.local\\bin)\n` +
         `Or use Docker: docker pull iiidev/iii:${IIPINNED_VERSION}`,
     );
@@ -1331,21 +1346,39 @@ async function runIiiInstaller(): Promise<{ ok: boolean; binPath: string | null 
 
   const binDir = agentmemoryBinDir();
   const binPath = privateIiiPath();
-  const installCmd = [
-    `mkdir -p "${binDir}"`,
-    `curl -fsSL "${releaseUrl}" | tar -xz -C "${binDir}"`,
-    `chmod +x "${binPath}"`,
-  ].join(" && ");
-  const installerOk = runCommand(shBin, ["-c", installCmd], {
-    label: `Installing iii-engine v${IIPINNED_VERSION} (pinned)`,
-    optional: true,
+  const label = `Installing iii-engine v${IIPINNED_VERSION} (pinned)`;
+  const spinner = p.spinner();
+  spinner.start(label);
+  const outcome = installIiiArchive({
+    sh: shBin,
+    releaseUrl,
+    version: IIPINNED_VERSION,
+    asset: asset ?? "",
+    binDir,
+    binPath,
   });
-  if (!installerOk) {
+  if (!outcome.ok) {
+    spinner.stop(`${label} ${pc.red("✗")}`);
+    const sha256 = expectedIiiSha256(IIPINNED_VERSION, asset ?? "");
+    const heading =
+      outcome.reason === "checksum"
+        ? "iii-engine download failed verification"
+        : outcome.reason === "no-checksum"
+          ? "iii-engine auto-install skipped"
+          : "iii-engine download failed";
+    const checksumHint = sha256
+      ? ""
+      : `Compare the archive against ${releaseUrl.replace(/\.(tar\.gz|zip)$/, ".sha256")} before extracting.\n`;
     p.log.warn(
-      `iii-engine installer failed. Fallbacks: Docker (\`docker pull iiidev/iii:${IIPINNED_VERSION}\`) or download manually from https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}.`,
+      `${heading}: ${outcome.detail.slice(0, 300)}\n` +
+        `Install it manually, then re-run agentmemory:\n` +
+        `  ${iiiManualInstallCommand(releaseUrl, binDir, binPath, sha256)}\n` +
+        checksumHint +
+        `Or use Docker: docker pull iiidev/iii:${IIPINNED_VERSION}`,
     );
     return { ok: false, binPath: null };
   }
+  spinner.stop(`${label} ${pc.green("✓")}`);
   return { ok: true, binPath };
 }
 
@@ -1359,7 +1392,7 @@ let startupFailure: StartupFailure | null = null;
 let activeStartupStderr = createStartupStderrCapture();
 
 function printCapturedStartupStderr(): void {
-  const stderr = activeStartupStderr.text().trim();
+  const stderr = redactCredentialUrls(activeStartupStderr.text().trim());
   if (IS_VERBOSE && stderr) {
     p.note(stderr, "engine stderr");
   }
@@ -1387,7 +1420,7 @@ function printDockerStartupLogs(): void {
       maxBuffer: 64 * 1024,
     },
   );
-  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+  const output = redactCredentialUrls(`${result.stdout ?? ""}${result.stderr ?? ""}`.trim());
   if (output) p.note(output.slice(-16 * 1024), "docker engine logs");
 }
 
@@ -1421,7 +1454,7 @@ function spawnEngineBackground(
     const abnormal =
       (code !== null && code !== 0) || (code === null && signal !== null);
     if (abnormal) {
-      const stderr = activeStartupStderr.text();
+      const stderr = redactCredentialUrls(activeStartupStderr.text());
       startupFailure = {
         kind: isDocker ? "docker-crashed" : "engine-crashed",
         stderr:
@@ -1457,9 +1490,15 @@ function prepareEngineLaunch(configPath: string): {
     home,
     bundledConfig,
   );
+  const stateBackendKind = getStateBackend();
   try {
     mkdirSync(cwd, { recursive: true });
-  } catch {
+  } catch (err) {
+    const failure = resolveLaunchRenderFailure(stateBackendKind, err);
+    if (failure.fatal) {
+      p.log.error(failure.message);
+      process.exit(1);
+    }
     return { configPath, cwd: process.cwd() };
   }
   try {
@@ -1472,6 +1511,8 @@ function prepareEngineLaunch(configPath: string): {
         viewerPort: getConfiguredViewerPort(),
         enginePort: getEnginePort(),
       },
+      stateBackend: { kind: stateBackendKind, redisUrl: getRedisUrl() },
+      saveIntervalMs: getStateSaveIntervalMs(),
     };
     const rewritten = bundledConfig
       ? rewriteBundledConfig(
@@ -1520,6 +1561,11 @@ function prepareEngineLaunch(configPath: string): {
       cwd,
     };
   } catch (err) {
+    const failure = resolveLaunchRenderFailure(stateBackendKind, err);
+    if (failure.fatal) {
+      p.log.error(failure.message);
+      process.exit(1);
+    }
     vlog(`runtime config generation failed, using bundled config verbatim: ${String(err)}`);
     return { configPath, cwd };
   }
@@ -1558,10 +1604,34 @@ function pickCompatibleIii(candidates: Array<string | null | undefined>): string
   return null;
 }
 
+function warnIfDockerIgnoresStateBackend(stateBackendKind: "file" | "redis"): void {
+  if (stateBackendKind !== "redis") return;
+  p.log.warn(
+    "AGENTMEMORY_STATE_BACKEND=redis is not applied on the Docker path: docker-compose.yml mounts iii-config.docker.yaml read-only, so this start will not render it. " +
+      "Edit iii-config.docker.yaml by hand to point iii-state/iii-stream at redis (see README \"Storage backend\"), or it keeps using the file store. " +
+      "docker-compose.yml passes AGENTMEMORY_REDIS_URL into the engine container, so redis_url: '${AGENTMEMORY_REDIS_URL}' works in that file.",
+  );
+}
+
 async function startEngine(): Promise<boolean> {
+  let stateBackendKind: "file" | "redis";
+  try {
+    stateBackendKind = getStateBackend();
+  } catch (err) {
+    p.log.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+  if (stateBackendKind === "redis" && !getRedisUrl()) {
+    p.log.error(
+      "AGENTMEMORY_STATE_BACKEND=redis requires AGENTMEMORY_REDIS_URL to be set (e.g. redis://localhost:6379). " +
+        "Set both in ~/.agentmemory/.env, or unset AGENTMEMORY_STATE_BACKEND to keep the default file store.",
+    );
+    process.exit(1);
+  }
   await assertRuntimePortOwnership();
   const persistedState = readEngineState();
   if (persistedState?.kind === "docker") {
+    warnIfDockerIgnoresStateBackend(stateBackendKind);
     const inspection = inspectOwnedDockerEngine(persistedState);
     if (inspection.status === "unavailable" || inspection.status === "missing") {
       const detail = inspection.status === "unavailable"
@@ -1707,6 +1777,7 @@ async function startEngine(): Promise<boolean> {
   }
 
   if (choice === "docker" && dockerBin && composeFile) {
+    warnIfDockerIgnoresStateBackend(stateBackendKind);
     const s = p.spinner();
     s.start("Starting iii-engine via Docker...");
     configureDockerHostUser();
@@ -1796,12 +1867,18 @@ async function reconcilePersistedDockerEngine(): Promise<boolean> {
 function installInstructions(): string[] {
   const releaseUrl = iiiReleaseUrl();
   if (IS_WINDOWS) {
+    const asset = iiiReleaseAsset() ?? "";
+    const sha256 = expectedIiiSha256(IIPINNED_VERSION, asset);
+    const verify = sha256
+      ? `     Verify before extracting: (Get-FileHash .\\${asset}).Hash must be ${sha256.toUpperCase()}`
+      : `     Verify before extracting against the matching .sha256 file on the release page`;
     return [
       `agentmemory needs iii-engine v${IIPINNED_VERSION}. Pick one:`,
       "",
       "  A) Download the prebuilt Windows binary:",
       `     1. Open https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}`,
       `     2. Download iii-x86_64-pc-windows-msvc.zip (or iii-aarch64-pc-windows-msvc.zip on ARM)`,
+      verify,
       "     3. Extract iii.exe to %USERPROFILE%\\.local\\bin\\iii.exe (or add to PATH)",
       "     4. Re-run: npx @agentmemory/agentmemory",
       "",
@@ -1814,7 +1891,7 @@ function installInstructions(): string[] {
     ];
   }
   const linuxInstall = releaseUrl
-    ? `  A) mkdir -p ~/.agentmemory/bin && curl -fsSL "${releaseUrl}" | tar -xz -C ~/.agentmemory/bin && chmod +x ~/.agentmemory/bin/iii`
+    ? `  A) ${iiiManualInstallCommand(releaseUrl, agentmemoryBinDir(), privateIiiPath(), expectedIiiSha256(IIPINNED_VERSION, iiiReleaseAsset() ?? ""))}`
     : `  A) Manual download: https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}`;
   return [
     `agentmemory needs iii-engine v${IIPINNED_VERSION}. Pick one:`,
@@ -1874,8 +1951,9 @@ function printReadyHint(): void {
   const engineUrl = `ws://${engineHost}:${getEnginePort()}`;
   const invocation = isInvokedViaNpx() ? "npx @agentmemory/agentmemory" : "agentmemory";
   const consolePort = defaultConsolePort(getConfiguredViewerPort());
+  const portFlags = portFlagSuffix(getRestPort(), selectedInstance);
 
-  const consoleLine = `${c.label("iii console")}  ${c.cmd(`${invocation} console`)}  ${c.dim(`(serves on :${consolePort}; first run downloads the console next to the pinned iii)`)}`;
+  const consoleLine = `${c.label("iii console")}  ${c.cmd(`${invocation} console${portFlags}`)}  ${c.dim(`(serves on :${consolePort}; first run downloads the console next to the pinned iii)`)}`;
 
   const lines = [
     `${c.label("REST API")}     ${c.url(restUrl)}`,
@@ -1894,7 +1972,7 @@ function printReadyHint(): void {
   // (unless they accepted the global-install prompt and the npm bin
   // dir was already on PATH in this shell), so we suggest the npx
   // form for them; everyone else gets the global form.
-  const demoCommand = `${invocation} demo`;
+  const demoCommand = `${invocation} demo${portFlags}`;
   process.stdout.write(`\n${c.dim("Try:")} ${c.cmd(demoCommand)}\n`);
 }
 
@@ -2103,9 +2181,7 @@ async function main() {
 
 async function apiFetch<T = unknown>(base: string, path: string, timeoutMs = 5000): Promise<T | null> {
   try {
-    const headers: Record<string, string> = {};
-    const secret = process.env["AGENTMEMORY_SECRET"];
-    if (secret) headers["Authorization"] = `Bearer ${secret}`;
+    const headers: Record<string, string> = bearerHeaders(base);
     const res = await fetch(`${base}/agentmemory/${path}`, {
       signal: AbortSignal.timeout(timeoutMs),
       headers,
@@ -2755,7 +2831,7 @@ async function postJson<T = unknown>(
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...bearerHeaders(url) },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -2773,7 +2849,7 @@ async function postJsonStrict<T = unknown>(
 ): Promise<T | null> {
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...bearerHeaders(url) },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -2815,7 +2891,7 @@ async function seedDemoSession(
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...bearerHeaders(url) },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(5000),
       });
@@ -3246,6 +3322,26 @@ async function signalAndWait(
 // Shared worker-reap: SIGTERM with a grace window sized for the worker's
 // shutdown flush (index snapshots land via the engine, so the worker must
 // die before the engine does, with time to commit).
+async function waitForEngineFlush(): Promise<void> {
+  let stateBackend: "file" | "redis" = "file";
+  try {
+    stateBackend = getStateBackend();
+  } catch {}
+  const runtimePath = runtimeConfigPath(dataDirResolution.dataDir);
+  const configTexts: string[] = [];
+  for (const path of engineStateConfigPaths(join(homedir(), ".agentmemory"), runtimePath)) {
+    try {
+      configTexts.push(readFileSync(path, "utf-8"));
+    } catch {}
+  }
+  const waitMs = engineFlushWaitMs(stateBackend, configTexts);
+  if (waitMs <= 0) return;
+  const s = p.spinner();
+  s.start(`Waiting ${(waitMs / 1000).toFixed(1)}s for iii-engine to write state to disk...`);
+  await new Promise((r) => setTimeout(r, waitMs));
+  s.stop("iii-engine state flush window passed");
+}
+
 async function stopWorkerPid(pid: number, graceMs: number): Promise<boolean> {
   const s = p.spinner();
   s.start(`Stopping agentmemory worker (pid ${pid})... [flushing state]`);
@@ -3564,6 +3660,9 @@ async function runStop(): Promise<void> {
   for (const pid of workerCandidates) {
     if (!(await stopWorkerPid(pid, SHUTDOWN_HARD_EXIT_MS + 1000))) allStopped = false;
   }
+  if (workerCandidates.size > 0 && [...candidates].some((pid) => !workerCandidates.has(pid))) {
+    await waitForEngineFlush();
+  }
   const skippedForeign: Array<{ pid: number; comm: string }> = [];
   for (const pid of candidates) {
     if (workerCandidates.has(pid)) continue;
@@ -3678,12 +3777,10 @@ async function runImportJsonl(): Promise<void> {
   }
 
   const body: Record<string, unknown> = {};
-  if (pathArg) body["path"] = pathArg;
+  if (pathArg) body["path"] = resolve(pathArg.startsWith("~") ? join(homedir(), pathArg.slice(1)) : pathArg);
   if (maxFiles !== undefined) body["maxFiles"] = maxFiles;
 
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  const secret = process.env["AGENTMEMORY_SECRET"];
-  if (secret) headers["authorization"] = `Bearer ${secret}`;
+  const headers: Record<string, string> = { "content-type": "application/json", ...bearerHeaders(base) };
 
   p.log.info(`Importing JSONL from ${pathArg || "~/.claude/projects"}…`);
   const spinner = p.spinner();
@@ -4019,6 +4116,15 @@ async function runConsole(): Promise<void> {
   process.exit(code);
 }
 
+async function runCapture(): Promise<void> {
+  const code = await runCaptureCommand({
+    base: getBaseUrl(),
+    args: args.slice(1),
+    secret: resolveClientSecret(getBaseUrl()),
+  });
+  process.exit(code);
+}
+
 const commands: Record<string, () => Promise<void>> = {
   init: runInit,
   connect: runConnectCmd,
@@ -4031,6 +4137,7 @@ const commands: Record<string, () => Promise<void>> = {
   remove: runRemove,
   mcp: runMcp,
   "import-jsonl": runImportJsonl,
+  capture: runCapture,
 };
 
 const first = args[0] ?? "";

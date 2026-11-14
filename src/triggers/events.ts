@@ -1,8 +1,9 @@
-import { withKeyedLock } from "../state/keyed-mutex.js";
 import { TriggerAction, type IIIClient } from "iii-sdk";
 import type { CompressedObservation, HookPayload, Memory, Session } from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { addSessionToProjectIndex } from "../state/session-index.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { isReflectEnabled } from "../functions/slots.js";
 import {
   detectLlmProviderKind,
@@ -13,6 +14,7 @@ import {
 } from "../config.js";
 import { computeInputFingerprint } from "../functions/input-fingerprint.js";
 import { logger } from "../logger.js";
+import { noteMemoryChange, noteSessionChange } from "../state/viewer-counts.js";
 
 // Global marker recording when corpus consolidation last ran, used to debounce
 // the per-turn session-stop fan-out.
@@ -58,7 +60,7 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
           ? data.agentId.trim().slice(0, 128)
           : undefined;
       const agentId = requestAgentId ?? getAgentId();
-      const session: Session = {
+      const freshSession: Session = {
         id: data.sessionId,
         project: data.project,
         cwd: data.cwd,
@@ -67,7 +69,28 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
         observationCount: 0,
         ...(agentId ? { agentId } : {}),
       };
-      await kv.set(KV.sessions, data.sessionId, session);
+      const session = await withKeyedLock(`obs:${data.sessionId}`, async () => {
+        const existing = await kv.get<Session>(KV.sessions, data.sessionId);
+        const merged: Session = {
+          ...freshSession,
+          observationCount: existing?.observationCount ?? freshSession.observationCount,
+          firstPrompt: existing?.firstPrompt,
+          summary: existing?.summary,
+          commitShas: existing?.commitShas,
+        };
+        await kv.set(KV.sessions, data.sessionId, merged);
+        return merged;
+      });
+      await addSessionToProjectIndex(kv, session.project, {
+        id: session.id,
+        startedAt: session.startedAt,
+        ...(session.agentId ? { agentId: session.agentId } : {}),
+      }).catch((err) => {
+        logger.warn("session index update failed", {
+          sessionId: session.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
       const contextResult = await sdk.trigger<
         { sessionId: string; project: string; agentId?: string },
         { context: string }
@@ -182,16 +205,24 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction(
     "event::session::ended",
     async (data: { sessionId: string }) => {
-      return withKeyedLock(`session:${data.sessionId}`, async () => {
-        if (!await kv.get(KV.sessions, data.sessionId)) {
-          return { success: true, skipped: "session-absent" };
-        }
-        await kv.update(KV.sessions, data.sessionId, [
+      const sessionId = data?.sessionId;
+      if (typeof sessionId !== "string" || sessionId.length === 0) {
+        return { success: true, ended: false, reason: "not_found" as const };
+      }
+      const endResult = await withKeyedLock(`obs:${sessionId}`, async () => {
+        const session = await kv.get<Session>(KV.sessions, sessionId);
+        if (!session || session.id !== sessionId) return "not_found" as const;
+        if (session.status === "completed") return "already_completed" as const;
+        await kv.update(KV.sessions, sessionId, [
           { type: "set", path: "endedAt", value: new Date().toISOString() },
           { type: "set", path: "status", value: "completed" },
         ]);
-        return { success: true };
+        return "ended" as const;
       });
+      if (endResult !== "ended") {
+        return { success: true, ended: false, reason: endResult };
+      }
+      return { success: true, ended: true };
     },
   );
   sdk.registerTrigger({
@@ -209,6 +240,7 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
       old_value?: Session;
       new_value?: Session;
     }) => {
+      noteSessionChange(payload.old_value, isStateDelete(payload) ? null : payload.new_value);
       if (isOutOfAgentScope(payload.new_value ?? payload.old_value)) {
         return { emitted: false };
       }
@@ -251,23 +283,29 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
       old_value?: Memory;
       new_value?: Memory;
     }) => {
+      const deleted = isStateDelete(payload);
+      noteMemoryChange(payload.old_value, deleted ? null : payload.new_value);
       if (isOutOfAgentScope(payload.new_value ?? payload.old_value)) {
         return { emitted: false };
       }
-      const deleted = isStateDelete(payload);
       const memory = payload.new_value;
+      const created = !deleted && !payload.old_value;
+      let type = "memory.updated";
+      if (deleted) type = "memory.deleted";
+      else if (created) type = "memory.created";
       await sendViewerEvent(
         sdk,
-        `memory-${deleted ? "deleted" : "updated"}-${payload.key}-${Date.now()}`,
-        deleted ? "memory.deleted" : "memory.updated",
+        `${type.replace(".", "-")}-${payload.key}-${Date.now()}`,
+        type,
         deleted
-          ? { memoryId: payload.key }
+          ? { memoryId: payload.key, isLatest: payload.old_value?.isLatest }
           : {
               memoryId: payload.key,
               type: memory?.type,
               title: memory?.title,
               isLatest: memory?.isLatest,
               updatedAt: memory?.updatedAt,
+              memory,
             },
       );
       return { emitted: true };
@@ -280,15 +318,15 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
   });
 }
 
-function isStateDelete(payload: { event_type: string; new_value?: unknown }): boolean {
+export function isStateDelete(payload: { event_type: string; new_value?: unknown }): boolean {
   return payload.event_type === "state:deleted" || !payload.new_value;
 }
 
-function isOutOfAgentScope(record: { agentId?: string } | undefined): boolean {
+export function isOutOfAgentScope(record: { agentId?: string } | undefined): boolean {
   return isAgentScopeIsolated() && record?.agentId !== getAgentId();
 }
 
-async function sendViewerEvent(
+export async function sendViewerEvent(
   sdk: IIIClient,
   id: string,
   type: string,

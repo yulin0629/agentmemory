@@ -13,7 +13,10 @@ import type {
 } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { addSessionToProjectIndex } from "../state/session-index.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { recordAudit } from "./audit.js";
+import { boundRecordSources } from "./graph.js";
 import { VERSION } from "../version.js";
 import { logger } from "../logger.js";
 import { exportContextKnowledge, parseContextKnowledgeBackups, restoreContextKnowledge } from "../state/context-knowledge-backup.js";
@@ -201,7 +204,19 @@ export function registerSnapshotFunction(
 
         if (state.sessions) {
           for (const session of state.sessions) {
-            await kv.set(KV.sessions, session.id, session);
+            await withKeyedLock(`obs:${session.id}`, () =>
+              kv.set(KV.sessions, session.id, session),
+            );
+            const project = session.project;
+            const startedAt = session.startedAt;
+            if (typeof project === "string" && typeof startedAt === "string") {
+              const agentId = session.agentId;
+              await addSessionToProjectIndex(kv, project, {
+                id: session.id,
+                startedAt,
+                ...(typeof agentId === "string" ? { agentId } : {}),
+              }).catch(() => {});
+            }
           }
         }
         if (state.memories) {
@@ -211,7 +226,9 @@ export function registerSnapshotFunction(
         }
         if (state.graphNodes) {
           for (const node of state.graphNodes) {
-            await kv.set(KV.graphNodes, node.id, node);
+            await withKeyedLock("graph:persist", () =>
+              kv.set(KV.graphNodes, node.id, boundRecordSources(node)),
+            );
           }
         }
         if (state.observations) {

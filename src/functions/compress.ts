@@ -23,7 +23,11 @@ import { scoreCompression } from "../eval/quality.js";
 import { compressWithRetry } from "../eval/self-correct.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
+import { createObservationSource, withoutObservationSource } from "./observation-source.js";
+import { trackViewerStreamItem, pruneViewerStreamIfDue } from "../state/viewer-stream.js";
+import { budgetLiveObservationSource } from "./observation-source-budget.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import { scrubRecord, stripPrivateData } from "./privacy.js";
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -136,25 +140,18 @@ async function persistSyntheticFallback(
         function_id: "stream::set",
         payload: {
           stream_name: STREAM.name,
-          group_id: STREAM.group(data.sessionId),
-          item_id: data.observationId,
-          data: { type: "compressed", observation: synthetic },
-        },
-      }),
-      sdk.trigger({
-        function_id: "stream::set",
-        payload: {
-          stream_name: STREAM.name,
           group_id: STREAM.viewerGroup,
           item_id: data.observationId,
           data: {
             type: "compressed",
-            observation: synthetic,
+            observation: withoutObservationSource(synthetic),
             sessionId: data.sessionId,
           },
         },
       }),
     ]);
+    trackViewerStreamItem(data.observationId);
+    void pruneViewerStreamIfDue(sdk).catch(() => {});
     for (const result of streamResults) {
       if (result.status === "rejected") {
         logger.warn("Non-fatal stream publish failure after synthetic fallback", {
@@ -198,6 +195,9 @@ export function registerCompressFunction(
       raw: RawObservation;
     }) => {
       const startMs = Date.now();
+      if (!data?.raw || typeof data.raw.hookType !== "string" || !data.raw.hookType) {
+        return { success: false, error: "invalid_raw_observation" };
+      }
       // Guards the catch below: once the LLM result is in kv, a later
       // failure (metrics, stream) must not overwrite it with a synthetic.
       let persisted = false;
@@ -291,20 +291,27 @@ export function registerCompressFunction(
 
         const qualityScore = scoreCompression(parsed);
 
-        const compressed: CompressedObservation = {
+        const candidate: CompressedObservation = {
           id: data.observationId,
           sessionId: data.sessionId,
           timestamp: data.raw.timestamp,
-          ...parsed,
+          ...scrubRecord(parsed),
           confidence: qualityScore / 100,
+          source: createObservationSource(data.raw),
           ...(hasImage ? { modality: data.raw.modality } : {}),
-          ...(imageDescription ? { imageDescription } : {}),
+          ...(imageDescription ? { imageDescription: stripPrivateData(imageDescription) } : {}),
           ...(data.raw.imageData ? { imageRef: data.raw.imageData } : {}),
           ...(data.raw.agentId ? { agentId: data.raw.agentId } : {}),
           ...(data.raw.origin ? { origin: data.raw.origin } : {}),
+          ...(data.raw.captureKey ? { captureKey: data.raw.captureKey } : {}),
         };
 
-        if (!(await persistIfPresent(kv, data.sessionId, data.observationId, compressed))) {
+        const compressed = await withKeyedLock(`obs:${data.sessionId}`, async () => {
+          const existing = await kv.list<CompressedObservation>(KV.observations(data.sessionId));
+          const bounded = budgetLiveObservationSource(candidate, existing);
+          return (await persistIfPresent(kv, data.sessionId, data.observationId, bounded)) ? bounded : null;
+        });
+        if (!compressed) {
           const latencyMs = Date.now() - startMs;
           if (metricsStore) {
             await metricsStore.record("mem::compress", latencyMs, false);
@@ -334,15 +341,6 @@ export function registerCompressFunction(
 
         const streamResults = await Promise.allSettled([
           sdk.trigger({
-            function_id: "stream::set",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.group(data.sessionId),
-              item_id: data.observationId,
-              data: { type: "compressed", observation: compressed },
-            },
-          }),
-          sdk.trigger({
             function_id: "stream::send",
             payload: {
               stream_name: STREAM.name,
@@ -351,7 +349,7 @@ export function registerCompressFunction(
               type: "compressed_observation",
               data: {
                 type: "compressed",
-                observation: compressed,
+                observation: withoutObservationSource(compressed),
                 sessionId: data.sessionId,
               },
             },
@@ -389,7 +387,7 @@ export function registerCompressFunction(
           retried,
         });
 
-        return { success: true, compressed, qualityScore };
+        return { success: true, compressed: withoutObservationSource(compressed), qualityScore };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         const latencyMs = Date.now() - startMs;

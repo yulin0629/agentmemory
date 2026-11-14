@@ -11,29 +11,19 @@ agentmemory is a persistent memory system for AI coding agents, built on iii-eng
 
 ## Consistency Rules
 
-**When adding or removing MCP tools, you MUST update ALL of the following:**
+**Before every commit, run `npm run docs:sync` and commit what it changes.** It computes MCP tool counts (all, core, local fallback), REST endpoints, skills, hooks, tests, iii functions, source files, lines of code and KV scopes from the source, and rewrites them in README.md, the translated READMEs, AGENTS.md, INSTALL_FOR_AGENTS.md, plugin manifests, integration READMEs, the stat badges and the `src/index.ts` banner. The last synced values live in `scripts/docs-sync.state.json`; commit that file with the rest. `npm run docs:check` exits non-zero when anything is out of date. When the sync prints `check <fact> <old> left in <file>`, open that line: either fix it by hand or add its noun to the fact in `scripts/docs-sync.ts` so the next sync catches it. Never hand-edit these numbers or versions in the docs; change the source and sync.
+
+**When adding or removing MCP tools, update:**
 1. `src/mcp/tools-registry.ts` — tool definition + `getAllTools()` array
 2. `src/mcp/server.ts` — handler case in the `mcp::tools::call` switch
 3. `src/triggers/api.ts` — REST endpoint registration
-4. `src/index.ts` — function registration + endpoint count in the log line
+4. `src/index.ts` — function registration
 5. `test/mcp-standalone.test.ts` — tool count assertion
-6. `README.md` — tool counts (search for "MCP tools")
-7. `plugin/.claude-plugin/plugin.json` — tool count in description
-8. `plugin/plugin.json` and `plugin/.mcp.copilot.json` (when present) — tool count or MCP exposure
 
-**When adding REST endpoints, you MUST update:**
+**When adding REST endpoints, update:**
 1. `src/triggers/api.ts` — endpoint registration
-2. `src/index.ts` — endpoint count in the log line
-3. `README.md` — endpoint count (search for "REST endpoints" and "endpoints on port")
 
-**When bumping version, you MUST update ALL of the following:**
-1. `package.json` — version field
-2. `src/version.ts` — VERSION constant and type union
-3. `src/types.ts` — ExportData version union
-4. `src/functions/export-import.ts` — supportedVersions set
-5. `test/export-import.test.ts` — version assertion
-6. `plugin/.claude-plugin/plugin.json` — version field
-7. `plugin/plugin.json` (when present) — version field
+**When bumping version, change only `package.json`.** `npm run docs:sync` carries the new version into `src/version.ts`, the `src/types.ts` ExportData union, the `supportedVersions` set in `src/functions/export-import.ts`, every plugin and package manifest that shared the old version, the deploy templates, the AGENTS.md stats heading, and CHANGELOG.md (the Unreleased section becomes the new version with today's date, plus its compare link).
 
 **When adding new KV scopes:**
 1. `src/state/schema.ts` — add to the KV object
@@ -101,7 +91,7 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 - **Selective authentication**: The global API secret takes precedence over `AGENTMEMORY_SELECTIVE_CONTEXT_SECRET`. With only the latter configured, legacy telemetry remains unchanged but explicit-save observations and both selective endpoints require its bearer token or `X-AgentMemory-Selective-Secret` (separate from relay authentication). Client prompt hooks may opt in through private `~/.config/agentmemory/selective-context.json`.
 - **Shared recall ownership**: With private config `owner: "agent-hooks"`, native adapters use `selective-client.mjs --stdin`; standalone prompt hooks retain telemetry but do not inject. `AGENTMEMORY_SHARED_CLIENT=1` is internal routing, not authorization. The shared client skips ordinary observation writes, but explicit saves still require authenticated, source-backed capture. Do not enable both native shared recall and separate extension recall.
 - **Historical lessons**: `lessonId` links adoption evidence to an existing lesson without another mutable lesson copy. Filter approved IDs before BM25 top-k, verify exact text/project against KV, then recheck source versions and catalog revision after Jev. Missing provenance never implies global adoption. Shared ownership also suppresses broad startup/tool/precompact injection.
-- **Telemetry-only hooks** (`notification`, `post-tool-failure`, `prompt-submit` by default, `stop`, `session-end`, `subagent-start`, `subagent-stop`, `task-completed`) write nothing to stdout. These use fire-and-forget `fetch(..., { signal: AbortSignal.timeout(N) }).catch(() => {})` paired with an unref'd `setTimeout(() => process.exit(0), timeout)`. Use 1500ms whenever losing the request matters and the path may be slow: `prompt-submit`, `stop`, and `session-end` all qualify, because a remote `AGENTMEMORY_URL` can take more than 500ms to acknowledge. **Request count is not the criterion — delivery-path latency is.** A hook that sends one request to a slow host drops it just as readily as one that sends three; 500ms is only safe for hooks whose loss is inconsequential (`notification`, `post-tool-failure`, `subagent-start`, `subagent-stop`, `task-completed`). **`post-tool-use` is the delivery-guaranteed exception:** it MUST await its single observation request with the existing 3-second abort bound because exiting after a short timer can drop tool observations on higher-latency relays.
+- **Telemetry-only hooks** (`notification`, `post-tool-failure`, `post-tool-use`, `prompt-submit` by default, `stop`, `session-end`, `subagent-start`, `subagent-stop`, `task-completed`) write nothing to stdout. A hook that posts an observation sends it with `captureObservation(...)` from `_capture.ts`, which spools the event on disk when the server does not acknowledge it, and pairs it with an unref'd `setTimeout(() => process.exit(0), EXIT_CAP_MS)`. `EXIT_CAP_MS` MUST exceed `OBSERVE_TIMEOUT_MS` so the request or the spool write can finish; `test/hook-exit-timing.test.ts` enforces this. `prompt-submit` uses the shared capture module only when its selective settings resolve the same URL and secret as `_capture.ts`; a private config that points elsewhere keeps the direct request. `stop` and `session-end` keep a 1500ms exit timer for their remaining fire-and-forget requests.
 
 ## Coding Standards
 
@@ -116,16 +106,17 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 
 ## Testing
 
-- All tests must pass before PR: `npm test` (1,596+ tests)
+- Before every commit run, in order: `npm run build`, `npm run skills:gen`, `npm run docs:sync`, `npm run skills:check`, `npm test` (2,500+ tests). Commit anything the generators changed. CI runs the same build, skills check and tests.
+- Before any npm publish: `npm run release:gate` must pass. It installs the packed tarballs into a clean home and runs capture, recovery, restart, export/import, MCP and status checks against the installed CLI (see CONTRIBUTING.md, Release process)
 - Mock pattern: `vi.mock("iii-sdk")` with mock `sdk.trigger`, `kv.get/set/list`
 - Test files go in `test/` with `.test.ts` extension
 - Follow existing patterns in `test/crystallize.test.ts` for function tests
 
-## Current Stats (v0.9.29)
+## Current Stats (v0.9.30)
 
 - 54 MCP tools (8 visible by default, `AGENTMEMORY_TOOLS=all` for all)
-- 134 REST endpoints
+- 140 REST endpoints
 - 6 MCP resources, 3 MCP prompts
 - 12 hooks, 17 skills
-- 260+ iii functions
-- 1,596+ tests
+- 311+ iii functions
+- 2,500+ tests

@@ -15,6 +15,8 @@ import {
   buildReducePrompt,
 } from "../prompts/summary.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
+import { isNoopProvider } from "../providers/noop.js";
+import { scrubRecord } from "./privacy.js";
 import { computeInputFingerprint } from "./input-fingerprint.js";
 import { SummaryOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
@@ -395,7 +397,7 @@ export function registerSummarizeFunction(
           return { success: true, summary: existing, skipped: true };
         }
 
-        if (provider.name === "noop") {
+        if (isNoopProvider(provider)) {
           logger.info("Summarize skipped — no LLM provider configured", {
             sessionId,
           });
@@ -463,6 +465,7 @@ export function registerSummarizeFunction(
             }
             return { success: false, error: "parse_failed" };
           }
+          summary = scrubRecord(summary);
 
           const summaryForValidation = {
             title: summary.title,

@@ -6,6 +6,11 @@ import type {
 } from "../src/types.js";
 import { registerEvictFunction } from "../src/functions/evict.js";
 import { KV } from "../src/state/schema.js";
+import { currentAuditScope } from "./helpers/mocks.js";
+import {
+  indexObservationSession,
+  lookupObservationSession,
+} from "../src/state/obs-index.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -155,7 +160,7 @@ describe("mem::evict stale sessions", () => {
     expect(await kv.get(KV.sessions, sessionId)).toBeNull();
     const audits = await kv.list<{
       details: { reason: string };
-    }>(KV.audit);
+    }>(currentAuditScope());
     expect(audits[0].details.reason).toBe(
       "stale_session_recovered_then_evicted",
     );
@@ -165,6 +170,40 @@ describe("mem::evict stale sessions", () => {
     expect(calls.map((call) => call.function_id)).toContain(
       "mem::consolidate-pipeline",
     );
+  });
+
+  it("drops the reverse-index entries of an evicted session's observations", async () => {
+    const sessionId = "ses_stale_indexed";
+    const store = storeForObservedSession(sessionId);
+    const kv = mockKV(store);
+    const { sdk } = mockSdk();
+
+    registerEvictFunction(sdk as never, kv as never);
+    sdk.registerFunction("event::session::stopped", async () => ({
+      success: true,
+    }));
+    sdk.registerFunction("mem::consolidate-pipeline", () => ({
+      success: true,
+    }));
+    sdk.registerFunction("mem::auto-crystallize", () => ({ success: true }));
+
+    const observations = await kv.list<CompressedObservation>(
+      KV.observations(sessionId),
+    );
+    expect(observations.length).toBeGreaterThan(0);
+    for (const o of observations) {
+      await indexObservationSession(kv as never, o.id, sessionId);
+    }
+
+    const result = (await sdk.trigger({
+      function_id: "mem::evict",
+      payload: {},
+    })) as { staleSessions: number };
+
+    expect(result.staleSessions).toBe(1);
+    for (const o of observations) {
+      expect(await lookupObservationSession(kv as never, o.id)).toBeNull();
+    }
   });
 
   it("bounds consolidation to one pass regardless of how many stale sessions are recovered", async () => {
@@ -307,6 +346,6 @@ describe("orphan session eviction", () => {
     registerEvictFunction(sdk as never, kv as never);
     await sdk.trigger({ function_id: "mem::evict", payload: { dryRun: kind === "dry-run" } });
     expect(store.get(KV.sessions)!.has(id)).toBe(kind !== "empty");
-    if (kind === "empty") expect([...store.get(KV.audit)!.values()].some((a: any) => a.details?.reason === "orphan_session_without_observations" || JSON.stringify(a).includes("orphan_session_without_observations"))).toBe(true);
+    if (kind === "empty") expect([...store].filter(([scope]) => scope.startsWith(KV.audit)).flatMap(([, rows]) => [...rows.values()]).some((a: any) => a.details?.reason === "orphan_session_without_observations" || JSON.stringify(a).includes("orphan_session_without_observations"))).toBe(true);
   });
 });

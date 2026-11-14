@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
+import { closeSync, fstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 //#region src/hooks/antigravity-bridge.ts
 const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
 const TOOL_NAME_MAP = {
@@ -84,7 +84,8 @@ function normalizePayload(event, raw) {
 			out["native_tool_name"] = rawName;
 		}
 		out["tool_input"] = args;
-		const result = toolCall["result"] ?? raw["toolResult"] ?? raw["result"];
+		if (out["tool_use_id"] === void 0 && Number.isInteger(raw["stepIdx"]) && raw["stepIdx"] >= 0) out["tool_use_id"] = `step:${raw["stepIdx"]}`;
+		const result = toolCall["result"] ?? raw["toolResult"] ?? raw["result"] ?? firstString(raw["error"]);
 		if (result !== void 0) out["tool_result"] = result;
 	}
 	return out;
@@ -93,15 +94,16 @@ function targetsFor(event, raw) {
 	switch (event) {
 		case "PreInvocation": {
 			const n = raw["invocationNum"];
-			return typeof n !== "number" || n <= 1 ? ["session-start.mjs", "prompt-submit.mjs"] : ["prompt-submit.mjs"];
+			return typeof n !== "number" || n === 0 ? ["session-start.mjs"] : [];
 		}
 		case "PreToolUse": return ["pre-tool-use.mjs"];
 		case "PostToolUse": return ["post-tool-use.mjs"];
-		case "Stop": return ["stop.mjs", "session-end.mjs"];
+		case "Stop": return raw["fullyIdle"] === false ? [] : ["session-end.mjs"];
 		default: return [];
 	}
 }
-function responseFor(event) {
+function responseFor(event, context = "") {
+	if (event === "PreInvocation" && context) return JSON.stringify({ injectSteps: [{ ephemeralMessage: context }] });
 	return event === "PreToolUse" ? "{\"decision\":\"allow\"}" : "{}";
 }
 async function main() {
@@ -117,19 +119,24 @@ async function main() {
 	}
 	if (!raw || typeof raw !== "object") return;
 	const payload = JSON.stringify(normalizePayload(event, raw));
-	for (const script of targetsFor(event, raw)) spawnSync(process.execPath, [join(SCRIPTS_DIR, script)], {
-		input: payload,
-		encoding: "utf8",
-		timeout: 6500,
-		stdio: [
-			"pipe",
-			"ignore",
-			"ignore"
-		]
-	});
+	let context = "";
+	for (const script of targetsFor(event, raw)) {
+		const child = spawnSync(process.execPath, [join(SCRIPTS_DIR, script)], {
+			input: payload,
+			encoding: "utf8",
+			timeout: 6500,
+			stdio: [
+				"pipe",
+				"pipe",
+				"ignore"
+			]
+		});
+		if (event === "PreInvocation" && script === "session-start.mjs" && child.status === 0) context = child.stdout?.trim() ?? "";
+	}
+	return context;
 }
-if (process.argv[1] !== void 0 && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch(() => {}).finally(() => {
-	process.stdout.write(responseFor(process.argv[2] ?? ""));
+if (process.argv[1] !== void 0 && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch(() => void 0).then((context) => {
+	process.stdout.write(responseFor(process.argv[2] ?? "", context));
 	process.exit(0);
 });
 //#endregion

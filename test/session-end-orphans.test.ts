@@ -26,7 +26,7 @@ for (const name of ["api::session::end", "event::session::ended"]) {
       kv.get.mockResolvedValue(null);
       const result = await handlers.get(name)!(payload);
       expect(kv.update).not.toHaveBeenCalled();
-      expect(name.startsWith("api") ? result.status_code : result.skipped).toBe(name.startsWith("api") ? 404 : "session-absent");
+      expect(name.startsWith("api") ? result.body : result).toMatchObject({ success: true, ended: false, reason: "not_found" });
     });
     it("propagates storage failures instead of reporting absence", async () => {
       const { handlers, kv } = setup();

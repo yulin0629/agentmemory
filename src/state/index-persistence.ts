@@ -1,4 +1,4 @@
-import { VectorIndex, base64ToFloat32, float32ToBase64 } from "./vector-index.js";
+import { VectorIndex, base64ToFloat32, float32ToBase64, type VectorEntry } from "./vector-index.js";
 import type { StateKV } from "./kv.js";
 import { KV } from "./schema.js";
 import { logger } from "../logger.js";
@@ -15,6 +15,12 @@ const VECTOR_META_KEY = "vectors:meta";
 const VECTOR_BUCKET_SCOPE_PREFIX = `${KV.bm25Index}:vec:`;
 const WRITE_CONCURRENCY = 32;
 const LOAD_CONCURRENCY = 8;
+const FIRST_CHECKPOINT_DELAY_MS = 5_000;
+const PENDING_CLEAR_KEY = "~clear";
+const PENDING_LOG_SAVE_THRESHOLD = 500;
+const EARLY_SAVE_MIN_GAP_MS = 5_000;
+const BACKFILL_MARKER_KEY = "vectors:backfill";
+const MEMORY_ID_PREFIX = "mem_";
 
 function auditIndexPersistEnabled(): boolean {
   const raw = process.env.AGENTMEMORY_AUDIT_INDEX_PERSIST;
@@ -43,6 +49,29 @@ type PersistedVector = {
   e: string;
 };
 
+type PendingVectorRow = {
+  q: number;
+  id?: string;
+  s?: string;
+  k?: "memory" | "observation";
+  e?: string;
+  t?: 1;
+  c?: 1;
+};
+
+type BackfillMarker = {
+  v: 1;
+  since: string;
+};
+
+export interface PendingReplayResult {
+  entries: number;
+  added: number;
+  removed: number;
+  cleared: boolean;
+  skipped: number;
+}
+
 type IndexPersistenceOptions = {
   saveIntervalMs?: number;
   bucketSize?: number;
@@ -63,11 +92,15 @@ export interface VectorCountShortfall {
 
 export interface IndexPersistenceStatus {
   saveIntervalMs: number;
+  firstCheckpointPending?: boolean;
+  nextSaveAt?: string | null;
   saving: boolean;
   buckets: number;
   pendingChanges: number;
   vector: IndexLegStatus | null;
   vectorCountShortfall: VectorCountShortfall | null;
+  pendingLog?: number;
+  pendingLogError?: string | null;
 }
 
 export type VectorLoadState = "buckets" | "migrated" | "none" | "unavailable";
@@ -130,6 +163,15 @@ async function inBatches<T>(items: T[], size: number, run: (item: T) => Promise<
   return failures;
 }
 
+function isPendingVectorRow(row: unknown): row is PendingVectorRow {
+  if (!row || typeof row !== "object") return false;
+  const candidate = row as PendingVectorRow;
+  if (typeof candidate.q !== "number" || !Number.isFinite(candidate.q)) return false;
+  if (candidate.c === 1) return true;
+  if (typeof candidate.id !== "string" || candidate.id.length === 0) return false;
+  return candidate.t === 1 || typeof candidate.e === "string";
+}
+
 function emptyLegStatus(): IndexLegStatus {
   return { lastSavedAt: null, lastError: null, lastErrorAt: null, dirtySince: null };
 }
@@ -144,6 +186,8 @@ export class IndexPersistence {
   private dirtyEpoch = 0;
   private markedDuringRunAt: number | null = null;
   private metaWritten = false;
+  private firstSaveAttempted = false;
+  private nextSaveAt: number | null = null;
   private leg: IndexLegStatus = emptyLegStatus();
   private readonly saveIntervalMs: number;
   private readonly bucketSize: number;
@@ -153,12 +197,20 @@ export class IndexPersistence {
   private highestBucket = 0;
   private hasOpenBucket = false;
   private vectorCountShortfall: VectorCountShortfall | null = null;
+  private seq = 0;
+  private pendingLog: Map<string, number> = new Map();
+  private logChains: Map<string, Promise<void>> = new Map();
+  private logSuppressed = false;
+  private pendingLogUnknown = false;
+  private pendingLogError: string | null = null;
+  private earlySaveQueued = false;
 
   constructor(
     private kv: StateKV,
     private vector: VectorIndex | null,
     options: IndexPersistenceOptions = {},
   ) {
+    this.vector?.setChangeListener((id, entry) => this.logChange(id, entry));
     this.now = options.now ?? Date.now;
     const interval = options.saveIntervalMs;
     this.saveIntervalMs =
@@ -174,17 +226,12 @@ export class IndexPersistence {
   }
 
   scheduleSave(): void {
-    if (this.stopped || !this.vector) return;
+    if (this.stopped || !this.vector?.pendingChanges) return;
     const now = this.now();
     this.dirtyEpoch++;
     if (this.running && this.markedDuringRunAt === null) this.markedDuringRunAt = now;
     if (this.leg.dirtySince === null) this.leg.dirtySince = new Date(now).toISOString();
-    if (this.timer) return;
-    const delay = Math.max(0, this.lastSaveAt + this.saveIntervalMs - now);
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      this.save().catch((err) => this.logFailure(err));
-    }, delay);
+    this.queueSave();
   }
 
   save(): Promise<void> {
@@ -204,12 +251,181 @@ export class IndexPersistence {
   status(): IndexPersistenceStatus {
     return {
       saveIntervalMs: this.saveIntervalMs,
+      firstCheckpointPending: Boolean(this.vector && !this.metaWritten && (this.vector.pendingChanges > 0 || this.running)),
+      nextSaveAt: this.nextSaveAt === null ? null : new Date(this.nextSaveAt).toISOString(),
       saving: this.running !== null,
       buckets: this.bucketCountInUse(),
       pendingChanges: this.vector?.pendingChanges ?? 0,
       vector: this.vector ? { ...this.leg } : null,
       vectorCountShortfall: this.vectorCountShortfall,
+      pendingLog: this.vector ? this.pendingLog.size : 0,
+      pendingLogError: this.pendingLogError,
     };
+  }
+
+  async replayPendingLog(expectedDimensions = 0): Promise<PendingReplayResult> {
+    const result: PendingReplayResult = { entries: 0, added: 0, removed: 0, cleared: false, skipped: 0 };
+    const vector = this.vector;
+    if (!vector) return result;
+    let rows: unknown[];
+    try {
+      rows = await this.kv.list<unknown>(KV.vectorPendingLog);
+    } catch (err) {
+      this.pendingLogUnknown = true;
+      this.pendingLogError = errorMessage(err);
+      logger.warn("index persistence: could not read the pending vector log", { message: this.pendingLogError });
+      return result;
+    }
+    const valid = (Array.isArray(rows) ? rows : []).filter(isPendingVectorRow).sort((a, b) => a.q - b.q);
+    this.logSuppressed = true;
+    try {
+      for (const row of valid) {
+        result.entries++;
+        const key = row.c === 1 ? PENDING_CLEAR_KEY : row.id!;
+        if ((this.pendingLog.get(key) ?? -Infinity) < row.q) this.pendingLog.set(key, row.q);
+        if (row.q > this.seq) this.seq = row.q;
+        if (row.c === 1) {
+          vector.clear();
+          result.cleared = true;
+          continue;
+        }
+        const id = row.id!;
+        if (row.t === 1) {
+          if (vector.has(id)) {
+            vector.remove(id);
+            result.removed++;
+          }
+          continue;
+        }
+        let embedding: Float32Array;
+        try {
+          embedding = base64ToFloat32(row.e!);
+        } catch {
+          result.skipped++;
+          continue;
+        }
+        if (embedding.length === 0 || (expectedDimensions > 0 && embedding.length !== expectedDimensions)) {
+          result.skipped++;
+          continue;
+        }
+        vector.add(id, typeof row.s === "string" ? row.s : "", embedding);
+        result.added++;
+      }
+    } finally {
+      this.logSuppressed = false;
+    }
+    if (result.added + result.removed > 0 || result.cleared) this.scheduleSave();
+    return result;
+  }
+
+  async readBackfillMarker(): Promise<string | null> {
+    if (!this.vector) return null;
+    try {
+      const marker = await this.kv.get<BackfillMarker>(KV.bm25Index, BACKFILL_MARKER_KEY);
+      return marker && typeof marker.since === "string" && !Number.isNaN(Date.parse(marker.since)) ? marker.since : null;
+    } catch (err) {
+      logger.warn("index persistence: vector backfill marker read failed", { message: errorMessage(err) });
+      return null;
+    }
+  }
+
+  async markBackfillSince(since: string): Promise<void> {
+    if (!this.vector || Number.isNaN(Date.parse(since))) return;
+    const current = await this.readBackfillMarker();
+    if (current !== null && Date.parse(current) <= Date.parse(since)) return;
+    await this.kv.set<BackfillMarker>(KV.bm25Index, BACKFILL_MARKER_KEY, { v: 1, since });
+  }
+
+  async clearBackfillMarker(): Promise<void> {
+    if (!this.vector) return;
+    await this.kv.delete(KV.bm25Index, BACKFILL_MARKER_KEY);
+  }
+
+  async flushPendingLog(): Promise<void> {
+    await Promise.all([...this.logChains.values()]);
+  }
+
+  private nextSeq(): number {
+    this.seq = Math.max(this.seq + 1, this.now() * 1000);
+    return this.seq;
+  }
+
+  private logChange(id: string | null, entry: VectorEntry | null): void {
+    if (this.logSuppressed) return;
+    const key = id ?? PENDING_CLEAR_KEY;
+    const q = this.nextSeq();
+    let row: PendingVectorRow;
+    if (id === null) {
+      row = { q, c: 1 };
+    } else if (entry) {
+      row = {
+        q,
+        id,
+        s: entry.sessionId,
+        k: id.startsWith(MEMORY_ID_PREFIX) ? "memory" : "observation",
+        e: float32ToBase64(entry.embedding),
+      };
+    } else {
+      row = { q, id, t: 1 };
+    }
+    this.pendingLog.set(key, q);
+    this.enqueueLog(key, async () => {
+      await this.kv.set<PendingVectorRow>(KV.vectorPendingLog, key, row);
+    }).then(
+      () => {
+        this.pendingLogError = null;
+      },
+      (err) => {
+        this.pendingLogError = errorMessage(err);
+        this.logFailure(err);
+      },
+    );
+    this.maybeEarlySave();
+  }
+
+  private enqueueLog(key: string, op: () => Promise<void>): Promise<void> {
+    const run = (this.logChains.get(key) ?? Promise.resolve()).then(op);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.logChains.set(key, tail);
+    void tail.then(() => {
+      if (this.logChains.get(key) === tail) this.logChains.delete(key);
+    });
+    return run;
+  }
+
+  private maybeEarlySave(): void {
+    if (this.stopped || this.running || this.earlySaveQueued) return;
+    if (this.pendingLog.size < PENDING_LOG_SAVE_THRESHOLD) return;
+    if (this.now() - this.lastSaveAt < EARLY_SAVE_MIN_GAP_MS) return;
+    this.earlySaveQueued = true;
+    setTimeout(() => {
+      this.earlySaveQueued = false;
+      this.save().catch((err) => this.logFailure(err));
+    }, 0);
+  }
+
+  private deletePendingKey(key: string, q: number | undefined): Promise<void> {
+    return this.enqueueLog(key, async () => {
+      if (this.pendingLog.get(key) !== q) return;
+      await this.kv.delete(KV.vectorPendingLog, key);
+      if (this.pendingLog.get(key) === q) this.pendingLog.delete(key);
+    });
+  }
+
+  private async clearCoveredPendingLog(coveredSeq: number): Promise<void> {
+    const clearSeq = this.pendingLog.get(PENDING_CLEAR_KEY);
+    if (clearSeq !== undefined ? clearSeq <= coveredSeq : this.pendingLogUnknown) {
+      await this.deletePendingKey(PENDING_CLEAR_KEY, clearSeq);
+    }
+    const covered = [...this.pendingLog].filter(([key, q]) => key !== PENDING_CLEAR_KEY && q <= coveredSeq);
+    const failures = await inBatches(covered, WRITE_CONCURRENCY, ([key, q]) => this.deletePendingKey(key, q));
+    if (failures.length > 0) {
+      throw new Error(`${failures.length} of ${covered.length} pending vector log deletes failed: ${errorMessage(failures[0])}`);
+    }
+    this.pendingLogUnknown = false;
   }
 
   stop(): void {
@@ -285,11 +501,28 @@ export class IndexPersistence {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    this.nextSaveAt = null;
+  }
+
+  private queueSave(): void {
+    if (this.stopped || this.timer || !this.vector?.pendingChanges) return;
+    const now = this.now();
+    const remaining = Math.max(0, this.lastSaveAt + this.saveIntervalMs - now);
+    const delay = !this.metaWritten && !this.firstSaveAttempted
+      ? Math.min(FIRST_CHECKPOINT_DELAY_MS, remaining)
+      : remaining;
+    this.nextSaveAt = now + delay;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.nextSaveAt = null;
+      this.save().catch((err) => this.logFailure(err));
+    }, delay);
   }
 
   private startRun(): Promise<void> {
     const run = this.runSave().finally(() => {
       if (this.running === run) this.running = null;
+      if (!this.queued) this.queueSave();
     });
     this.running = run;
     return run;
@@ -297,12 +530,18 @@ export class IndexPersistence {
 
   private async runSave(): Promise<void> {
     const vector = this.vector;
-    if (!vector) return;
+    if (!vector?.pendingChanges) return;
     const epoch = this.dirtyEpoch;
     this.markedDuringRunAt = null;
     this.lastSaveAt = this.now();
+    this.firstSaveAttempted = true;
+    const coveredSeq = this.seq;
     try {
       await this.writeChanges(vector);
+      await this.clearCoveredPendingLog(coveredSeq).catch((err) => {
+        this.pendingLogError = errorMessage(err);
+        this.logFailure(err);
+      });
       this.leg.lastSavedAt = new Date(this.now()).toISOString();
       this.leg.lastError = null;
       this.leg.lastErrorAt = null;
@@ -315,13 +554,15 @@ export class IndexPersistence {
       this.leg.lastError = errorMessage(err);
       this.leg.lastErrorAt = new Date(this.now()).toISOString();
       if (this.leg.dirtySince === null) this.leg.dirtySince = this.leg.lastErrorAt;
+      this.lastSaveAt = this.now();
+      this.clearTimer();
       this.logFailure(err);
     }
   }
 
   private async writeChanges(vector: VectorIndex): Promise<void> {
     const changes = vector.takeChanges();
-    if (changes.size === 0 && this.metaWritten) return;
+    if (changes.size === 0) return;
     const failed = new Map<string, boolean>();
     const failures = await inBatches([...changes], WRITE_CONCURRENCY, async ([id, present]) => {
       const entry = present ? vector.get(id) : undefined;
@@ -351,12 +592,17 @@ export class IndexPersistence {
         `${failures.length} of ${changes.size} vector writes failed: ${errorMessage(failures[0])}`,
       );
     }
-    await this.kv.set<VectorMeta>(KV.bm25Index, VECTOR_META_KEY, {
-      v: 3,
-      bucketCount: this.bucketCountInUse(),
-      savedAt: new Date(this.now()).toISOString(),
-      count: vector.size,
-    });
+    try {
+      await this.kv.set<VectorMeta>(KV.bm25Index, VECTOR_META_KEY, {
+        v: 3,
+        bucketCount: this.bucketCountInUse(),
+        savedAt: new Date(this.now()).toISOString(),
+        count: vector.size,
+      });
+    } catch (err) {
+      vector.returnChanges(changes);
+      throw err;
+    }
     this.metaWritten = true;
   }
 

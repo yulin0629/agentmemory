@@ -6,9 +6,11 @@ import { getAllTools } from "./tools-registry.js";
 import { getStandalonePersistPath } from "../config.js";
 import { VERSION } from "../version.js";
 import { generateId } from "../state/schema.js";
+import { queryAudit } from "../functions/audit.js";
 import {
   resolveHandle,
   invalidateHandle,
+  ProxyCallError,
   type Handle,
   type ProxyHandle,
 } from "./rest-proxy.js";
@@ -241,8 +243,20 @@ async function handleProxy(
       return textResponse(result);
     }
     case "memory_export": {
-      const result = await handle.call("/agentmemory/export", { method: "GET" });
-      return textResponse(result, true);
+      try {
+        const result = await handle.call("/agentmemory/export", { method: "GET" });
+        return textResponse(result, true);
+      } catch (err) {
+        if (
+          err instanceof ProxyCallError &&
+          err.body != null &&
+          typeof err.body === "object" &&
+          (err.body as { oversized?: boolean }).oversized === true
+        ) {
+          return textResponse(err.body, true);
+        }
+        throw err;
+      }
     }
     case "memory_audit": {
       const result = await handle.call(
@@ -337,14 +351,10 @@ async function handleLocal(
     }
 
     case "memory_audit": {
-      const entries = await kvInstance.list("mem:audit");
-      const limit = v.limit ?? 50;
-      return textResponse(
-        {
-          entries: (entries as Array<Record<string, unknown>>).slice(0, limit),
-        },
-        true,
-      );
+      const result = await queryAudit(kvInstance as never, {
+        limit: v.limit ?? 50,
+      });
+      return textResponse(result, true);
     }
 
     default:
@@ -379,9 +389,6 @@ export async function handleToolCall(
   const handle = await resolveHandle();
   announceMode(handle);
 
-  // Tools the local InMemoryKV fallback doesn't implement: forward straight
-  // to the server. Local validation would otherwise raise "Unknown tool"
-  // (issue #234).
   if (!IMPLEMENTED_TOOLS.has(toolName)) {
     if (handle.mode === "proxy") {
       try {

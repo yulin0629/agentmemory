@@ -128,6 +128,7 @@ describe("OpenAI explicit system role compatibility", () => {
     const kv = {
       get: async (scope: string, key: string) => store.get(`${scope}/${key}`) ?? null,
       set: async (scope: string, key: string, value: unknown) => { store.set(`${scope}/${key}`, value); return value; },
+      list: async (scope: string) => [...store].filter(([key]) => key.startsWith(`${scope}/`)).map(([, value]) => value),
     };
     const functions = new Map<string, (payload: unknown) => Promise<unknown>>();
     const sdk = {
@@ -142,7 +143,7 @@ describe("OpenAI explicit system role compatibility", () => {
       { role: "developer", content: COMPRESSION_SYSTEM },
       { role: "user", content: buildCompressionPrompt(raw) },
     ]);
-    expect(store.get(`${scope}/${raw.id}`)).toEqual(result.compressed);
+    expect(store.get(`${scope}/${raw.id}`)).toMatchObject(result.compressed);
     expect(result.compressed).toMatchObject({ id: raw.id, sessionId: raw.sessionId, timestamp: raw.timestamp, type: "file_read", title: "Read role provider", facts: ["Roles stay separate."], files: ["src/providers/openai.ts"], importance: 6 });
     expect(result.compressed.confidence).not.toBe(0.3);
   });

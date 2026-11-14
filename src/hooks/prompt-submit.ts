@@ -3,6 +3,14 @@ import { resolveProject, resolveContextProjectId, hookCwd } from "./_project.js"
 import { previousContext } from "./_previous-context.js";
 import { isRememberRequest } from "../state/explicit-memory.js";
 import { selectiveSettings } from "./_selective-settings.js";
+import {
+  REST_URL as CAPTURE_URL,
+  authHeaders as captureAuthHeaders,
+  captureObservation,
+  isDrainChild,
+  runDrainChild,
+  withEventId,
+} from "./_capture.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -16,6 +24,8 @@ const SECRET = settings.secret;
 const SHARED_CLIENT = process.env.AGENTMEMORY_SHARED_CLIENT === "1";
 const SELECTIVE_CONTEXT_INJECT = settings.enabled && (settings.owner !== "agent-hooks" || SHARED_CLIENT);
 const SELECTIVE_CONTEXT_TIMEOUT_MS = 2000;
+const OBSERVE_TIMEOUT_MS = 3000;
+const EXIT_CAP_MS = 3500;
 
 // Diagnostic metadata travels separately from model-facing stdout. Never log content or errors verbatim.
 function diagnostic(reason: string, fields: Record<string, string | number> = {}) {
@@ -30,6 +40,12 @@ function authHeaders(): Record<string, string> {
   if (settings.selectiveSecret) h["X-AgentMemory-Selective-Secret"] = settings.selectiveSecret;
   return h;
 }
+
+// The shared capture module resolves its own URL and secret. Its spool is used
+// only when both match this hook's settings; a private config that points
+// elsewhere keeps the direct request.
+const DURABLE_CAPTURE = REST_URL === CAPTURE_URL
+  && authHeaders()["Authorization"] === captureAuthHeaders()["Authorization"];
 
 function contextPayload(data: Record<string, unknown>, context: string): string {
   if (
@@ -60,6 +76,7 @@ function renderSelectedContext(result: unknown): string | null {
 }
 
 async function main() {
+  if (isDrainChild()) return runDrainChild();
   let input = "";
   for await (const chunk of process.stdin) {
     input += chunk;
@@ -83,25 +100,26 @@ async function main() {
   const prompt = typeof data.prompt === "string" ? data.prompt
     : typeof data.userPrompt === "string" ? data.userPrompt : "";
 
-  const observation = SHARED_CLIENT && !isRememberRequest(prompt) ? Promise.resolve(null) : fetch(`${REST_URL}/agentmemory/observe`, {
+  const explicit = SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt);
+  const body = {
+    hookType: "prompt_submit",
+    sessionId,
+    project,
+    cwd,
+    timestamp: new Date().toISOString(),
+    data: { prompt, ...(projectId ? { contextProjectId: projectId } : {}), ...(explicit ? { explicitMemoryRequest: true } : {}) },
+  };
+  const post = (timeoutMs: number) => fetch(`${REST_URL}/agentmemory/observe`, {
     method: "POST",
     headers: authHeaders(),
-    body: JSON.stringify({
-      hookType: "prompt_submit",
-      sessionId,
-      project,
-      cwd,
-      timestamp: new Date().toISOString(),
-      data: { prompt, ...(projectId ? { contextProjectId: projectId } : {}), ...(SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt)
-        ? { explicitMemoryRequest: true } : {}) },
-    }),
-    signal: AbortSignal.timeout(SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt) ? 5000 : 3000),
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
-  if (SELECTIVE_CONTEXT_INJECT && isRememberRequest(prompt)) {
+  if (explicit) {
     let notice = "[Memory update] Storage could not be confirmed. Do not claim this request was saved.";
     try {
-      const response = await observation;
+      const response = await post(5000);
       const result = response?.ok ? await response.json() as {
         knowledgeCapture?: { success?: boolean; status?: string; action?: string; knowledgeId?: string };
       } : null;
@@ -120,7 +138,10 @@ async function main() {
     process.stdout.write(contextPayload(data, notice));
     return;
   }
-  observation.catch(() => {});
+  if (!SHARED_CLIENT || isRememberRequest(prompt)) {
+    if (DURABLE_CAPTURE) void captureObservation(withEventId(body, data), OBSERVE_TIMEOUT_MS);
+    else post(OBSERVE_TIMEOUT_MS).catch(() => {});
+  }
 
   if (SELECTIVE_CONTEXT_INJECT && prompt.trim()) {
     const started = performance.now();
@@ -153,7 +174,7 @@ async function main() {
       // A slow or unavailable judge must never block a user prompt.
     }
   } else diagnostic("disabled_or_empty_prompt");
-  setTimeout(() => process.exit(0), 1500).unref();
+  setTimeout(() => process.exit(0), EXIT_CAP_MS).unref();
 }
 
 main().catch(() => process.exit(0));

@@ -9,6 +9,7 @@ import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation } from '../state/memory-utils.js'
 import { recordAccessBatch } from './access-tracker.js'
 import { logger } from "../logger.js";
+import { withoutObservationSource } from "./observation-source.js";
 import {
   getAgentId,
   getVectorBackfillMax,
@@ -55,7 +56,28 @@ export function isBm25RebuildIncomplete(): boolean {
   return bm25RebuildIncomplete
 }
 
+let keywordRebuildPending = false
+let keywordRebuildsRunning = 0
+let keywordRebuildEpoch = 0
+export function getKeywordRebuildEpoch(): number {
+  return keywordRebuildEpoch
+}
+export function markKeywordRebuildPending(): void {
+  keywordRebuildPending = true
+}
+export function isKeywordRebuildInProgress(): boolean {
+  return keywordRebuildPending || keywordRebuildsRunning > 0
+}
+
 let pendingVectorBackfill = 0
+export type VectorBackfillState = "idle" | "running" | "paused" | "waiting-for-opt-in"
+let vectorBackfillState: VectorBackfillState = "idle"
+export function getVectorBackfillState(): VectorBackfillState {
+  return vectorBackfillState
+}
+export function setVectorBackfillState(state: VectorBackfillState): void {
+  vectorBackfillState = state
+}
 export function getPendingVectorBackfillCount(): number {
   return pendingVectorBackfill
 }
@@ -82,6 +104,45 @@ export function setEmbeddingProvider(provider: EmbeddingProvider | null): void {
 
 export function getEmbeddingProvider(): EmbeddingProvider | null {
   return currentEmbeddingProvider
+}
+
+const MEMORY_ID_PREFIX = "mem_"
+const RANK_FUSION_K = 60
+
+export async function rankMemoryIds(
+  query: string,
+  limit: number,
+): Promise<{ ids: string[]; mode: "hybrid" | "keyword" }> {
+  const fetchLimit = Math.max(limit * 4, 50)
+  const keyword = getSearchIndex()
+    .search(query, fetchLimit)
+    .filter((hit) => hit.obsId.startsWith(MEMORY_ID_PREFIX))
+  let semantic: Array<{ obsId: string }> = []
+  if (vectorIndex && vectorIndex.size > 0 && currentEmbeddingProvider) {
+    try {
+      const embedding = await currentEmbeddingProvider.embed(query)
+      semantic = vectorIndex
+        .search(embedding, fetchLimit)
+        .filter((hit) => hit.obsId.startsWith(MEMORY_ID_PREFIX))
+    } catch (err) {
+      logger.warn("memory vector ranking failed, using keyword ranking", {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+  const scores = new Map<string, number>()
+  const addRanks = (hits: Array<{ obsId: string }>) => {
+    hits.forEach((hit, rank) => {
+      scores.set(hit.obsId, (scores.get(hit.obsId) ?? 0) + 1 / (RANK_FUSION_K + rank + 1))
+    })
+  }
+  addRanks(keyword)
+  addRanks(semantic)
+  const ids = Array.from(scores.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([id]) => id)
+  return { ids, mode: semantic.length > 0 ? "hybrid" : "keyword" }
 }
 
 export function vectorIndexRemove(id: string): void {
@@ -159,6 +220,7 @@ type PendingAdd = {
   sessionId: string
   text: string
   context: { kind: "memory" | "observation" | "synthetic"; logId: string }
+  commit?: (embedding: Float32Array) => Promise<boolean> | boolean
   resolve: (ok: boolean) => void
 }
 
@@ -179,6 +241,7 @@ async function flushPendingAdds(): Promise<void> {
   const task = (async () => {
     try {
       const outcomes = await addVectorBatch(batch, (i) => !cancelledAdds.has(batch[i]))
+      if (outcomes.some(Boolean)) scheduleIndexSave()
       batch.forEach((p, i) => p.resolve(outcomes[i]))
     } catch {
       for (const p of batch) p.resolve(false)
@@ -199,13 +262,14 @@ export async function vectorIndexAddGuarded(
   sessionId: string,
   text: string,
   context: { kind: "memory" | "observation" | "synthetic"; logId: string },
+  commit?: (embedding: Float32Array) => Promise<boolean> | boolean,
 ): Promise<boolean> {
   const vi = vectorIndex
   const ep = currentEmbeddingProvider
   if (!vi || !ep) return false
   if (COALESCE_WINDOW_MS > 0) {
     return new Promise<boolean>((resolve) => {
-      const pending = { id, sessionId, text, context, resolve }
+      const pending = { id, sessionId, text, context, commit, resolve }
       activeAdds.add(pending)
       pendingAdds.push(pending)
       if (pendingAdds.length >= COALESCE_MAX_ITEMS) {
@@ -219,10 +283,21 @@ export async function vectorIndexAddGuarded(
   }
   // Registered like a coalesced add so a vectorIndexRemove that lands while
   // the embed is in flight cancels the write instead of being undone by it.
-  const pending: PendingAdd = { id, sessionId, text, context, resolve: () => {} }
+  const pending: PendingAdd = { id, sessionId, text, context, commit, resolve: () => {} }
   activeAdds.add(pending)
   try {
-    const embedding = await ep.embed(clipEmbedInput(text))
+    let embedding: Float32Array
+    try {
+      embedding = await ep.embed(clipEmbedInput(text))
+    } catch (err) {
+      logger.warn("vector-index add: embed failed — skipping", {
+        kind: context.kind,
+        id: context.logId,
+        provider: ep.name,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return false
+    }
     if (cancelledAdds.has(pending)) return false
     if (embedding.length !== ep.dimensions) {
       logger.warn("vector-index add: dimension mismatch — skipping", {
@@ -234,16 +309,24 @@ export async function vectorIndexAddGuarded(
       })
       return false
     }
+    if (commit) {
+      try {
+        const committed = await commit(embedding)
+        if (committed) scheduleIndexSave()
+        return committed
+      } catch (err) {
+        logger.warn("vector-index add: commit failed — skipping", {
+          kind: context.kind,
+          id: context.logId,
+          provider: ep.name,
+          error: err instanceof Error ? err.message : String(err),
+        })
+        return false
+      }
+    }
     vi.add(id, sessionId, embedding)
+    scheduleIndexSave()
     return true
-  } catch (err) {
-    logger.warn("vector-index add: embed failed — skipping", {
-      kind: context.kind,
-      id: context.logId,
-      provider: ep.name,
-      error: err instanceof Error ? err.message : String(err),
-    })
-    return false
   } finally {
     activeAdds.delete(pending)
   }
@@ -324,8 +407,8 @@ async function addVectorBatch(
       continue
     }
     try {
-      vi.add(item.id, item.sessionId, embedding)
-      outcomes.push(true)
+      const added = item.commit ? await item.commit(embedding) : (vi.add(item.id, item.sessionId, embedding), true)
+      outcomes.push(added)
     } catch (err) {
       logger.warn("vector-index add batch: index write failed — skipping item", {
         kind: item.context.kind,
@@ -532,10 +615,26 @@ async function listSessionsWithRetry(kv: StateKV): Promise<Session[] | null> {
   return null
 }
 
+type KeywordRebuildResult = { documents: number; vectorJobs: VectorBackfillJob[]; fullBackfillPending: number }
+
 export async function rebuildKeywordIndex(
   kv: StateKV,
   vectorBackfillSince?: string | null,
-): Promise<{ documents: number; vectorJobs: VectorBackfillJob[]; fullBackfillPending: number }> {
+): Promise<KeywordRebuildResult> {
+  keywordRebuildsRunning++
+  try {
+    return await runKeywordRebuild(kv, vectorBackfillSince)
+  } finally {
+    keywordRebuildsRunning--
+    keywordRebuildPending = false
+    keywordRebuildEpoch++
+  }
+}
+
+async function runKeywordRebuild(
+  kv: StateKV,
+  vectorBackfillSince?: string | null,
+): Promise<KeywordRebuildResult> {
   const idx = getSearchIndex()
   idx.clear()
   memoryIndexReady = false
@@ -562,7 +661,7 @@ export async function rebuildKeywordIndex(
       fullBackfillPending++
       return
     }
-    if (!backfillActive || vectorJobs.length >= backfillCap) return
+    if (!backfillActive || (wholeStoreBackfill && vectorJobs.length >= backfillCap)) return
     vectorJobs.push({ id, sessionId, text, context: { kind, logId: id } })
   }
 
@@ -619,24 +718,64 @@ export async function rebuildKeywordIndex(
 }
 
 const BACKFILL_SAVE_EVERY_BATCHES = 10
+const VECTOR_BACKLOG_PAUSE_MS = 1000
 
-export async function backfillVectors(jobs: VectorBackfillJob[]): Promise<number> {
+async function embedBackfillJobs(
+  jobs: VectorBackfillJob[],
+  remainingAfter: number,
+): Promise<{ ok: number; fail: number }> {
   const batchSize = getRebuildEmbedBatchSize()
-  let added = 0
+  let ok = 0
+  let fail = 0
   let batchesSinceSave = 0
-  setPendingVectorBackfillCount(jobs.length)
+  setPendingVectorBackfillCount(remainingAfter + jobs.length)
   for (let offset = 0; offset < jobs.length; offset += batchSize) {
-    const { ok } = await vectorIndexAddBatchGuarded(jobs.slice(offset, offset + batchSize))
-    added += ok
-    setPendingVectorBackfillCount(jobs.length - Math.min(jobs.length, offset + batchSize))
+    const result = await vectorIndexAddBatchGuarded(jobs.slice(offset, offset + batchSize))
+    ok += result.ok
+    fail += result.fail
+    setPendingVectorBackfillCount(remainingAfter + jobs.length - Math.min(jobs.length, offset + batchSize))
     batchesSinceSave++
     if (batchesSinceSave >= BACKFILL_SAVE_EVERY_BATCHES) {
       await flushIndexSave()
       batchesSinceSave = 0
     }
   }
-  if (added > 0) await flushIndexSave()
-  return added
+  if (ok > 0) await flushIndexSave()
+  return { ok, fail }
+}
+
+export async function backfillVectors(jobs: VectorBackfillJob[]): Promise<number> {
+  return (await embedBackfillJobs(jobs, 0)).ok
+}
+
+export type VectorBacklogResult = { added: number; failed: number; remaining: number; complete: boolean }
+
+export async function backfillVectorBacklog(
+  jobs: VectorBackfillJob[],
+  options: { batchSize?: number; pauseMs?: number } = {},
+): Promise<VectorBacklogResult> {
+  const batchSize = options.batchSize && options.batchSize > 0 ? options.batchSize : getVectorBackfillMax()
+  const pauseMs = options.pauseMs ?? VECTOR_BACKLOG_PAUSE_MS
+  let added = 0
+  let failed = 0
+  for (let offset = 0; offset < jobs.length; offset += batchSize) {
+    if (offset > 0 && pauseMs > 0) await delay(pauseMs)
+    const after = Math.max(0, jobs.length - offset - batchSize)
+    const batch = jobs.slice(offset, offset + batchSize).filter((job) => !vectorIndex?.has(job.id))
+    if (batch.length === 0) {
+      setPendingVectorBackfillCount(after)
+      continue
+    }
+    const result = await embedBackfillJobs(batch, after)
+    added += result.ok
+    failed += result.fail
+    if (result.ok === 0) {
+      setPendingVectorBackfillCount(jobs.length - offset)
+      return { added, failed, remaining: jobs.length - offset, complete: false }
+    }
+  }
+  setPendingVectorBackfillCount(failed)
+  return { added, failed, remaining: failed, complete: failed === 0 }
 }
 
 export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
@@ -668,19 +807,6 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
       }
       const projectFilter = typeof data.project === 'string' && data.project.trim().length > 0 ? data.project.trim() : undefined
       const cwdFilter = typeof data.cwd === 'string' && data.cwd.trim().length > 0 ? data.cwd.trim() : undefined
-      // #817: agent-scope isolation. mem::search backs REST /search,
-      // memory_recall and recall_context. Without filtering here a
-      // worker booted with AGENT_ID=B + AGENTMEMORY_AGENT_SCOPE=isolated
-      // could read A's memories — the cross-agent leak the issue
-      // documented. Mirrors the smart-search pattern: wildcard "*"
-      // bypasses, explicit agentId pins, isolated mode falls back to
-      // the worker's own AGENT_ID.
-      //
-      // Fail-closed: if isolated mode is on AND no explicit agentId
-      // is given AND env AGENT_ID is unset, refuse the call rather
-      // than silently dropping the filter. Allowing the call through
-      // with filterAgentId=undefined is the same leak this fix is
-      // supposed to close.
       const isolated = isAgentScopeIsolated();
       const explicitAgentId =
         typeof data.agentId === "string" && data.agentId.trim().length > 0
@@ -841,10 +967,6 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
         candidates.push(r)
       }
 
-      // Second pass: load observations in parallel. Fall back to
-      // KV.memories when the observation lookup misses — entries indexed
-      // via mem::remember live in the memories scope under a synthetic
-      // sessionId, so the observation key never exists (#265).
       const obsResults = await Promise.all(
         candidates.map(async (r) => {
           if (r.observation) return r.observation
@@ -862,14 +984,10 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
       for (let i = 0; i < candidates.length; i++) {
         const obs = obsResults[i]
         if (!obs) continue
-        // #817: enforce agent-scope after the observation/memory is
-        // loaded. The BM25 index doesn't carry agentId so the filter
-        // happens post-lookup. Wildcard ("*") and no-isolation paths
-        // resolved filterAgentId=undefined upstream and pass through.
         if (filterAgentId !== undefined && obs.agentId !== filterAgentId) continue
         if (enriched.length >= effectiveLimit) break
         enriched.push({
-          observation: obs,
+          observation: withoutObservationSource(obs),
           score: candidates[i].score,
           sessionId: candidates[i].sessionId,
         })
