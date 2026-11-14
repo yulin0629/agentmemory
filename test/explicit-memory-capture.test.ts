@@ -9,7 +9,7 @@ import type { ContextKnowledgeCatalog } from "../src/types.js";
 import { registerLessonsFunctions, resetLessonIndex } from "../src/functions/lessons.js";
 
 vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
-vi.mock("../src/config.js", () => ({ isAutoCompressEnabled: () => false, getAgentId: () => undefined }));
+vi.mock("../src/config.js", () => ({ isAutoCompressEnabled: () => false, getAgentId: () => undefined, getFinalizeIdleMs: () => 0 }));
 vi.mock("../src/functions/search.js", () => ({ getSearchIndex: () => ({ add: vi.fn() }), vectorIndexAddGuarded: vi.fn(), scheduleIndexSave: vi.fn() }));
 
 const useful: ContextJudge = async (_request, records) => records.flatMap(record => record.spans.map(span => ({

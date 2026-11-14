@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { registerMcpEndpoints } from "../src/mcp/server.js";
+import { registerApiTriggers } from "../src/triggers/api.js";
 import { KV } from "../src/state/schema.js";
 
 function mockSdk() {
@@ -196,6 +197,7 @@ describe("remote MCP HTTP endpoint", () => {
     const kv = mockKv();
     kv.sessions.push({ id: "session-1", startedAt: "2026-03-01T00:00:00Z" });
     registerMcpEndpoints(sdk as never, kv as never, undefined, "chatgpt-secret");
+    registerApiTriggers(sdk as never, kv as never, "");
     const handler = sdk.getFunction("mcp::remote")!;
 
     const result = await handler(
@@ -214,7 +216,6 @@ describe("remote MCP HTTP endpoint", () => {
     expect(result.body.result.isError).toBeUndefined();
     const payload = JSON.parse(result.body.result.content[0].text);
     expect(payload.sessions).toHaveLength(1);
-    expect(payload.total).toBe(1);
   });
 
   it("marks every result with resultType for 2026-07-28 clients", async () => {
@@ -222,6 +223,7 @@ describe("remote MCP HTTP endpoint", () => {
     const kv = mockKv();
     kv.sessions.push({ id: "session-1", startedAt: "2026-03-01T00:00:00Z" });
     registerMcpEndpoints(sdk as never, kv as never, undefined, "chatgpt-secret");
+    registerApiTriggers(sdk as never, kv as never, "");
     const handler = sdk.getFunction("mcp::remote")!;
     const call = (id: number, method: string, params?: unknown) =>
       handler(req({ jsonrpc: "2.0", id, method, params }, "chatgpt-secret"));
@@ -392,6 +394,7 @@ describe("remote MCP HTTP endpoint", () => {
       { id: "middle", startedAt: "2026-02-01T00:00:00Z" },
     );
     registerMcpEndpoints(sdk as never, kv as never);
+    registerApiTriggers(sdk as never, kv as never, "");
 
     const handler = sdk.getFunction("mcp::tools::call")!;
     const result = await handler(req({ name: "memory_sessions", arguments: { limit: 2 } }));

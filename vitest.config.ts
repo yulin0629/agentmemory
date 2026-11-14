@@ -17,6 +17,9 @@ export default defineConfig({
     env: {
       HOME: testHome,
       USERPROFILE: testHome,
+      // The embedding coalescer delays every vector write by its window.
+      // Tests run without it; test/embedding-coalesce.test.ts opts back in.
+      EMBED_COALESCE_MS: "0",
     },
   },
 });

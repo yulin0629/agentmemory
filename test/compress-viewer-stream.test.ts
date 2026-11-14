@@ -11,16 +11,17 @@ vi.mock("../src/functions/search.js", () => ({
 }));
 
 import { registerCompressFunction } from "../src/functions/compress.js";
-import { STREAM } from "../src/state/schema.js";
+import { KV } from "../src/state/schema.js";
+import { onLiveEvent } from "../src/viewer/live-events.js";
 import type { MemoryProvider, RawObservation } from "../src/types.js";
 
-const VALID_COMPRESS_XML = `<type>command_run</type>
+const VALID_COMPRESS_XML = `<observation><type>command_run</type>
 <title>Ran a probe command</title>
 <facts><fact>Ran echo probe</fact></facts>
 <narrative>The agent ran a probe command</narrative>
 <concepts><concept>testing</concept></concepts>
 <files></files>
-<importance>5</importance>`;
+<importance>5</importance></observation>`;
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -32,15 +33,14 @@ function mockKV() {
       return data;
     },
     delete: async () => {},
-    list: async () => [],
+    list: async (scope: string) => [...(store.get(scope)?.values() ?? [])],
   };
 }
 
-describe("compress no longer writes a per-session mem-live group", () => {
-  it("only targets the viewer group on stream:: calls", async () => {
+describe("compress emits updates over the worker-owned SSE hub", () => {
+  it("broadcasts the compressed observation without a legacy stream worker", async () => {
     const trigger = vi.fn(async () => undefined);
-    const sdk = { trigger } as never;
-    const kv = mockKV() as never;
+    const kv = mockKV();
 
     const provider: MemoryProvider = {
       name: "mock",
@@ -65,7 +65,7 @@ describe("compress no longer writes a per-session mem-live group", () => {
         if (id === "mem::compress") compressCallback = fn;
       },
     };
-    registerCompressFunction(registerSdk as never, kv, provider);
+    registerCompressFunction(registerSdk as never, kv as never, provider);
     expect(compressCallback).not.toBeNull();
 
     const sessionId = "ses_compress_stream_test";
@@ -80,21 +80,21 @@ describe("compress no longer writes a per-session mem-live group", () => {
       raw: {},
     };
 
-    await (kv as unknown as { set: (scope: string, key: string, value: unknown) => Promise<unknown> }).set(`mem:obs:${sessionId}`, raw.id, raw);
+    const events: unknown[] = [];
+    const unsubscribe = onLiveEvent((event) => events.push(event));
+    await kv.set(KV.observations(sessionId), raw.id, raw);
     await compressCallback!({
       observationId: "obs_1",
       sessionId,
       raw,
     });
 
-    const streamCalls = trigger.mock.calls
-      .map((c) => c[0] as { function_id: string; payload: { group_id?: string } })
-      .filter((c) => c.function_id.startsWith("stream::"));
-
-    expect(streamCalls.length).toBeGreaterThan(0);
-    for (const call of streamCalls) {
-      expect(call.payload.group_id).not.toBe(sessionId);
-      expect(call.payload.group_id).toBe(STREAM.viewerGroup);
-    }
+    unsubscribe();
+    expect(events).toContainEqual(expect.objectContaining({
+      id: "compressed-obs_1",
+      type: "compressed_observation",
+      data: expect.objectContaining({ type: "compressed", sessionId }),
+    }));
+    expect(trigger.mock.calls.some(([call]) => (call as { function_id: string }).function_id.startsWith("stream::"))).toBe(false);
   });
 });

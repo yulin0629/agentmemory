@@ -114,8 +114,10 @@ export function normalizePayload(event: string, raw: Json): Json {
       for (const line of lines.reverse()) {
         if (!line.trim()) continue;
         const step = JSON.parse(line);
-        if (step.type === "USER_INPUT" && typeof step.content === "string") {
-          out["prompt"] = step.content;
+        // Same rule as session-end's transcript backfill.
+        if (step.type === "USER_INPUT" && step.source === "USER_EXPLICIT" && typeof step.content === "string") {
+          const match = step.content.match(/<USER_REQUEST>\n?([\s\S]*?)\n?<\/USER_REQUEST>/);
+          out["prompt"] = (match ? match[1] : step.content).trim();
           break;
         }
       }
@@ -198,10 +200,18 @@ async function main() {
   }
   if (!raw || typeof raw !== "object") return;
 
-  const payload = JSON.stringify(normalizePayload(event, raw));
+  const normalized = normalizePayload(event, raw);
+  const payload = JSON.stringify(normalized);
   let context = "";
+  const targets = targetsFor(event, raw);
+  // Fork addition: when the transcript yields the latest user turn, run
+  // prompt-submit so an explicit save (記住：) is captured during the turn.
+  // The server deduplicates repeats across invocations.
+  if (event === "PreInvocation" && typeof normalized["prompt"] === "string" && normalized["prompt"].trim()) {
+    targets.push("prompt-submit.mjs");
+  }
 
-  for (const script of targetsFor(event, raw)) {
+  for (const script of targets) {
     // Synchronous so the hook process does not exit before the capture
     // POSTs are issued. Each bundled hook already caps its own fetch
     // timeout, so the worst case here is bounded by those.

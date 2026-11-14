@@ -1,3 +1,4 @@
+import type { GraphObservationAuthorization } from "./graph-retrieval.js";
 import type { IIIClient } from "iii-sdk";
 import type {
   CompactLessonResult,
@@ -5,7 +6,9 @@ import type {
   CompressedObservation,
   HybridSearchResult,
   Lesson,
+  Memory,
 } from "../types.js";
+import { getSearchResultLayer, isSearchLayer, matchesSearchLayer, type SearchLayer, type SearchResultLayer } from "../state/search-layer.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -22,6 +25,8 @@ import {
 import { logger } from "../logger.js";
 import { withoutObservationSource } from "./observation-source.js";
 import { getCounters } from "../telemetry/setup.js";
+import { memoryToObservation } from "../state/memory-utils.js";
+import { getSearchIndex } from "./search.js";
 
 export interface RecentSearch {
   sessionId: string;
@@ -71,11 +76,12 @@ export function resetFollowupStatsForTests(): void {
 // Compact mode trims each lesson's content for at-a-glance display. The
 // full content is fetched via memory_lesson_recall when the caller needs it.
 const LESSON_CONTENT_PREVIEW_CHARS = 240;
+const SCOPED_RETRY_CANDIDATES = 1000;
 
 export function registerSmartSearchFunction(
   sdk: IIIClient,
   kv: StateKV,
-  searchFn: (query: string, limit: number) => Promise<HybridSearchResult[]>,
+  searchFn: (query: string, limit: number, targetLayer?: SearchLayer, authorizeGraph?: GraphObservationAuthorization) => Promise<HybridSearchResult[]>,
 ): void {
   sdk.registerFunction("mem::smart-search",
     async (data: {
@@ -84,6 +90,7 @@ export function registerSmartSearchFunction(
       limit?: number;
       project?: string;
       includeLessons?: boolean;
+      targetLayer?: SearchLayer;
       // optional per-call agent filter for runtimes routing many
       // roles through one server. "*" opts out of the env-default
       // scope and returns hits from every agent.
@@ -92,6 +99,10 @@ export function registerSmartSearchFunction(
       source?: string;
     }) => {
 
+      if (data.targetLayer !== undefined && !isSearchLayer(data.targetLayer)) {
+        throw new Error("mem::smart-search: targetLayer must be one of 'all', 'memory', or 'observation'");
+      }
+      const targetLayer = data.targetLayer ?? "all";
       const isolated = isAgentScopeIsolated();
       const explicitAgentId =
         typeof data.agentId === "string" && data.agentId.trim().length > 0
@@ -102,6 +113,10 @@ export function registerSmartSearchFunction(
       const filterAgentId = wildcardAgent
         ? undefined
         : explicitAgentId ?? envAgentId;
+      const project =
+        typeof data.project === "string" && data.project.trim()
+          ? data.project.trim()
+          : undefined;
       if (
         isolated &&
         !wildcardAgent &&
@@ -116,12 +131,14 @@ export function registerSmartSearchFunction(
         );
       }
 
+      const matchesProject = project ? makeProjectMatcher(kv, project) : undefined;
+
       if (data.expandIds && data.expandIds.length > 0) {
-        const raw = data.expandIds.slice(0, 20);
+        const raw = data.expandIds.slice(0, 100);
         const items = raw.map((entry) => {
           if (typeof entry === "string") return { obsId: entry, sessionId: undefined as string | undefined };
-          if (entry && typeof entry === "object" && typeof (entry as any).obsId === "string") {
-            return { obsId: (entry as any).obsId, sessionId: (entry as any).sessionId as string | undefined };
+          if (entry && typeof entry === "object" && typeof entry.obsId === "string") {
+            return { obsId: entry.obsId, sessionId: typeof entry.sessionId === "string" ? entry.sessionId : undefined };
           }
           return null;
         }).filter((item): item is NonNullable<typeof item> => item !== null);
@@ -130,34 +147,40 @@ export function registerSmartSearchFunction(
           obsId: string;
           sessionId: string;
           observation: CompressedObservation;
+          layer: SearchResultLayer;
         }> = [];
 
-        const results = await Promise.all(
-          items.map(({ obsId, sessionId }) =>
-            findObservation(kv, obsId, sessionId).then((obs) =>
-              obs ? { obsId, sessionId: obs.sessionId, observation: withoutObservationSource(obs) } : null,
-            ),
-          ),
-        );
-        for (const r of results) {
-          if (r) expanded.push(r);
+        let attempted = 0;
+        for (let offset = 0; offset < items.length && expanded.length < 20; offset += 10) {
+          const batch = items.slice(offset, offset + 10);
+          const results = await Promise.all(batch.map(({ obsId, sessionId }) => findObservation(kv, obsId, sessionId)));
+          attempted += batch.length;
+          for (const result of results) {
+            if (!result) continue;
+            const { observation, layer } = result;
+            if (!matchesSearchLayer(observation.id, observation.sessionId, targetLayer, layer)) continue;
+            if (filterAgentId && observation.agentId !== filterAgentId) continue;
+            if (matchesProject && !await matchesProject(observation.id, observation.sessionId)) continue;
+            expanded.push({
+              obsId: observation.id,
+              sessionId: observation.sessionId,
+              observation: withoutObservationSource(observation),
+              layer,
+            });
+          }
         }
-
-        const scoped = filterAgentId
-          ? expanded.filter((e) => e.observation.agentId === filterAgentId)
-          : expanded;
+        const scoped = expanded.slice(0, 20);
 
         void recordAccessBatch(
           kv,
           scoped.map((e) => e.observation.id),
         );
 
-        const truncated = data.expandIds.length > raw.length;
+        const truncated = data.expandIds.length > raw.length || attempted < items.length || expanded.length > scoped.length;
         logger.info("Smart search expanded", {
           requested: data.expandIds.length,
-          attempted: raw.length,
+          attempted,
           returned: scoped.length,
-          filteredOutOfScope: expanded.length - scoped.length,
           truncated,
         });
         return { mode: "expanded", results: scoped, truncated };
@@ -171,38 +194,75 @@ export function registerSmartSearchFunction(
       // Lesson recall stays capped: lessons are denser than raw
       // observations so 10 covers most recall flows.
       const lessonLimit = Math.min(limit, 10);
-      const includeLessons = data.includeLessons !== false;
-
-      // Over-fetch when filtering. Hybrid search can't filter on
-      // agentId (BM25/vector indexes don't carry it), so we ask the
-      // searcher for more hits than we need and trim post-filter. 3×
-      // is a defensible middle ground: enough headroom for a small
-      // workload, capped at 300 so a 100-limit request never asks for
-      // thousands of hits.
-      const overFetchLimit = filterAgentId
-        ? Math.min(limit * 3, 300)
+      const includeLessons = targetLayer === "all" && data.includeLessons !== false;
+      const overFetchLimit = filterAgentId || project
+        ? Math.max(Math.min(limit * 10, 300), 100)
         : limit;
 
+      const authorizeGraph: GraphObservationAuthorization = async (record, sessionId, read) => {
+        if (filterAgentId !== undefined && record.agentId !== filterAgentId) return false;
+        if (!project) return true;
+        if ("content" in record && record.project !== undefined) return record.project === project;
+        return (await read<{ project?: string }>(KV.sessions, sessionId))?.project === project;
+      };
       const [hybridResults, lessons] = await Promise.all([
-        searchFn(data.query, overFetchLimit),
+        searchFn(data.query, overFetchLimit, targetLayer, authorizeGraph),
         includeLessons
-          ? recallLessons(sdk, data.query, lessonLimit, data.project)
+          ? recallLessons(sdk, data.query, lessonLimit, project)
           : Promise.resolve([]),
       ]);
 
-      const filteredHybrid = filterAgentId
-        ? hybridResults
-            .filter((r) => r.observation.agentId === filterAgentId)
-            .slice(0, limit)
-        : hybridResults.slice(0, limit);
+      const scopeResults = async (results: HybridSearchResult[]) => {
+        const layerResults = results.filter((result) => matchesSearchLayer(
+          result.observation.id,
+          result.sessionId,
+          targetLayer,
+          result.layer ?? getSearchIndex().layerOf(result.observation.id),
+        ));
+        const projectResults = matchesProject
+          ? await filterProjectResults(layerResults, (result) => matchesProject(result.observation.id, result.sessionId))
+          : layerResults;
 
-      const compact: CompactSearchResult[] = filteredHybrid.map((r) => ({
-        obsId: r.observation.id,
-        sessionId: r.sessionId,
-        title: r.observation.title,
-        type: r.observation.type,
-        score: r.combinedScore,
-        timestamp: r.observation.timestamp,
+        return filterAgentId
+          ? projectResults
+              .filter((r) => r.observation.agentId === filterAgentId)
+              .slice(0, limit)
+          : projectResults.slice(0, limit);
+      };
+
+      let filteredHybrid = await scopeResults(hybridResults);
+      if ((filterAgentId || project) && filteredHybrid.length < limit && getSearchIndex().size > overFetchLimit) {
+        try {
+          const deeper = await scopeResults(
+            await searchFn(data.query, SCOPED_RETRY_CANDIDATES, targetLayer, authorizeGraph),
+          );
+          const seen = new Set(deeper.map((result) => result.observation.id));
+          filteredHybrid = [
+            ...deeper,
+            ...filteredHybrid.filter((result) => !seen.has(result.observation.id)),
+          ].slice(0, limit);
+        } catch (err) {
+          logger.warn("Smart search deeper scoped ranking failed; keeping first-pass results", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      const compact: CompactSearchResult[] = await Promise.all(filteredHybrid.map(async (r) => {
+        const layer = r.layer ?? getSearchIndex().layerOf(r.observation.id) ?? getSearchResultLayer(r.observation.id, r.sessionId);
+        const memoryType = layer === "memory"
+          ? (await kv.get<Memory>(KV.memories, r.observation.id).catch(() => null))?.type ?? r.observation.memoryType
+          : undefined;
+        return {
+          obsId: r.observation.id,
+          layer,
+          sessionId: r.sessionId,
+          title: r.observation.title,
+          type: r.observation.type,
+          ...(memoryType !== undefined && { memoryType }),
+          score: r.combinedScore,
+          timestamp: r.observation.timestamp,
+        };
       }));
 
       void recordAccessBatch(
@@ -343,12 +403,15 @@ async function findObservation(
   kv: StateKV,
   obsId: string,
   sessionIdHint?: string,
-): Promise<CompressedObservation | null> {
+): Promise<{ observation: CompressedObservation; layer: SearchResultLayer } | null> {
+  const memory = await kv.get<Memory>(KV.memories, obsId);
+  if (memory) return { observation: memoryToObservation(memory), layer: "memory" };
+
   if (sessionIdHint) {
     const obs = await kv
       .get<CompressedObservation>(KV.observations(sessionIdHint), obsId)
       .catch(() => null);
-    if (obs) return obs;
+    if (obs) return { observation: obs, layer: "observation" };
   }
 
   const indexedSessionId = await lookupObservationSession(kv, obsId);
@@ -356,7 +419,7 @@ async function findObservation(
     const obs = await kv
       .get<CompressedObservation>(KV.observations(indexedSessionId), obsId)
       .catch(() => null);
-    if (obs) return obs;
+    if (obs) return { observation: obs, layer: "observation" };
   }
 
   const sessions = await kv.list<{ id: string }>(KV.sessions);
@@ -373,8 +436,38 @@ async function findObservation(
       await indexObservationSession(kv, obsId, batch[foundIndex].id).catch(
         () => {},
       );
-      return found;
+      return { observation: found, layer: "observation" };
     }
   }
   return null;
+}
+
+function makeProjectMatcher(kv: StateKV, project: string): (obsId: string, sessionId: string) => Promise<boolean> {
+  const memories = new Map<string, Promise<Memory | null>>();
+  const sessions = new Map<string, Promise<{ project?: string } | null>>();
+  return async (obsId, sessionId) => {
+    let memoryRead = memories.get(obsId);
+    if (!memoryRead) {
+      memoryRead = kv.get<Memory>(KV.memories, obsId);
+      memories.set(obsId, memoryRead);
+    }
+    const memory = await memoryRead;
+    if (memory?.project !== undefined) return memory.project === project;
+    let sessionRead = sessions.get(sessionId);
+    if (!sessionRead) {
+      sessionRead = kv.get<{ project?: string }>(KV.sessions, sessionId);
+      sessions.set(sessionId, sessionRead);
+    }
+    return (await sessionRead)?.project === project;
+  };
+}
+
+async function filterProjectResults<T>(items: T[], matches: (item: T) => Promise<boolean>): Promise<T[]> {
+  const scoped: T[] = [];
+  for (let offset = 0; offset < items.length; offset += 10) {
+    const batch = items.slice(offset, offset + 10);
+    const selected = await Promise.all(batch.map(matches));
+    scoped.push(...batch.filter((_, index) => selected[index]));
+  }
+  return scoped;
 }

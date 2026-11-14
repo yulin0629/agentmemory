@@ -1,13 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
-vi.hoisted(() => { process.env.EMBED_COALESCE_MS = "0"; });
-
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
 import { registerRememberFunction } from "../src/functions/remember.js";
 import {
+  getSearchIndex,
+  indexRecords,
   setVectorIndex,
   setEmbeddingProvider,
   setIndexPersistence,
@@ -16,6 +16,7 @@ import {
 import { logger } from "../src/logger.js";
 import { VectorIndex } from "../src/state/vector-index.js";
 import { KV } from "../src/state/schema.js";
+import { withKeyedLock } from "../src/state/keyed-mutex.js";
 import type { EmbeddingProvider, Memory } from "../src/types.js";
 
 function mockKV() {
@@ -193,6 +194,46 @@ describe("mem::remember lock scope", () => {
     }
   });
 
+  it("does not overwrite a newer imported body while its commit reread is pending", async () => {
+    getSearchIndex().clear();
+    const sdk = mockSdk();
+    const kv = mockKV();
+    let captured!: Memory;
+    let release!: () => void;
+    let entered!: () => void;
+    const reading = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    registerRememberFunction(sdk as never, {
+      ...kv,
+      set: async <T>(scope: string, key: string, value: T) => {
+        if (scope === KV.memories) captured = value as Memory;
+        return kv.set(scope, key, value);
+      },
+      get: async <T>(scope: string, key: string): Promise<T | null> => {
+        if (scope === KV.memories && key === captured?.id) {
+          entered();
+          await blocked;
+        }
+        return kv.get<T>(scope, key);
+      },
+    } as never);
+    setEmbeddingProvider({
+      name: "race-test", dimensions: 3,
+      embed: async () => new Float32Array([1, 0, 0]),
+      embedBatch: async (texts) => texts.map(() => new Float32Array([0, 1, 0])),
+    });
+    const saving = sdk.trigger({ function_id: "mem::remember", payload: { content: "original body before import" } });
+    await reading;
+    const replacement = { ...captured, title: "newimportmarker", content: "newimportmarker" };
+    await kv.set(KV.memories, replacement.id, replacement);
+    await indexRecords([], [replacement]);
+    release();
+    await saving;
+    expect(vectorIndex.get(replacement.id)?.embedding).toEqual(new Float32Array([0, 1, 0]));
+    expect(getSearchIndex().search("newimportmarker").map((hit) => hit.obsId)).toEqual([replacement.id]);
+    getSearchIndex().clear();
+  });
+
   it("logs a vector-index commit failure distinctly from an embed failure", async () => {
     const failingCommit = vi.fn(async () => {
       throw new Error("kv unavailable");
@@ -215,5 +256,21 @@ describe("mem::remember lock scope", () => {
       "vector-index add: embed failed — skipping",
       expect.anything(),
     );
+  });
+
+  it("waits for the mem:remember lock before deleting a memory", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    await kv.set(KV.memories, "held", { id: "held", title: "t", content: "c", isLatest: true } as unknown as Memory);
+    let release!: () => void;
+    const held = withKeyedLock("mem:remember", () => new Promise<void>((resolve) => { release = resolve; }));
+    const forget = sdk.trigger({ function_id: "mem::forget", payload: { memoryId: "held" } });
+    await delay(20);
+    expect(await kv.get(KV.memories, "held")).not.toBeNull();
+    release();
+    await held;
+    await forget;
+    expect(await kv.get(KV.memories, "held")).toBeNull();
   });
 });

@@ -6,7 +6,7 @@ import { join } from "node:path";
 //#region src/secret-store.ts
 const SECRET_KEY = "AGENTMEMORY_SECRET";
 function agentmemoryHomeDir() {
-	return join(homedir(), ".agentmemory");
+	return process.env["AGENTMEMORY_DATA_DIR"] || join(homedir(), ".agentmemory");
 }
 function secretFilePath() {
 	return join(agentmemoryHomeDir(), "secret");
@@ -27,10 +27,10 @@ function unquote(value) {
 	const hash = value.indexOf(" #");
 	return hash === -1 ? value : value.slice(0, hash).trim();
 }
-function readEnvFileSecret() {
+function readEnvFileValue(name) {
 	let content;
 	try {
-		content = readFileSync(join(agentmemoryHomeDir(), ".env"), "utf-8");
+		content = readFileSync(process.env["AGENTMEMORY_ENV_FILE"] || join(homedir(), ".agentmemory", ".env"), "utf-8");
 	} catch {
 		return "";
 	}
@@ -41,17 +41,39 @@ function readEnvFileSecret() {
 		if (trimmed.startsWith("#")) continue;
 		const eq = trimmed.indexOf("=");
 		if (eq === -1) continue;
-		if (trimmed.slice(0, eq).replace(/^export\s+/, "").trim() !== SECRET_KEY) continue;
-		found = usable(unquote(trimmed.slice(eq + 1).trim()));
+		if (trimmed.slice(0, eq).replace(/^export\s+/, "").trim() !== name) continue;
+		found = unquote(trimmed.slice(eq + 1).trim());
 	}
 	return found;
 }
-function readStoredSecret() {
+function readEnvFileSecret() {
+	return usable(readEnvFileValue(SECRET_KEY));
+}
+function readSecretFile(path) {
 	try {
-		return usable(readFileSync(secretFilePath(), "utf-8"));
+		return usable(readFileSync(path, "utf-8"));
 	} catch {
 		return "";
 	}
+}
+function legacyDataDirSecretPaths(env = process.env) {
+	const dataDir = env["AGENTMEMORY_DATA_DIR"];
+	if (!dataDir) return [];
+	const paths = [
+		join(dataDir, "secret"),
+		join(dataDir, ".hmac"),
+		join(dataDir, "..", ".hmac")
+	];
+	return [...new Set(paths.filter((path) => path !== secretFilePath()))];
+}
+function readStoredSecret(env = process.env) {
+	const canonicalPath = canonicalSecretPath();
+	const localPath = secretFilePath();
+	const legacyPaths = legacyDataDirSecretPaths(env);
+	return readSecretFile(canonicalPath) || (localPath === canonicalPath ? "" : readSecretFile(localPath)) || legacyPaths.map(readSecretFile).find(Boolean) || "";
+}
+function explicitSecret(env = process.env) {
+	return usable(env[SECRET_KEY]) || readEnvFileSecret();
 }
 function isLoopbackUrl(url) {
 	let hostname;
@@ -66,8 +88,12 @@ function isLoopbackUrl(url) {
 function resolveClientSecret(baseUrl, env = process.env) {
 	const fromEnv = usable(env[SECRET_KEY]);
 	if (fromEnv) return fromEnv;
+	if (env.AGENTMEMORY_CREDENTIAL_MODE === "explicit") return "";
 	if (!isLoopbackUrl(baseUrl)) return "";
-	return readEnvFileSecret() || readStoredSecret();
+	return readEnvFileSecret() || readStoredSecret(env);
+}
+function canonicalSecretPath() {
+	return join(homedir(), ".agentmemory", "secret");
 }
 //#endregion
 //#region src/hooks/_selective-settings.ts
@@ -80,7 +106,7 @@ function selectiveSettings() {
 	return {
 		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
 		url,
-		secret: process.env.AGENTMEMORY_SECRET || local?.secret || resolveClientSecret(url),
+		secret: explicitSecret() || local?.secret || resolveClientSecret(url),
 		selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
 		owner: local?.owner
 	};

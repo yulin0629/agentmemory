@@ -84,18 +84,6 @@ function makeObs(i: number, sessionId: string): CompressedObservation {
   };
 }
 
-// mem::observe writes this shape first; mem::compress overwrites the same
-// key with a titled CompressedObservation once the LLM call returns.
-function makeRawObs(i: number, sessionId: string) {
-  return {
-    id: `obs_${i}`,
-    sessionId,
-    timestamp: new Date().toISOString(),
-    hookType: "PostToolUse",
-    raw: {},
-  };
-}
-
 function makeProvider(responses: string[]): MemoryProvider & {
   calls: Array<{ system: string; user: string }>;
 } {
@@ -490,212 +478,6 @@ describe("mem::summarize chunking", () => {
   });
 });
 
-describe("mem::summarize dedup (double-trigger guard)", () => {
-  it("skips the LLM when observation count is unchanged since last summary", async () => {
-    const provider = makeProvider([summaryXml({ title: "First run" })]);
-    const { handler } = await setupHandler({
-      sessionId: "ses_dedup",
-      obsCount: 10,
-      provider,
-    });
-
-    const first: any = await handler({ sessionId: "ses_dedup" });
-    expect(first.success).toBe(true);
-    expect(provider.calls).toHaveLength(1);
-
-    const second: any = await handler({ sessionId: "ses_dedup" });
-    expect(second.success).toBe(true);
-    expect(second.skipped).toBe(true);
-    expect(second.summary.title).toBe("First run");
-    expect(provider.calls).toHaveLength(1); // no second LLM run
-  });
-
-  it("collapses concurrent duplicate calls into a single LLM run", async () => {
-    const provider = makeProvider([summaryXml({ title: "Only run" })]);
-    const { handler } = await setupHandler({
-      sessionId: "ses_race",
-      obsCount: 10,
-      provider,
-    });
-
-    const [a, b]: any[] = await Promise.all([
-      handler({ sessionId: "ses_race" }),
-      handler({ sessionId: "ses_race" }),
-    ]);
-
-    expect(a.success).toBe(true);
-    expect(b.success).toBe(true);
-    expect(provider.calls).toHaveLength(1);
-  });
-
-  it("re-summarizes when the observation set changed but the count did not", async () => {
-    const provider = makeProvider([
-      summaryXml({ title: "First run" }),
-      summaryXml({ title: "Second run" }),
-    ]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_swap",
-      obsCount: 10,
-      provider,
-    });
-
-    await handler({ sessionId: "ses_swap" });
-
-    // evict/auto-forget can delete observations; a new one can then bring
-    // the count back to its previous value with different content.
-    await kv.delete("obs:ses_swap", "obs_0");
-    const extra = makeObs(10, "ses_swap");
-    await kv.set("obs:ses_swap", extra.id, extra);
-
-    const result: any = await handler({ sessionId: "ses_swap" });
-    expect(result.success).toBe(true);
-    expect(result.skipped).toBeUndefined();
-    expect(result.summary.title).toBe("Second run");
-    expect(provider.calls).toHaveLength(2);
-  });
-
-  it("releases the session lock when a run exceeds SUMMARIZE_LOCK_TIMEOUT_MS", async () => {
-    process.env.SUMMARIZE_LOCK_TIMEOUT_MS = "50";
-    try {
-      const provider: MemoryProvider = {
-        name: "hung",
-        compress: async () => "",
-        summarize: () => new Promise(() => {}), // never settles
-      };
-      const { handler } = await setupHandler({
-        sessionId: "ses_hung",
-        obsCount: 10,
-        provider,
-      });
-
-      const result: any = await handler({ sessionId: "ses_hung" });
-      expect(result.success).toBe(false);
-      expect(result.error).toBe("summarize_timeout");
-
-      // The lock must be free again: a follow-up call proceeds instead of
-      // queueing behind the hung run.
-      const again: any = await handler({ sessionId: "ses_hung" });
-      expect(again.error).toBe("summarize_timeout");
-    } finally {
-      delete process.env.SUMMARIZE_LOCK_TIMEOUT_MS;
-    }
-  });
-
-  it("re-summarizes when new observations arrived since last summary", async () => {
-    const provider = makeProvider([
-      summaryXml({ title: "First run" }),
-      summaryXml({ title: "Second run" }),
-    ]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_grow",
-      obsCount: 10,
-      provider,
-    });
-
-    await handler({ sessionId: "ses_grow" });
-    const extra = makeObs(10, "ses_grow");
-    await kv.set("obs:ses_grow", extra.id, extra);
-
-    const result: any = await handler({ sessionId: "ses_grow" });
-    expect(result.success).toBe(true);
-    expect(result.skipped).toBeUndefined();
-    expect(result.summary.title).toBe("Second run");
-    expect(provider.calls).toHaveLength(2);
-  });
-});
-
-describe("mem::summarize waits for in-flight compressions", () => {
-  afterEach(() => {
-    delete process.env.SUMMARIZE_COMPRESS_WAIT_MS;
-  });
-
-  it("summarizes once a raw observation finishes compressing after session/end", async () => {
-    process.env.SUMMARIZE_COMPRESS_WAIT_MS = "5000";
-    const provider = makeProvider([summaryXml({ title: "Late compress" })]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_pending",
-      obsCount: 0,
-      provider,
-    });
-    // observe has landed, its mem::compress is still running.
-    await kv.set("obs:ses_pending", "obs_0", makeRawObs(0, "ses_pending") as any);
-
-    const run = handler({ sessionId: "ses_pending" });
-    setTimeout(() => {
-      void kv.set("obs:ses_pending", "obs_0", makeObs(0, "ses_pending"));
-    }, 600);
-
-    const result: any = await run;
-
-    expect(result.success).toBe(true);
-    expect(result.summary.title).toBe("Late compress");
-    expect(result.summary.observationCount).toBe(1);
-  });
-
-  it("waits for every pending compression, not just the first", async () => {
-    process.env.SUMMARIZE_COMPRESS_WAIT_MS = "5000";
-    const provider = makeProvider([summaryXml({ title: "All three" })]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_partial",
-      obsCount: 0,
-      provider,
-    });
-    for (let i = 0; i < 3; i++) {
-      await kv.set(`obs:ses_partial`, `obs_${i}`, makeRawObs(i, "ses_partial") as any);
-    }
-
-    const run = handler({ sessionId: "ses_partial" });
-    setTimeout(() => {
-      void kv.set("obs:ses_partial", "obs_0", makeObs(0, "ses_partial"));
-    }, 200);
-    setTimeout(() => {
-      void kv.set("obs:ses_partial", "obs_1", makeObs(1, "ses_partial"));
-      void kv.set("obs:ses_partial", "obs_2", makeObs(2, "ses_partial"));
-    }, 900);
-
-    const result: any = await run;
-
-    expect(result.success).toBe(true);
-    expect(result.summary.observationCount).toBe(3);
-  });
-
-  it("gives up after the wait budget and summarizes what did compress", async () => {
-    process.env.SUMMARIZE_COMPRESS_WAIT_MS = "600";
-    const provider = makeProvider([summaryXml({ title: "Partial" })]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_stuck",
-      obsCount: 1,
-      provider,
-    });
-    // obs_9's compression never completes.
-    await kv.set("obs:ses_stuck", "obs_9", makeRawObs(9, "ses_stuck") as any);
-
-    const result: any = await handler({ sessionId: "ses_stuck" });
-
-    expect(result.success).toBe(true);
-    expect(result.summary.observationCount).toBe(1);
-  });
-
-  it("still returns no_observations when the session has nothing at all", async () => {
-    process.env.SUMMARIZE_COMPRESS_WAIT_MS = "5000";
-    const provider = makeProvider([summaryXml({ title: "never" })]);
-    const { handler } = await setupHandler({
-      sessionId: "ses_empty",
-      obsCount: 0,
-      provider,
-    });
-
-    const started = Date.now();
-    const result: any = await handler({ sessionId: "ses_empty" });
-
-    expect(result.success).toBe(false);
-    expect(result.error).toBe("no_observations");
-    expect(provider.calls).toHaveLength(0);
-    // No raw observations means nothing to wait for — must not burn the budget.
-    expect(Date.now() - started).toBeLessThan(1000);
-  });
-});
-
 describe("mem::summarize without an LLM provider", () => {
   it("skips a wrapped noop provider without recording a failed call", async () => {
     const { ResilientProvider } = await import("../src/providers/resilient.js");
@@ -712,5 +494,70 @@ describe("mem::summarize without an LLM provider", () => {
 
     expect(result).toMatchObject({ success: false, error: "no_provider" });
     expect(record).not.toHaveBeenCalled();
+  });
+});
+
+describe("mem::summarize deadline", () => {
+  const ORIGINAL_ENV = { ...process.env };
+
+  beforeEach(() => {
+    delete process.env.SUMMARIZE_CHUNK_SIZE;
+    delete process.env.SUMMARIZE_CHUNK_CONCURRENCY;
+    delete process.env.AGENTMEMORY_SUMMARY_TIMEOUT_MS;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  function slowProvider(delayMs: number, responses: string[]) {
+    const provider = makeProvider(responses);
+    const inner = provider.summarize;
+    provider.summarize = async (system: string, user: string) => {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return inner(system, user);
+    };
+    return provider;
+  }
+
+  async function runChunked(delayMs: number) {
+    process.env.SUMMARIZE_CHUNK_SIZE = "10";
+    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
+    const responses = [
+      ...Array.from({ length: 4 }, (_, i) => summaryXml({ title: `chunk ${i}` })),
+      summaryXml({ title: "merged" }),
+    ];
+    const provider = slowProvider(delayMs, responses);
+    const { handler } = await setupHandler({ sessionId: "ses_slow", obsCount: 40, provider });
+    vi.useFakeTimers();
+    const pending = handler({ sessionId: "ses_slow" }) as Promise<any>;
+    await vi.advanceTimersByTimeAsync(10 * delayMs);
+    return { result: await pending, provider };
+  }
+
+  it("keeps the default 120 s budget for a multi-chunk session", async () => {
+    const { result } = await runChunked(30_000);
+    expect(result).toMatchObject({ success: false });
+    expect(result.error).toMatch(/summary_timeout|too_many_chunks_skipped/);
+  });
+
+  it("AGENTMEMORY_SUMMARY_TIMEOUT_MS extends the budget so slow chunked sessions finish", async () => {
+    process.env.AGENTMEMORY_SUMMARY_TIMEOUT_MS = "600000";
+    const { result, provider } = await runChunked(30_000);
+    expect(result).toMatchObject({ success: true });
+    expect(result.summary.title).toBe("merged");
+    expect(provider.calls).toHaveLength(5);
+  });
+
+  it("ignores an invalid AGENTMEMORY_SUMMARY_TIMEOUT_MS", async () => {
+    const { getSummaryTimeoutMs, getSummaryTriggerTimeoutMs } = await import("../src/functions/summary-state.js");
+    for (const bad of ["nope", "600s", "1e6", "0.5", "0", "2592000000"]) {
+      process.env.AGENTMEMORY_SUMMARY_TIMEOUT_MS = bad;
+      expect(getSummaryTimeoutMs()).toBe(120_000);
+    }
+    process.env.AGENTMEMORY_SUMMARY_TIMEOUT_MS = "300000";
+    expect(getSummaryTimeoutMs()).toBe(300_000);
+    expect(getSummaryTriggerTimeoutMs()).toBeGreaterThan(300_000);
   });
 });

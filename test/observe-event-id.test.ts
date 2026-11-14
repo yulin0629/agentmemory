@@ -98,3 +98,29 @@ describe("durable observe event IDs", () => {
     expect(await kv.list(KV.observations(a.sessionId))).toHaveLength(2);
   });
 });
+
+describe("capture queue in front of observe", () => {
+  function queue(observe: (data: unknown) => Promise<unknown>) {
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    registerCaptureFunctions(sdk as never, kv as never);
+    sdk.registerFunction("mem::observe", observe);
+    return sdk;
+  }
+
+  it("answers a deferred event_id request with the observation id the event will get", async () => {
+    const sdk = queue(async () => { throw new Error("state worker unavailable"); });
+    const event = payload();
+    const result = await sdk.trigger("mem::capture", { payload: event }) as any;
+    expect(result.status).toBe("accepted");
+    expect(result.state).not.toBe("completed");
+    expect(result.observationId).toBe(`obs_event_${event.event_id!.replace(/-/g, "")}`);
+  });
+
+  it("returns the explicit-save outcome that observe produced", async () => {
+    const knowledgeCapture = { success: true, status: "active", action: "saved" };
+    const sdk = queue(async () => ({ observationId: "obs_explicit_save", knowledgeCapture }));
+    const result = await sdk.trigger("mem::capture", { payload: payload() }) as any;
+    expect(result).toMatchObject({ status: "accepted", state: "completed", knowledgeCapture });
+  });
+});

@@ -5,6 +5,7 @@ import type { Lesson } from "../types.js";
 import { SearchIndex } from "../state/search-index.js";
 import { lessonToObservation } from "../state/memory-utils.js";
 import { recordAudit } from "./audit.js";
+import { deleteFacetsForTargets } from "./facets.js";
 
 // Dedicated BM25 index for lessons, with the full records cached
 // alongside it. Recall previously listed every lesson from KV and
@@ -39,7 +40,7 @@ async function ensureLessonIndex(kv: StateKV): Promise<SearchIndex> {
       if (generation !== lessonIndexGeneration) return;
       for (const l of all) {
         if (!l.deleted) {
-          idx.add(lessonToObservation(l));
+          idx.add(lessonToObservation(l), "lesson");
           lessonRecords.set(l.id, l);
         }
       }
@@ -62,7 +63,7 @@ export async function findContextLesson(kv: StateKV, text: string, project: stri
 export async function searchContextLessons(kv: StateKV, query: string, eligibleIds: Set<string>, limit = 10): Promise<Lesson[]> {
   if (!eligibleIds.size) return [];
   const index = await ensureLessonIndex(kv);
-  return index.search(query, limit, id => eligibleIds.has(id))
+  return index.search(query, limit, "all", id => eligibleIds.has(id))
     .flatMap(hit => {
       const lesson = lessonRecords.get(hit.obsId);
       return lesson && !lesson.deleted ? [lesson] : [];
@@ -159,7 +160,7 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
         lessonRecords.set(existing.id, existing);
         if (indexedTextChanged && lessonIndex) {
           lessonIndex.remove(existing.id);
-          lessonIndex.add(lessonToObservation(existing));
+          lessonIndex.add(lessonToObservation(existing), "lesson");
         }
         noteLessonMutation();
 
@@ -201,7 +202,7 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
 
       await kv.set(KV.lessons, lesson.id, lesson);
       lessonRecords.set(lesson.id, lesson);
-      if (lessonIndex) lessonIndex.add(lessonToObservation(lesson));
+      if (lessonIndex) lessonIndex.add(lessonToObservation(lesson), "lesson");
       noteLessonMutation();
 
       try {
@@ -346,6 +347,7 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
       lessonRecords.delete(lesson.id);
       if (lessonIndex) lessonIndex.remove(lesson.id);
       noteLessonMutation();
+      await deleteFacetsForTargets(kv, [lesson.id]);
 
       try {
         await recordAudit(kv, "lesson_delete", "mem::lesson-delete", [
@@ -413,8 +415,10 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
       }
 
       await Promise.all(dirty.map((l) => kv.set(KV.lessons, l.id, l)));
+      const softDeletedIds: string[] = [];
       for (const l of dirty) {
         if (l.deleted) {
+          softDeletedIds.push(l.id);
           lessonRecords.delete(l.id);
           if (lessonIndex) lessonIndex.remove(l.id);
         } else {
@@ -422,6 +426,9 @@ export function registerLessonsFunctions(sdk: IIIClient, kv: StateKV): void {
         }
       }
       if (dirty.length > 0) noteLessonMutation();
+      if (softDeletedIds.length > 0) {
+        await deleteFacetsForTargets(kv, softDeletedIds);
+      }
       await Promise.all(
         auditEvents.map((event) =>
           recordAudit(kv, "lesson_strengthen", "mem::lesson-decay-sweep", [event.id], {

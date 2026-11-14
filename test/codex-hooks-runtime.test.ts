@@ -276,7 +276,7 @@ describe("Codex hook runtime contract", () => {
     ["stop.mjs", "Stop", { turn_id: "turn-1", stop_hook_active: false, last_assistant_message: "done" }, "/agentmemory/session/end"],
   ])("%s accepts Codex payload, sends telemetry, and stays silent", async (script, event, extra, path) => {
     const result = await runHook(script, codexPayload(event, extra));
-    expect(result.requests[0]?.path).toBe(path);
+    expect(result.requests.map(r => r.path)).toContain(path);
     expect(result.stdout).toBe("");
   });
 });

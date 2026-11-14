@@ -1,15 +1,28 @@
+import { availableParallelism } from "node:os";
 import { getHeapStatistics } from "node:v8";
 import type { IIIClient } from "iii-sdk";
 import type { HealthSnapshot } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { evaluateHealth } from "./thresholds.js";
-import type { StreamRelayProbe } from "./stream-relay-probe.js";
+import { getLiveEventsStats } from "../viewer/live-events.js";
+
+export function cpuCoreCount(): number {
+  const count = availableParallelism();
+  return count > 0 ? count : 1;
+}
+
+export function normalizeCpuPercent(
+  singleCorePercent: number,
+  coreCount: number = cpuCoreCount(),
+): number {
+  const cores = coreCount > 0 ? coreCount : 1;
+  return singleCorePercent / cores;
+}
 
 export function registerHealthMonitor(
   sdk: IIIClient,
   kv: StateKV,
-  options: { streamRelayProbe?: StreamRelayProbe } = {},
 ): { stop: () => void } {
   let connectionState = "connected";
   let prevCpuUsage = process.cpuUsage();
@@ -30,8 +43,10 @@ export function registerHealthMonitor(
     const elapsedMs = now - prevCpuTime;
     const userDelta = currentCpu.user - prevCpuUsage.user;
     const systemDelta = currentCpu.system - prevCpuUsage.system;
-    const cpuPercent =
+    const singleCoreCpuPercent =
       elapsedMs > 0 ? ((userDelta + systemDelta) / 1000 / elapsedMs) * 100 : 0;
+    const coreCount = cpuCoreCount();
+    const cpuPercent = normalizeCpuPercent(singleCoreCpuPercent, coreCount);
     prevCpuUsage = currentCpu;
     prevCpuTime = now;
 
@@ -66,13 +81,9 @@ export function registerHealthMonitor(
       kvConnectivity = { status: "error", error: "kv_probe_failed", latencyMs: Math.round((performance.now() - kvStart) * 100) / 100 };
     }
 
-    const streamRelay = options.streamRelayProbe
-      ? await options.streamRelayProbe.check().catch(() => "unknown" as const)
-      : undefined;
-
     const snapshot: HealthSnapshot = {
       connectionState,
-      ...(streamRelay ? { streamRelay } : {}),
+      liveEvents: getLiveEventsStats(),
       workers,
       memory: {
         heapUsed: mem.heapUsed,
@@ -85,6 +96,7 @@ export function registerHealthMonitor(
         userMicros: currentCpu.user,
         systemMicros: currentCpu.system,
         percent: Math.round(cpuPercent * 100) / 100,
+        cores: coreCount,
       },
       eventLoopLagMs,
       uptimeSeconds: uptime,
@@ -111,7 +123,6 @@ export function registerHealthMonitor(
   return {
     stop: () => {
       clearInterval(interval);
-      options.streamRelayProbe?.close();
     },
   };
 }

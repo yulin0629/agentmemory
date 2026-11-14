@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { registerApiTriggers } from "../src/triggers/api.js";
-import { registerEventTriggers } from "../src/triggers/events.js";
 import { registerRememberFunction } from "../src/functions/remember.js";
 import { KV } from "../src/state/schema.js";
 
@@ -13,12 +12,11 @@ function setup() {
   };
   const kv = { get: vi.fn(), update: vi.fn(), list: vi.fn(async () => []), set: vi.fn(), delete: vi.fn() };
   registerApiTriggers(sdk as never, kv as never, "");
-  registerEventTriggers(sdk as never, kv as never);
   registerRememberFunction(sdk as never, kv as never);
   return { handlers, kv };
 }
 
-for (const name of ["api::session::end", "event::session::ended"]) {
+for (const name of ["api::session::end"]) {
   describe(name, () => {
     const payload = name.startsWith("api") ? { body: { sessionId: "s" } } : { sessionId: "s" };
     it("skips absent sessions", async () => {

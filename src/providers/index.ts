@@ -13,12 +13,12 @@ import { OpenRouterProvider } from "./openrouter.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
 import { SplitProvider } from "./split.js";
-import { getEnvVar, loadSummarizeConfig } from "../config.js";
+import { getEnvVar, getProviderKey, loadSummarizeConfig } from "../config.js";
 
 export { createEmbeddingProvider, createImageEmbeddingProvider } from "./embedding/index.js";
 
 function requireEnvVar(key: string): string {
-  const value = getEnvVar(key);
+  const value = getProviderKey(key);
   if (!value) {
     throw new Error(
       `Missing required environment variable: ${key}. Set it in ~/.agentmemory/.env or as an environment variable.`,
@@ -141,7 +141,7 @@ function createBaseProvider(config: ProviderConfig): MemoryProvider {
       );
     case "gemini": {
       const geminiKey =
-        getEnvVar("GEMINI_API_KEY") || getEnvVar("GOOGLE_API_KEY");
+        getProviderKey("GEMINI_API_KEY") || getProviderKey("GOOGLE_API_KEY");
       if (!geminiKey) {
         throw new Error(
           "GEMINI_API_KEY (or GOOGLE_API_KEY) is required for the gemini provider",
@@ -162,7 +162,7 @@ function createBaseProvider(config: ProviderConfig): MemoryProvider {
         "https://openrouter.ai/api/v1/chat/completions",
       );
     case "openai": {
-      const openaiKey = getEnvVar("OPENAI_API_KEY");
+      const openaiKey = getProviderKey("OPENAI_API_KEY");
       if (!openaiKey) {
         throw new Error(
           "OPENAI_API_KEY is required for the openai provider",

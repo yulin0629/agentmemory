@@ -96,6 +96,21 @@ describe("mem::session-sweep", () => {
     expect(sweep.success).toBe(true);
   });
 
+  it("summarizes what a stale session captured before leaving it abandoned", async () => {
+    kv.set(
+      KV.sessions,
+      "s-obs",
+      session({ id: "s-obs", observationCount: 3, updatedAt: new Date(nowMs - 30 * H).toISOString() }),
+    );
+    kv.set(KV.sessions, "s-empty", session({ id: "s-empty", updatedAt: new Date(nowMs - 30 * H).toISOString() }));
+    const sweep = await (sdk as any).trigger({ function_id: "mem::session-sweep", payload: {} });
+    expect(sweep.abandoned).toBe(2);
+    const stopped = sdk.triggers.filter((t) => t.function_id === "event::session::stopped");
+    expect(stopped).toEqual([
+      expect.objectContaining({ payload: { sessionId: "s-obs", skipConsolidation: true } }),
+    ]);
+  });
+
   it("falls back to startedAt when the session has no heartbeat", async () => {
     kv.set(KV.sessions, "s-nobeat", session({ id: "s-nobeat", startedAt: new Date(nowMs - 48 * H).toISOString() }));
     const sweep = await (sdk as any).trigger({ function_id: "mem::session-sweep", payload: {} });
@@ -206,6 +221,29 @@ describe("mem::session-sweep", () => {
     expect(sweep.failed).toBe(1);
     expect((await kv.get<Session>(KV.sessions, "s-ok"))!.status).toBe("abandoned");
     expect((await kv.get<Session>(KV.sessions, "s-bad"))!.status).toBe("active");
+  });
+
+  it("skips stale active rows without a non-empty string id and abandons the rest", async () => {
+    kv.set(KV.sessions, "s-old", session({ id: "s-old", updatedAt: new Date(nowMs - 30 * H).toISOString() }));
+    const { id: _id, ...noId } = session({ updatedAt: new Date(nowMs - 30 * H).toISOString() });
+    const unusable = [noId, { ...noId, id: null }, { ...noId, id: 42 }, { ...noId, id: "" }];
+    unusable.forEach((row, i) => kv.set(KV.sessions, `row-${i}`, row));
+    const realGet = kv.get;
+    const sessionGetKeys: unknown[] = [];
+    kv.get = async <T>(scope: string, key: unknown): Promise<T | null> => {
+      if (scope === KV.sessions) sessionGetKeys.push(key);
+      if (typeof key !== "string") {
+        throw new Error("deserialization_error: Failed to deserialize input for state::get: missing field `key`");
+      }
+      return realGet<T>(scope, key);
+    };
+    const sweep = await sdk.trigger({ function_id: "mem::session-sweep", payload: {} });
+    expect(sweep).toMatchObject({ success: true, abandoned: 1, failed: 0 });
+    expect(sessionGetKeys.filter((key) => typeof key !== "string" || key === "")).toEqual([]);
+    expect((await realGet<Session>(KV.sessions, "s-old"))!.status).toBe("abandoned");
+    for (const i of unusable.keys()) {
+      expect((await realGet<Session>(KV.sessions, `row-${i}`))!.status).toBe("active");
+    }
   });
 
   it("writes one audit entry into the current month scope listing the abandoned sessions", async () => {

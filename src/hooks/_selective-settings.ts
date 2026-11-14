@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { resolveClientSecret } from "../secret-store.js";
+import { explicitSecret, resolveClientSecret } from "../secret-store.js";
 
 export function selectiveSettings(): { enabled: boolean; url: string; secret: string; selectiveSecret: string; owner?: string } {
   let local: { enabled?: boolean; url?: string; secret?: string; selectiveSecret?: string; owner?: string } = {};
@@ -13,7 +13,7 @@ export function selectiveSettings(): { enabled: boolean; url: string; secret: st
     enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== undefined
       ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
     url,
-    secret: process.env.AGENTMEMORY_SECRET || local?.secret || resolveClientSecret(url),
+    secret: explicitSecret() || local?.secret || resolveClientSecret(url),
     selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
     owner: local?.owner,
   };

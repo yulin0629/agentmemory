@@ -1,4 +1,5 @@
 import type { IIIClient } from "iii-sdk";
+import { randomUUID } from "node:crypto";
 import type {
   CompressedObservation,
   SessionSummary,
@@ -7,7 +8,6 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
   SUMMARY_SYSTEM,
   buildSummaryPrompt,
@@ -15,26 +15,24 @@ import {
   buildReducePrompt,
 } from "../prompts/summary.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
-import { isNoopProvider } from "../providers/noop.js";
-import { scrubRecord } from "./privacy.js";
-import { computeInputFingerprint } from "./input-fingerprint.js";
 import { SummaryOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreSummary } from "../eval/quality.js";
+import { isNoopProvider } from "../providers/noop.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { scrubRecord } from "./privacy.js";
+import { registerSummaryRecoveryFunction } from "./summary-recovery.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
+import { getSummaryTimeoutMs, summaryFingerprint, summaryObservations } from "./summary-state.js";
 
 // Per-chunk observation budget when a session is too large to fit in one
 // LLM call. Default ≈ 50k input tokens per chunk at ~110 tok/obs — fits
 // comfortably in 128k-window models. Override via SUMMARIZE_CHUNK_SIZE.
 const CHUNK_SIZE_DEFAULT = 400;
-// Concurrent in-flight chunk calls. 6 keeps a 100-chunk session under
-// iii's 180s function-invocation timeout at ~8s/call while staying
-// inside generous-but-not-unlimited provider rate limits (well below
-// OpenAI free tier's 500 RPM). High-throughput providers
-// (Novita / DeepInfra / DeepSeek) typically allow 100+ concurrent — set
-// SUMMARIZE_CHUNK_CONCURRENCY higher to cover ~1000+ chunk sessions.
+// Concurrent chunk calls share the summary deadline. Increase this for
+// large sessions only when the configured provider supports the load.
 const CHUNK_CONCURRENCY_DEFAULT = 6;
 // Bail on the merged summary if more than this fraction of chunks fail
 // to parse — a half-blind narrative is worse than a clean error.
@@ -52,44 +50,6 @@ function getChunkConcurrency(): number {
   if (!raw) return CHUNK_CONCURRENCY_DEFAULT;
   const n = parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : CHUNK_CONCURRENCY_DEFAULT;
-}
-
-// Upper bound on how long one summarize run may hold the per-session lock.
-// Some providers (anthropic, agent-sdk) have no request timeout of their
-// own; without a bound a hung LLM call would block every later summarize
-// for that session forever. Generous enough for chunked map-reduce runs.
-const LOCK_TIMEOUT_MS_DEFAULT = 300_000;
-
-function getLockTimeoutMs(): number {
-  const raw = process.env.SUMMARIZE_LOCK_TIMEOUT_MS;
-  if (!raw) return LOCK_TIMEOUT_MS_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : LOCK_TIMEOUT_MS_DEFAULT;
-}
-
-// Resolves with a timeout marker instead of rejecting so the caller gets a
-// normal { success: false } result. The underlying run keeps going in the
-// background, but the keyed lock is released.
-function raceLockTimeout<T>(
-  work: Promise<T>,
-  ms: number,
-  sessionId: string,
-): Promise<T | { success: false; error: string }> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<{ success: false; error: string }>((resolve) => {
-    timer = setTimeout(() => {
-      logger.warn("Summarize lock timeout — releasing session lock", {
-        sessionId,
-        timeoutMs: ms,
-      });
-      resolve({ success: false, error: "summarize_timeout" });
-    }, ms);
-    timer.unref?.();
-  });
-  return Promise.race([
-    work.finally(() => clearTimeout(timer)),
-    timeout,
-  ]);
 }
 
 // One chunk call with retry-once. Returns null when both attempts fail —
@@ -226,10 +186,6 @@ async function produceSummaryXml(
   return { response, mode: "chunked", chunks: chunks.length, skipped };
 }
 
-// #783: many LLMs (DeepSeek, GPT variants, some Anthropic responses)
-// wrap structured XML in markdown code fences or add conversational
-// text before/after. Strip those wrappers before the tag regex so a
-// well-formed summary doesn't get silently dropped as parse_failed.
 function stripXmlWrappers(raw: string): string {
   if (!raw) return "";
   let cleaned = raw.trim();
@@ -268,76 +224,33 @@ function parseSummaryXml(
   };
 }
 
-// mem::observe writes the raw observation under the same kv key that
-// mem::compress later overwrites with the compressed one, so an entry
-// without a `title` means "compression still in flight". /session/end
-// fans out to mem::summarize the moment the last observe returns, while
-// that observation's mem::compress is still running (8.5s mean on the
-// reference deployment vs. a sub-second observe→end gap for one-shot
-// runs like `claude -p` / `pi -p`). Bailing with no_observations there
-// loses the summary permanently — nothing re-triggers summarize. Wait
-// for the pending compressions to land instead; on timeout summarize
-// whatever did compress rather than dropping the session.
-// A run that outlived its lock timeout keeps going in the background; the
-// run number lets it notice a newer run already wrote and drop its stale
-// result instead of overwriting.
-// debt: ceiling: one entry per summarized session for the process lifetime;
-// upgrade: delete the entry when no run for the session is in flight if a
-// single process ever summarizes hundreds of thousands of sessions.
-const lastWrittenRun = new Map<string, number>();
-let runCounter = 0;
-
-const COMPRESS_WAIT_MS_DEFAULT = 60_000;
-const COMPRESS_POLL_MS = 500;
-
-function getCompressWaitMs(): number {
-  const raw = process.env.SUMMARIZE_COMPRESS_WAIT_MS;
-  if (!raw) return COMPRESS_WAIT_MS_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n >= 0 ? n : COMPRESS_WAIT_MS_DEFAULT;
+function visibleAt(observation: CompressedObservation): string {
+  return observation.compressedAt ?? observation.timestamp;
 }
 
-async function waitForPendingCompressions(
-  kv: StateKV,
-  sessionId: string,
-): Promise<{
-  observations: CompressedObservation[];
-  compressed: CompressedObservation[];
-}> {
-  const deadline = Date.now() + getCompressWaitMs();
-  let observations = await kv.list<CompressedObservation>(
-    KV.observations(sessionId),
+async function reduceWithExisting(
+  provider: MemoryProvider,
+  existing: SessionSummary,
+  delta: SessionSummary,
+  total: number,
+): Promise<string> {
+  const existingEnd = Math.max(1, total - delta.observationCount);
+  const partial = (s: SessionSummary, obsRangeStart: number, obsRangeEnd: number) => ({
+    title: s.title,
+    narrative: s.narrative,
+    keyDecisions: s.keyDecisions,
+    filesModified: s.filesModified,
+    concepts: s.concepts,
+    obsRangeStart,
+    obsRangeEnd,
+  });
+  return provider.summarize(
+    REDUCE_SYSTEM,
+    buildReducePrompt([
+      partial(existing, 1, existingEnd),
+      partial(delta, existingEnd + 1, total),
+    ]),
   );
-  let compressed = observations.filter((o) => o.title);
-  if (compressed.length === observations.length) {
-    return { observations, compressed };
-  }
-
-  const startedAt = Date.now();
-  while (compressed.length < observations.length && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, COMPRESS_POLL_MS));
-    observations = await kv.list<CompressedObservation>(
-      KV.observations(sessionId),
-    );
-    compressed = observations.filter((o) => o.title);
-  }
-
-  const waitedMs = Date.now() - startedAt;
-  if (compressed.length < observations.length) {
-    logger.warn("Summarizing with compressions still pending", {
-      sessionId,
-      compressed: compressed.length,
-      total: observations.length,
-      waitedMs,
-    });
-  } else {
-    logger.info("Waited for in-flight compressions before summarizing", {
-      sessionId,
-      observationCount: compressed.length,
-      waitedMs,
-    });
-  }
-  return { observations, compressed };
 }
 
 export function registerSummarizeFunction(
@@ -346,220 +259,216 @@ export function registerSummarizeFunction(
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
 ): void {
-  sdk.registerFunction("mem::summarize", 
-    async (data: { sessionId: string } | undefined) => {
+  registerSummaryRecoveryFunction(sdk, kv, () => !isNoopProvider(provider));
+  const lockPrefix = `summary:${randomUUID()}`;
+  const summarize = async (data: { sessionId: string; force?: boolean } | undefined) => {
       const startMs = Date.now();
       if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
         return { success: false, error: "sessionId is required" };
       }
       const sessionId = data.sessionId.trim();
 
-      // Serialize per-session runs: the stop path and the explicit API can
-      // race, and a second concurrent run would redo the same LLM work.
-      // See the up-to-date short-circuit below for the sequential case.
-      const runSummarize = async () => {
-        const run = ++runCounter;
-        const session = await kv.get<Session>(KV.sessions, sessionId);
-        if (!session) {
-          logger.warn("Session not found for summarize", {
-            sessionId,
-          });
-          return { success: false, error: "session_not_found" };
-        }
-
-        const { observations, compressed } =
-          await waitForPendingCompressions(kv, sessionId);
-
-        if (compressed.length === 0) {
-          logger.info("No observations to summarize", {
-            sessionId,
-            rawPending: observations.length,
-          });
-          return { success: false, error: "no_observations" };
-        }
-
-        // An unchanged input fingerprint means the LLM input would be
-        // identical to the previous run. Skipping avoids re-summarizing
-        // long-lived sessions (e.g. heartbeat loops) from scratch on every
-        // stop when nothing new happened. Summaries written before this
-        // field existed have no fingerprint and never match, so they
-        // re-summarize once and pick one up.
-        const inputFingerprint = computeInputFingerprint(compressed);
-        const existing = await kv.get<SessionSummary>(
-          KV.summaries,
+      const session = await kv.get<Session>(KV.sessions, sessionId);
+      if (!session) {
+        logger.warn("Session not found for summarize", {
           sessionId,
-        );
-        if (existing && existing.inputFingerprint === inputFingerprint) {
-          logger.info("Summary already up to date — skipping", {
+        });
+        return { success: false, error: "session_not_found" };
+      }
+
+      const observations = await kv.list<CompressedObservation>(
+        KV.observations(sessionId),
+      );
+      const compressed = summaryObservations(observations);
+
+      if (compressed.length === 0) {
+        logger.info("No observations to summarize", {
+          sessionId,
+        });
+        return { success: false, error: "no_observations" };
+      }
+
+      const storedSummary = await kv.get<SessionSummary>(KV.summaries, sessionId);
+      const summaryRevision = JSON.stringify(storedSummary);
+      const existing = data.force === true ? null : storedSummary;
+      const fingerprint = summaryFingerprint(session, compressed);
+      const coveredCount = existing?.observationCount ?? 0;
+      const prefixMatches = existing?.coveredFingerprint && Number.isSafeInteger(coveredCount) &&
+        coveredCount > 0 && coveredCount <= compressed.length &&
+        summaryFingerprint(session, compressed.slice(0, coveredCount)) === existing.coveredFingerprint;
+      if (existing && prefixMatches && coveredCount === compressed.length) {
+        return { success: true, unchanged: true, summary: existing };
+      }
+      const incremental = existing && prefixMatches ? existing : null;
+      const input = incremental ? compressed.slice(coveredCount) : compressed;
+      const coveredThrough = visibleAt(compressed[compressed.length - 1]);
+
+      if (isNoopProvider(provider)) {
+        logger.info("Summarize skipped — no LLM provider configured", {
+          sessionId,
+        });
+        return {
+          success: false,
+          error: "no_provider",
+          reason:
+            "No LLM provider chosen; Summarize is a no-op. Set AGENTMEMORY_LLM_PROVIDER and that provider's key in ~/.agentmemory/.env to enable.",
+        };
+      }
+
+      const timeoutMs = getSummaryTimeoutMs();
+      const boundedProvider: MemoryProvider = {
+        name: provider.name,
+        compress: (system, prompt) => provider.compress(system, prompt),
+        summarize: async (system, prompt) => {
+          const remaining = timeoutMs - (Date.now() - startMs);
+          if (remaining <= 0) throw new Error("summary_timeout");
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            return await Promise.race([provider.summarize(system, prompt), new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error("summary_timeout")), remaining);
+            })]);
+          } finally { clearTimeout(timer); }
+        },
+      };
+      try {
+        let summary: SessionSummary | null = null;
+        let response = "";
+        let mode = "single";
+        let chunks = 1;
+        let incomplete = false;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const produced = await produceSummaryXml(
+            boundedProvider,
+            input,
             sessionId,
-            observationCount: compressed.length,
-          });
-          return { success: true, summary: existing, skipped: true };
-        }
-
-        if (isNoopProvider(provider)) {
-          logger.info("Summarize skipped — no LLM provider configured", {
-            sessionId,
-          });
-          return {
-            success: false,
-            error: "no_provider",
-            reason:
-              "No LLM provider key set; Summarize is a no-op. Set ANTHROPIC_API_KEY (or GEMINI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env to enable.",
-          };
-        }
-
-        try {
-          // #783: chunk-level produceSummaryXml retries internally, but
-          // the final merge used to parse once and bail. Wrap the
-          // produce-and-parse pair in the same 2-attempt loop so a
-          // markdown-wrapped or otherwise wrapped response gets a
-          // second roll-of-the-dice instead of dropping the summary.
-          let summary: SessionSummary | null = null;
-          let response = "";
-          let mode = "single";
-          let chunks = 1;
-          for (let attempt = 1; attempt <= 2; attempt++) {
-            const produced = await produceSummaryXml(
-              provider,
-              compressed,
-              sessionId,
-              session.project,
-            );
-            response = produced.response;
-            mode = produced.mode;
-            chunks = produced.chunks;
-            if (!response || !response.trim()) {
-              logger.warn("Empty provider response on summarize", {
-                sessionId,
-                provider: provider.name,
-                mode,
-                chunks,
-                observationCount: compressed.length,
-                attempt,
-              });
-              continue;
-            }
-            summary = parseSummaryXml(
-              response,
-              sessionId,
-              session.project,
-              compressed.length,
-            );
-            if (summary) break;
-            logger.warn("Failed to parse summary XML", { sessionId, attempt });
-          }
-
-          if (!response || !response.trim()) {
-            const latencyMs = Date.now() - startMs;
-            if (metricsStore) {
-              await metricsStore.record("mem::summarize", latencyMs, false);
-            }
-            return { success: false, error: "empty_provider_response" };
-          }
-
-          if (!summary) {
-            const latencyMs = Date.now() - startMs;
-            if (metricsStore) {
-              await metricsStore.record("mem::summarize", latencyMs, false);
-            }
-            return { success: false, error: "parse_failed" };
-          }
-          summary = scrubRecord(summary);
-
-          const summaryForValidation = {
-            title: summary.title,
-            narrative: summary.narrative,
-            keyDecisions: summary.keyDecisions,
-            filesModified: summary.filesModified,
-            concepts: summary.concepts,
-          };
-          const validation = validateOutput(
-            SummaryOutputSchema,
-            summaryForValidation,
-            "mem::summarize",
+            session.project,
           );
-
-          if (!validation.valid) {
-            const latencyMs = Date.now() - startMs;
-            if (metricsStore) {
-              await metricsStore.record("mem::summarize", latencyMs, false);
-            }
-            logger.warn("Summary validation failed", {
+          response = produced.response;
+          mode = incremental ? "incremental" : produced.mode;
+          chunks = produced.chunks;
+          incomplete = (produced.skipped ?? 0) > 0;
+          if (!response || !response.trim()) {
+            logger.warn("Empty provider response on summarize", {
               sessionId,
-              errors: validation.result.errors,
+              provider: provider.name,
+              mode,
+              chunks,
+              observationCount: input.length,
+              attempt,
             });
-            return { success: false, error: "validation_failed" };
+            continue;
           }
-
-          const qualityScore = scoreSummary(summaryForValidation);
-
-          summary.inputFingerprint = inputFingerprint;
-          // mem::forget deletes observations under obs-write:<sid> and the
-          // session row under session:<sid>. Skip the write if a newer run
-          // already wrote, the session is gone, or an observation summarized
-          // here was forgotten meanwhile (the session row alone can be
-          // recreated by the next observation).
-          const dropped = await withKeyedLock(`obs-write:${sessionId}`, () => withKeyedLock(`session:${sessionId}`, async () => {
-            if ((lastWrittenRun.get(sessionId) ?? 0) > run) return "superseded";
-            if (!(await kv.get(KV.sessions, sessionId))) return "session_deleted";
-            const current = new Set(
-              (await kv.list<{ id: string }>(KV.observations(sessionId))).map((o) => o.id),
-            );
-            if (!compressed.every((o) => current.has(o.id))) return "observations_deleted";
-            await kv.set(KV.summaries, sessionId, summary);
-            lastWrittenRun.set(sessionId, run);
-            return null;
-          }));
-          if (dropped) {
-            const latencyMs = Date.now() - startMs;
-            if (metricsStore) {
-              await metricsStore.record("mem::summarize", latencyMs, false);
-            }
-            logger.info("Summary dropped before write", { sessionId, reason: dropped });
-            return { success: false, error: dropped };
-          }
-          await safeAudit(kv, "compress", "mem::summarize", [sessionId], {
-            title: summary.title,
-            observationCount: compressed.length,
-          });
-
-          const latencyMs = Date.now() - startMs;
-          if (metricsStore) {
-            await metricsStore.record(
-              "mem::summarize",
-              latencyMs,
-              true,
-              qualityScore,
-            );
-          }
-
-          logger.info("Session summarized", {
+          summary = parseSummaryXml(
+            response,
             sessionId,
-            title: summary.title,
-            decisions: summary.keyDecisions.length,
-            qualityScore,
-            valid: validation.valid,
-          });
+            session.project,
+            input.length,
+          );
+          if (summary && incremental) {
+            response = await reduceWithExisting(boundedProvider, incremental, summary, compressed.length);
+            summary = parseSummaryXml(response, sessionId, session.project, compressed.length);
+          }
+          if (summary) break;
+          logger.warn("Failed to parse summary XML", { sessionId, attempt });
+        }
 
-          return { success: true, summary, qualityScore };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
+        if (!response || !response.trim()) {
           const latencyMs = Date.now() - startMs;
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
-          logger.error("Summarize failed", {
-            sessionId,
-            error: msg,
-          });
-          return { success: false, error: msg };
+          return { success: false, error: "empty_provider_response" };
         }
-      };
 
-      return withKeyedLock(`summarize:${sessionId}`, () =>
-        raceLockTimeout(runSummarize(), getLockTimeoutMs(), sessionId),
-      );
-    },
+        if (!summary) {
+          const latencyMs = Date.now() - startMs;
+          if (metricsStore) {
+            await metricsStore.record("mem::summarize", latencyMs, false);
+          }
+          return { success: false, error: "parse_failed" };
+        }
+        summary = scrubRecord({ ...summary, observationCount: compressed.length,
+          ...(!incomplete ? { coveredThrough, coveredFingerprint: fingerprint } : {}),
+        });
+
+        const summaryForValidation = {
+          title: summary.title,
+          narrative: summary.narrative,
+          keyDecisions: summary.keyDecisions,
+          filesModified: summary.filesModified,
+          concepts: summary.concepts,
+        };
+        const validation = validateOutput(
+          SummaryOutputSchema,
+          summaryForValidation,
+          "mem::summarize",
+        );
+
+        if (!validation.valid) {
+          const latencyMs = Date.now() - startMs;
+          if (metricsStore) {
+            await metricsStore.record("mem::summarize", latencyMs, false);
+          }
+          logger.warn("Summary validation failed", {
+            sessionId,
+            errors: validation.result.errors,
+          });
+          return { success: false, error: "validation_failed" };
+        }
+
+        const qualityScore = scoreSummary(summaryForValidation);
+
+        const published = await withKeyedLock(`obs:${sessionId}`, async () => {
+          const currentSession = await kv.get<Session>(KV.sessions, sessionId);
+          if (!currentSession || currentSession.id !== sessionId) return false;
+          const currentObservations = summaryObservations(await kv.list<CompressedObservation>(KV.observations(sessionId)));
+          if (summaryFingerprint(currentSession, currentObservations) !== fingerprint ||
+              JSON.stringify(await kv.get(KV.summaries, sessionId)) !== summaryRevision) return false;
+          await kv.set(KV.summaries, sessionId, summary);
+          return true;
+        });
+        if (!published) return { success: false, error: "source_changed" };
+        await safeAudit(kv, "compress", "mem::summarize", [sessionId], {
+          title: summary.title,
+          observationCount: compressed.length,
+          newObservations: input.length,
+        });
+
+        const latencyMs = Date.now() - startMs;
+        if (metricsStore) {
+          await metricsStore.record(
+            "mem::summarize",
+            latencyMs,
+            true,
+            qualityScore,
+          );
+        }
+
+        logger.info("Session summarized", {
+          sessionId,
+          title: summary.title,
+          decisions: summary.keyDecisions.length,
+          qualityScore,
+          valid: validation.valid,
+        });
+
+        return { success: true, summary, qualityScore, incremental: incremental !== null, ...(incomplete ? { incomplete: true } : {}) };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const latencyMs = Date.now() - startMs;
+        if (metricsStore) {
+          await metricsStore.record("mem::summarize", latencyMs, false);
+        }
+        logger.error("Summarize failed", {
+          sessionId,
+          error: msg,
+        });
+        return { success: false, error: msg };
+      }
+    };
+  sdk.registerFunction("mem::summarize", (data: { sessionId: string; force?: boolean } | undefined) =>
+    typeof data?.sessionId === "string" && data.sessionId.trim()
+      ? withKeyedLock(`${lockPrefix}:${data.sessionId.trim()}`, () => summarize(data))
+      : summarize(data),
   );
 }

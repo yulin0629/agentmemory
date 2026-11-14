@@ -1,3 +1,5 @@
+import { matchesSearchLayer, type SearchLayer, type SearchLayerResolver } from "./search-layer.js";
+
 export function float32ToBase64(arr: Float32Array): string {
   return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength).toString(
     "base64",
@@ -97,6 +99,8 @@ export class VectorIndex {
   search(
     query: Float32Array,
     limit = 20,
+    targetLayer: SearchLayer = "all",
+    resolveLayer?: SearchLayerResolver,
     filter?: (obsId: string) => boolean,
   ): Array<{ obsId: string; sessionId: string; score: number }> {
     const results: Array<{
@@ -107,6 +111,7 @@ export class VectorIndex {
     let minScore = -Infinity;
 
     for (const [obsId, entry] of this.vectors) {
+      if (!matchesSearchLayer(obsId, entry.sessionId, targetLayer, resolveLayer?.(obsId, entry.sessionId))) continue;
       if (filter && !filter(obsId)) continue;
       const score = cosineSimilarity(query, entry.embedding);
       if (results.length < limit) {

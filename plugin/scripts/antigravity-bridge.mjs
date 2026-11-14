@@ -67,8 +67,9 @@ function normalizePayload(event, raw) {
 			for (const line of lines.reverse()) {
 				if (!line.trim()) continue;
 				const step = JSON.parse(line);
-				if (step.type === "USER_INPUT" && typeof step.content === "string") {
-					out["prompt"] = step.content;
+				if (step.type === "USER_INPUT" && step.source === "USER_EXPLICIT" && typeof step.content === "string") {
+					const match = step.content.match(/<USER_REQUEST>\n?([\s\S]*?)\n?<\/USER_REQUEST>/);
+					out["prompt"] = (match ? match[1] : step.content).trim();
 					break;
 				}
 			}
@@ -118,9 +119,12 @@ async function main() {
 		return;
 	}
 	if (!raw || typeof raw !== "object") return;
-	const payload = JSON.stringify(normalizePayload(event, raw));
+	const normalized = normalizePayload(event, raw);
+	const payload = JSON.stringify(normalized);
 	let context = "";
-	for (const script of targetsFor(event, raw)) {
+	const targets = targetsFor(event, raw);
+	if (event === "PreInvocation" && typeof normalized["prompt"] === "string" && normalized["prompt"].trim()) targets.push("prompt-submit.mjs");
+	for (const script of targets) {
 		const child = spawnSync(process.execPath, [join(SCRIPTS_DIR, script)], {
 			input: payload,
 			encoding: "utf8",

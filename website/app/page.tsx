@@ -2,17 +2,22 @@ import { Nav } from "@/components/site/Nav";
 import { Hero } from "@/components/site/Hero";
 import { Proof } from "@/components/site/Proof";
 import { Featured, InTheWild } from "@/components/site/InTheWild";
+import { Research } from "@/components/site/Research";
 import { UseCases } from "@/components/site/UseCases";
 import { ContextFunnel } from "@/components/site/ContextFunnel";
 import { InfraTiles } from "@/components/site/InfraTiles";
 import { MemoryScroll } from "@/components/site/MemoryScroll";
 import { Benchmarks } from "@/components/site/Benchmarks";
+import { Runtime } from "@/components/site/Runtime";
+import { Scale } from "@/components/site/Scale";
 import { Agents } from "@/components/site/Agents";
 import { LocalFirst } from "@/components/site/LocalFirst";
 import { Interfaces } from "@/components/site/Interfaces";
 import { Faq } from "@/components/site/Faq";
 import { Install } from "@/components/site/Install";
 import { Footer } from "@/components/site/Footer";
+
+export const revalidate = 3600;
 
 export default function Page() {
   return (
@@ -22,15 +27,18 @@ export default function Page() {
         <Hero />
         <Proof />
         <Featured />
+        <Interfaces />
         <UseCases />
+        <Runtime />
         <ContextFunnel />
         <InfraTiles />
         <MemoryScroll />
         <InTheWild />
+        <Research />
+        <Scale />
         <Benchmarks />
         <Agents />
         <LocalFirst />
-        <Interfaces />
         <Faq />
         <Install />
       </main>

@@ -17,18 +17,130 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Remote MCP results now carry `resultType` (0.9.29-yulin.2).** `POST /mcp` negotiates protocol `2026-07-28`, which requires `resultType` on every result, but no result had it, so claude.ai connectors rejected every `tools/call` as malformed. Every result (`initialize`, `server/discover`, `ping`, `tools/list`, `tools/call` including `isError`) now sends `resultType: "complete"`; a `resultType` already set by the tool implementation is kept. Earlier-revision clients ignore the extra field.
 - **Forgetting a session is no longer undone by work still in flight.** A `mem::compress` that finished after `mem::forget` wrote the observation back (and re-indexed it for search); a `mem::summarize` running across the forget stored a summary of the forgotten observations, even when the next turn had already recreated the session row; an `mem::observe` racing the forget re-upserted a partial session row; and forgetting a single observation while `mem::observe` was still writing it left its synthetic compression behind (the default, `AGENTMEMORY_AUTO_COMPRESS` off); and with `EMBED_COALESCE_MS=0` an embedding still in flight re-added the forgotten entry to the vector index. Compress now persists only while the raw entry still exists, both forget paths serialize with observe and compress per session, and summarize re-checks the session and its observations under the session lock before writing, and an uncoalesced vector add is cancelled by a remove that lands mid-embed like a coalesced one already was. A result dropped this way counts as a failed call in metrics. Found by model-checking the session lifecycle in TLA+; each interleaving has a regression test in `test/session-lifecycle-races.test.ts`.
 - **Forgetting individual observations no longer leaves them quoted in the session summary.** `mem::forget` with `observationIds` now drops the summary and, when observations remain, re-summarizes the session from them in the background (one extra LLM call per such forget). A retry for ids that are already gone leaves the summary alone.
-- **A summarize run that outlived `SUMMARIZE_LOCK_TIMEOUT_MS` no longer overwrites a newer summary.** The timed-out run keeps going in the background; it now drops its result if a later run already wrote.
 - **`GET /agentmemory/sessions?limit=N`** now truncates to the N newest sessions before the summary fan-out instead of fetching every summary and returning the whole list.
 - **Upstream merge (`e04ba88`) integration fixes.** `event::session::stopped` keeps the graph-extract fingerprint dedup on top of upstream's unconditional `fireVoid` path; `contextPayload` regained the `hook_event_name: "SessionStart"` branch upstream dropped, which had reduced Claude Code / Codex SessionStart output to bare text instead of `hookSpecificOutput` JSON; `connect dsh --with-hooks` now reads `hooks.json` instead of `hooks.codex.json`, matching what the adapter's own protocol note and the README already claim (this fork trims `PreToolUse`/`PreCompact` from the Codex manifest on purpose).
 - **Hybrid search tie-break actually breaks ties.** Upstream's stable-sort fallback compared `a.obsId`, which `HybridSearchResult` does not define — it was `undefined` on both sides, so the comparator always returned 0. Now compares `a.observation.id`.
 - **Native Windows Claude Code hook installation.** `agentmemory connect claude-code --with-hooks` now passes the Windows dispatcher gate, preserves existing Claude Code hooks while merging all 12 AgentMemory events, and previews both MCP and hook changes in `--dry-run` mode. `PostToolUse` also waits for the remote observation request instead of exiting after 500 ms, preventing dropped tool observations on higher-latency relays.
-- **Observations are no longer silently dropped when LLM compression fails.** `mem::compress` now falls back to the zero-LLM synthetic compression on both `parse_failed` and `compression_failed`, performing the same full write sequence as `mem::observe` (kv, BM25, vector index, both stream groups). Degraded entries keep `confidence: 0.3` so they stay distinguishable from LLM-quality output.
 
 ### Changed
 
+- **Merged upstream v0.9.33 (0.9.33-yulin.1).** Engine is iii 0.25.1 under Worker Compose, and an LLM runs only when `AGENTMEMORY_LLM_PROVIDER` names it. Upstream's compression and summary state machines replace the fork's synthetic fallback on compression failure, `SUMMARIZE_LOCK_TIMEOUT_MS` and `SUMMARIZE_COMPRESS_WAIT_MS` (use `AGENTMEMORY_SUMMARY_TIMEOUT_MS`); its graph index reader replaces the fork's snapshot reads in reflect and graph retrieval. Fork behaviour kept or adapted: embedding coalescing now shares only the embed call, so each add keeps its own revision check and commit (this removes a remember/evolve deadlock the 0.9.30 merge had) and observe no longer waits for the synthetic vector add; explicit saves store the raw prompt event for capture and then restore the synthetic row; Antigravity runs `prompt-submit` when the session's own transcript yields an explicit user turn; `AGENTMEMORY_AUTH=none` (new) skips the generated API secret for a loopback-bound server reached through an authenticated tunnel; the Hermes plugin stays on the fork implementation.
 - **Merged upstream v0.9.30 (0.9.30-yulin.1).** Fork behaviour that changed with the merge: `POST /agentmemory/session/end` for an unknown session answers 200 `{ success: true, ended: false, reason: "not_found" }` instead of 404 (the DevSpace forwarder accepts both). `POST /agentmemory/observe` goes through the durable capture inbox and returns its result; `knowledgeCapture` is passed through for explicit saves, and an `event_id` request keeps its `obs_event_<uuid>` observation id while a capture is retrying. The `prompt-submit` hook sends ordinary observations through the shared capture module (disk spool, 3.5 s exit cap) when its selective settings resolve the same URL and secret; explicit saves and selective recall keep their direct requests. The synthetic compression fallback publishes to the viewer stream group only. `GET /agentmemory/sessions` keeps rejecting a non-integer `limit` with 400.
 
 ## [Unreleased]
+
+## [0.9.33] — 2026-11-09
+
+### Upgrade notes
+
+- agentmemory now pins iii 0.25.1 (engine, `iii-sdk` and `@iii-dev/helpers`) with state 0.22.22 and http 0.22.8. The first start after the upgrade installs them (#1634, #1694).
+- `GET /agentmemory/memories` and `GET /agentmemory/relations` without `limit` return 413 with a paging hint when the full list is larger than the transport limit, as `/semantic` and `/procedural` already did. Use `?limit=N` and `nextCursor`. The viewer and CLI already page (#1636).
+- Docker installs: the root and Coolify Compose files now forward `AGENTMEMORY_LLM_PROVIDER`. A provider key alone does not turn on LLM features; set `AGENTMEMORY_LLM_PROVIDER` to the provider whose key you configured. Docker installs that set only a key ran without LLM summaries since 0.9.32 (#1700).
+
+### Added
+
+- **State scopes above 64 MiB keep working.** Whole-scope reads page through `state::list_keys` instead of one frame, and mesh export pages when given `limit` or `cursor` (#1636). The transport cap is 64 MiB, up from 16 MiB (#1634).
+- `GET /agentmemory/sessions` filters by `startedAfter`, `startedBefore`, `endedAfter` and `endedBefore` (#1527 by @yxtay).
+- `AGENTMEMORY_SUMMARY_TIMEOUT_MS` sets the summary budget for large chunked sessions on slow or local LLMs (default 120 s) (#1689).
+- `memory_diagnose` and `memory_heal` have a `facets` category that finds and removes facets whose target was deleted (#1698).
+
+### Fixed
+
+- **Search:** saved memories are no longer capped at three per search (#1696). Evicted memories leave the search indexes (#1601 by @DimitriChrysafis). Boot detects historical gaps in a partially embedded vector index (#1687 by @mvanhorn). CLIP text queries use the CLIP text tower, so text-to-image search returns matching images (#1250 by @anhtahaylove).
+- **Hooks:** PreToolUse sends its context in the hook envelope, so the model sees it (#1693). Enrichment is scoped to the current project (#1220 by @devon3000). The Claude Code SessionEnd hook has time to finish (#1692). Captured text is redacted before it is cut to length, and compound secret key names are redacted (#1695, #1701). Cursor subagent stop type and summary fields are mapped (#1684 by @mothieras).
+- **Providers:** placeholder keys such as `sk-...` count as unset when agentmemory picks the LLM provider (#1588 by @dmazhukov). A success clears the circuit breaker failure count (#1350 by @redeye1011), and content-filter rejections no longer open the breaker (#1277 by @dKaulig).
+- The MCP shim waits 190 s for proxied calls instead of 15 s, past the server's 180 s limit, so long consolidate and reflect calls finish (#1691). `memory_action_create` records the creating agent (#1697).
+- Consolidation keeps provenance and version heads across retries, and saved pattern memories reach the procedural tier (#1545, #1690). Reflection bounds its evidence and insight responses and keeps other projects' crystals out of a scoped reflection (#1544).
+- `health` reports CPU relative to the machine's cores, not one core (#1286 by @DanielCarmingham).
+- `agentmemory demo` stops the Compose workers it started on Windows (#1688 by @Mike-Animal-Counseling). Generated Compose values keep newlines (#1708 by @zhichao-poper).
+- Fresh installs retry the iii engine download up to three times within two minutes on network errors, timeouts and HTTP 408, 429 and 5xx responses, and wait as long as `Retry-After` asks (#1719).
+- `agentmemory connect` honors `CLAUDE_CONFIG_DIR` for Claude Code detection, MCP configuration and hooks (#1703 by @mothieras).
+
+### Infrastructure
+
+- `@agentmemory/pi` 0.1.1 and `@agentmemory/fs-watcher` 0.2.0 (#1683). GitHub Actions bumps (#967, #1473). Config reference env count regenerated (#1705). The Windows release gate fails when its leftover-process query fails (#1711), and the CLIP tests check both towers (#1712). The release gate runs the packed package on Linux x64 and arm64, macOS arm64 and Intel, and Windows x64 and arm64 (#1716).
+
+## [0.9.32] — 2026-11-04
+
+### Upgrade notes
+
+- **Breaking: an API key alone no longer turns on an outside provider.** LLM summaries, compression, consolidation and reflection run only when `AGENTMEMORY_LLM_PROVIDER` names `anthropic`, `openai`, `gemini`, `openrouter` or `minimax` and that provider's key is set. `AGENTMEMORY_ALLOW_AGENT_SDK=true` stays the other route. Cloud embeddings run only when `EMBEDDING_PROVIDER` names the provider; `EMBEDDING_PROVIDER=local` stays on-device, and unset means BM25 and graph search only. If a key is present without a choice, boot, `doctor`, `status` and the viewer name the exact line to add (#1664).
+- `OPENAI_API_KEY_FOR_LLM` is removed. Set `AGENTMEMORY_LLM_PROVIDER` instead (#1664).
+- **Hooks send nothing to a remote `http://` server.** A non-loopback `AGENTMEMORY_URL` must use HTTPS; captures for a plain-HTTP remote server are dropped, not spooled. The secret is sent only to loopback or HTTPS addresses (#1664).
+- The PreCompact hook prints stored memory only with `AGENTMEMORY_INJECT_CONTEXT=true`, the same gate as SessionStart (#1664).
+- The Claude Code plugin asks for the server URL and secret through plugin settings. The secret is kept in the system credential store. The Devin plugin no longer forwards `AGENTMEMORY_SECRET` from the environment (#1664).
+
+### Added
+
+- **iii installs itself on Windows.** A fresh `agentmemory` on win32 downloads the pinned iii zip, checks its SHA-256 and extracts it with the system `tar.exe`, falling back to PowerShell `Expand-Archive` (#1670).
+- MCP tools carry `readOnlyHint` and `destructiveHint` annotations, and the plugin README states what the hooks record, where it is kept and how to delete it. Privacy policy: https://agent-memory.dev/privacy (#1664).
+- `memory_lesson_save` accepts `sourceIds` (#1661).
+- agentmemory is listed in the [OpenAI plugin directory](https://chatgpt.com/plugins/plugins_6ac50a1b89948191906ff15c72357972) for Codex (skills; pair with `agentmemory connect codex`), the Hermes plugin catalog and ClawHub. For Hermes and OpenClaw, install with `hermes plugins install agentmemory` or `openclaw plugins install clawhub:agentmemory`; the README and the Hermes and OpenClaw guides describe both routes beside `agentmemory connect`.
+- Each published release builds a `linux/amd64` and `linux/arm64` image and pushes it to Docker Hub as `ghumarerohit/agentmemory:<version>`; `latest` follows the highest stable version (#1677).
+- The MCP stdio shim records why it exits in `mcp-crash.log` in the data directory (owner-only, rotated at 1 MiB) and saves its fallback store before writing to stderr (#1662, #1674).
+
+### Fixed
+
+- **Worker Compose starts on native Windows.** Worker commands, the worker PATH and project ownership checks with `\\?\` and 8.3 paths are fixed; `agentmemory stop` waits long enough for every worker (#1641). The launcher retries a slow `iii --version` probe and never waits on a hidden install prompt (#1658). `doctor` does not prompt without a terminal or with `CI` set (#1671). `status` and `stop` output no longer include iii SDK debug lines (#1672).
+- **Boot no longer races the state worker.** agentmemory waits up to 120 s for the state worker to register before boot reads, and the keyword rebuild keeps retrying, so a slow start no longer leaves vector recovery paused or the keyword index empty until restart (#1627 by @cbsincool, #1626 by @Tyxiel, #1660).
+- A stale Worker Compose PID reused by an unrelated process after a reboot no longer causes a start crash loop (#1622 by @pei711).
+- The Docker image keeps the optional dependencies that local embeddings need (#1651 by @mothieras).
+- Slot tools are hidden and return 503 when `AGENTMEMORY_SLOTS` is off (#1659).
+- Search: CJK queries recall core observations again (#1553 by @akushonkamen); scoped smart-search fills short pages from a deeper window (#1669 by @dmazhukov); project-filtered recall excludes unscoped memories (#1647 by @reevesc88); search responses keep the original memory type (#1646 by @reevesc88).
+- An OpenAI reply cut off at `max_tokens` fails over instead of being stored as the result (#1495 by @Rex57).
+- Orphaned index generations are reclaimed (#1256 by @inix-x), and the MCP graph stats resource reads a bounded snapshot instead of listing the whole graph (#1260 by @inix-x).
+- Facet tags are removed when lessons are deleted or observations forgotten (#1642 by @xh123637). The session sweep skips rows without an id (#1645 by @dmazhukov). Hook truncation keeps surrogate pairs whole (#1598 by @dmazhukov).
+- Copilot CLI subagent reports are stored with their reply. The `subagentStop` hook reads Copilot's camelCase fields, so a report is no longer empty and a retry is no longer stored twice. The reply is redacted before it is cut to 4000 characters (#1599 by @dmazhukov).
+- The Hermes project git probe no longer inherits the worker's stdin, which could hang on Windows (#1663). The Cline CLI MCP configuration uses its native settings path (#1633).
+- A superseded memory gets a strictly later `updatedAt`, so mesh sync carries the change to peers (#1665 by @egantz).
+- pi includes recalled lessons in search and can read a full lesson by ID, scoped to its project (#1605 by @YeChenglin8888).
+- `npm run build` works under the Windows `cmd.exe` shell (#1362 by @mattamundson).
+- `.env.example` names the Agent SDK route and documents `MAX_OBS_PER_SESSION` as a hard per-session cap (#1675, from #1503 by @Rex57).
+- The Claude Code plugin passes its URL and secret settings to the MCP server as `CLAUDE_PLUGIN_OPTION_AGENTMEMORY_URL` and `CLAUDE_PLUGIN_OPTION_AGENTMEMORY_SECRET`, the names the plugin directory accepts. An empty URL setting no longer hides `AGENTMEMORY_URL` from the environment, and an empty secret setting still never sends `AGENTMEMORY_SECRET` from the environment.
+
+### Changed
+
+- The Claude Code plugin hooks run in exec form (`command` plus `args`), so the plugin path reaches Node as one argument with no shell quoting. The plugin and `connect claude-code --with-hooks` now need Claude Code 2.1.139 or later.
+
+### Known issues
+
+- On Windows, `agentmemory stop` takes about 60 s and each start opens empty console windows for the engine and workers. Both come from iii (iii-hq/iii#2430).
+
+## [0.9.31] — 2026-10-25
+### Upgrade notes
+
+- **The runtime moves to iii 0.25.0 and Worker Compose.** Stop the existing instance with its old CLI before upgrading, then restart with the same instance, port and data directory. File state, the daemon secret and Docker data volumes are preserved. The CLI no longer uses `AGENTMEMORY_USE_DOCKER`, `AGENTMEMORY_III_CONFIG` or custom `iii-config.yaml` files; Docker deployments use the shared deployment image. Follow the [upgrade guide](docs/upgrades/iii-0.25.md) for these installation changes.
+- **Viewer updates use authenticated SSE** on the REST port at `/agentmemory/viewer/events`; port 3112 is unused. `agentmemory console` now prints migration guidance and the viewer URL. The viewer remains on port 3113 by default. Status reports the configured engine pin as `service.enginePinnedVersion` instead of `engineVersion`.
+- **Narrative recall now returns structured JSON through MCP.** Read the `text` field for the narrative and the accompanying budget metadata for omitted or shortened results. See [recall guidance](docs/recall.md).
+- Full historical vector recovery requires `AGENTMEMORY_VECTOR_BACKFILL=all` on each start and processes at most `AGENTMEMORY_VECTOR_BACKFILL_MAX` missing records per start. Keyword search remains available while recovery is paused. See [vector recovery](docs/reliability/source-and-vector-recovery.md) before rebuilding an old index.
+- Re-run `agentmemory connect pi --with-mcp` or `agentmemory connect omp --with-mcp` after upgrading to refresh their bundled paths and skills. Existing DSH hook-bridge installations migrate with `agentmemory connect dsh --with-hooks --force`; the connector backs up configuration and preserves unrelated entries.
+
+### Added
+
+- **Installable Pi package and native OMP integration.** Pi's `@agentmemory/pi` package contains the compiled extension and shared skills. Both connectors install project recall, capture, native memory tools and optional MCP, with bounded offline capture queues. The connector works before the separate Pi package's first npm publication.
+- **Native DSH capture** ships inside AgentMemory, with prompt, tool and assistant-reply capture, privacy filtering and offline recovery. No separate capture package is needed (#1609, including instruction-file setup by hejiawow).
+- **Cursor workspace resolution** maps lifecycle hooks to the correct project using validated paths and local session metadata, with detached stop/session-end delivery (#1112).
+- **Paged exports** support `collectionLimit`, `collectionOffset` and `collections` through REST and MCP. Partial exports cannot be imported with `strategy: "replace"`.
+- **Compression recovery** preserves searchable captures after optional model compression fails. `agentmemory compression` inspects failures and supports scoped retries; summary repair resumes after late capture and restart.
+
+### Fixed
+
+- Saved-memory recall preserves project and agent scope, supports memory-only retrieval and retains recovery references when a token budget omits content. Graph retrieval uses bounded shared reads and keeps each observation's best score; optional reranking uses the model's actual paired-query scores.
+- Vector recovery retains unfinished work across checkpoints, provider failures and restarts. Redis state mutations serialize per key within a worker, and deletion keeps graph and facet indexes consistent.
+- Imports validate collection shapes and row keys before a replace operation deletes stored data. The import observation ceiling no longer changes with the ordinary capture limit.
+- Hooks capture final assistant replies and distinguish separate subagent, task and notification events. Structured redaction preserves identifiers and retained custom-event content remains searchable.
+- MCP keeps routine logs off stdout and reports when a write only reached its local fallback store. The viewer loads actions beyond the first page.
+- **JSONL import keeps real session times and no longer duplicates on re-import.** `parseJsonlText` took `startedAt`/`endedAt` from the first and last line even when it was a timestampless metadata entry (`last-prompt`, `cost-state`), so the session got the import time. It now uses only entries that carry a timestamp. Observation ids are derived from the entry `uuid` (or session id and line position when absent) instead of a random id, so importing the same transcript again overwrites the same rows, and `observationCount` counts only rows that were new. Rows imported by earlier versions keep their random ids, so the first re-import after upgrading adds one last copy.
+- **Session summaries cover the whole session again** (#745). 0.9.30 completed a session on the first per-turn Stop and ignored every later end, so summaries and graph extraction stopped at turn 1. `mem::observe` now reopens a completed session when new observations arrive, the Stop hook sends `final: false` so the session stays open, and an idle finalizer completes it once nothing has happened for `AGENTMEMORY_FINALIZE_IDLE_MS` (default 2 minutes). SessionEnd, the CLI and the OpenCode plugin send `final: true` and complete at once; a request without the flag behaves as before. The sweep summarizes a session before marking it abandoned (#737).
+- **The Devin plugin captures sessions.** A plugin install loaded `hooks/hooks.json`, whose capitalized Claude Code matchers never match Devin's tool names and whose extra events Devin rejects, so capture never fired. `plugin/hooks.json` now carries the six Devin hooks with lowercase matchers, and Devin loads it first. Verified on Devin CLI 3000.11.3: one session recorded session start, prompt, tool use and session end.
+- **Summaries are incremental.** `mem::summarize` keeps a watermark (`coveredThrough`) and summarizes only the observations captured since the last run, merging them into the stored summary with one reduce call. A session end with nothing new costs no LLM call, and the reflect, graph and skill fan-out is skipped for it.
+
+### Changed
+
+- **Publishing verifies the exact gated tarballs.** The workflow checks SHA512 integrity and signed provenance against the source repository, workflow, ref and commit before accepting an existing version or completing publication. Conflicting artifacts fail instead of being skipped.
+- Shared agent skills now describe the current runtime, credential discovery, native integrations and capture limits. The README and translations link to current setup, storage and upgrade guidance.
+- The Devin plugin manifest adds a display name and logo, says it is for Devin CLI and Devin Desktop only, and runs `@agentmemory/mcp` at the release version instead of the latest one. `npm run docs:sync` moves that pin on each version bump.
+- `@agentmemory/mcp` pins the exact matching `@agentmemory/agentmemory` release instead of a `~` range, so an installed shim never resolves a newer runtime than the one it was published with.
 
 ## [0.9.30] - 2026-10-06
 
@@ -285,6 +397,9 @@ Wave release closing several breaking regressions reported against v0.9.26, plus
 - `/agentmemory:forget` skill still calls `memory_governance_delete` which only touches `KV.memories` and never observations ([#833](https://github.com/rohitg00/agentmemory/issues/833)). Skill rewrite + new `memory_forget` MCP tool tracked separately.
 - `crypto.randomUUID()` global-only on Node <19 ([#715](https://github.com/rohitg00/agentmemory/issues/715)). Drop-in import fix tracked.
 
+[0.9.33]: https://github.com/rohitg00/agentmemory/compare/v0.9.32...v0.9.33
+[0.9.32]: https://github.com/rohitg00/agentmemory/compare/v0.9.31...v0.9.32
+[0.9.31]: https://github.com/rohitg00/agentmemory/compare/v0.9.30...v0.9.31
 [0.9.30]: https://github.com/rohitg00/agentmemory/compare/v0.9.29...v0.9.30
 [0.9.29]: https://github.com/rohitg00/agentmemory/compare/v0.9.28...v0.9.29
 [0.9.28]: https://github.com/rohitg00/agentmemory/compare/v0.9.27...v0.9.28

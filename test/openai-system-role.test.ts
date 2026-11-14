@@ -116,7 +116,7 @@ describe("OpenAI explicit system role compatibility", () => {
 
   it("extracts a compression response JSON fixture and persists through registered iii functions", async () => {
     env.set("OPENAI_SYSTEM_ROLE", "developer");
-    const xml = "<type>file_read</type><title>Read role provider</title><facts><fact>Roles stay separate.</fact></facts><narrative>Read the provider and preserved instruction boundaries.</narrative><concepts><concept>compatibility</concept></concepts><files><file>src/providers/openai.ts</file></files><importance>6</importance>";
+    const xml = "<observation><type>file_read</type><title>Read role provider</title><facts><fact>Roles stay separate.</fact></facts><narrative>Read the provider and preserved instruction boundaries.</narrative><concepts><concept>compatibility</concept></concepts><files><file>src/providers/openai.ts</file></files><importance>6</importance></observation>";
     fetchMock.mockImplementation(async () => responseFixture(xml));
     const raw: RawObservation = {
       id: "obs_fixture", sessionId: "ses_fixture", timestamp: "2026-10-13T00:00:00.000Z",

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -118,5 +118,35 @@ describe("bundled Antigravity bridge", () => {
     expect(tools).toHaveLength(2);
     expect(tools[0].body.data.tool_name).toBe("read");
     expect(tools[0].body.eventId).toBe(tools[1].body.eventId);
+  }, 30_000);
+
+  it("sends the latest explicit user turn from the session's own transcript to prompt-submit", async () => {
+    root = mkdtempSync(join(tmpdir(), "am-agy-prompt-"));
+    const plugin = join(root, "plugin");
+    symlinkSync(resolve(__dirname, "../plugin"), plugin, process.platform === "win32" ? "junction" : "dir");
+    const posts: Array<{ path: string; body: any }> = [];
+    server = createServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      posts.push({ path: req.url!, body: JSON.parse(raw || "{}") });
+      res.setHeader("content-type", "application/json");
+      res.end("{}");
+    });
+    await new Promise<void>((done) => server!.listen(0, "127.0.0.1", done));
+    const port = (server.address() as { port: number }).port;
+    mkdirSync(join(root, "ag-own"));
+    const transcriptPath = join(root, "ag-own", "transcript.jsonl");
+    writeFileSync(transcriptPath, [
+      { type: "USER_INPUT", source: "USER_EXPLICIT", content: "<USER_REQUEST>\n記住：回歸測試命令是 npm test。\n</USER_REQUEST>" },
+      { type: "USER_INPUT", source: "SYSTEM", content: "Not an explicit user prompt" },
+    ].map((row) => JSON.stringify(row)).join("\n"));
+    const child = exec(process.execPath, [join(plugin, "scripts/antigravity-bridge.mjs"), "PreInvocation"], {
+      env: { ...process.env, AGENTMEMORY_URL: `http://127.0.0.1:${port}`, AGENTMEMORY_DATA_DIR: join(root, "capture") },
+      timeout: 15_000,
+    });
+    child.child.stdin!.end(JSON.stringify({ conversationId: "ag-own", workspacePaths: [root], transcriptPath, invocationNum: 3 }));
+    await child;
+    const prompts = posts.filter((p) => p.body.hookType === "prompt_submit");
+    expect(prompts.map((p) => p.body.data.prompt)).toEqual(["記住：回歸測試命令是 npm test。"]);
   }, 30_000);
 });

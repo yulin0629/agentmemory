@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync, execSync } from "node:child_process";
-import { basename, join, resolve } from "node:path";
 import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { createHash } from "node:crypto";
 import { REST_URL, authHeaders, captureObservation, isDrainChild, runDrainChild, withEventId } from "./_capture.mjs";
@@ -55,7 +55,7 @@ function resolveProject(cwd) {
 	if (explicit && explicit.trim()) return explicit.trim();
 	const dir = cwd && cwd.trim() ? cwd : process.cwd();
 	try {
-		const top = execSync("git rev-parse --show-toplevel", {
+		const [top, gitDir, commonDir] = execSync("git rev-parse --show-toplevel --git-dir --git-common-dir", {
 			cwd: dir,
 			stdio: [
 				"ignore",
@@ -63,10 +63,17 @@ function resolveProject(cwd) {
 				"ignore"
 			],
 			timeout: 500
-		}).toString().trim();
-		if (top) return basename(top);
+		}).toString().trim().split(/\r?\n/);
+		if (top) return basename(repositoryRoot(dir, top, gitDir, commonDir));
 	} catch {}
 	return basename(dir);
+}
+function repositoryRoot(dir, top, gitDir, commonDir) {
+	if (!gitDir || !commonDir) return top;
+	const physical = realpathSync(dir);
+	const common = resolve(physical, commonDir);
+	if (resolve(physical, gitDir) === common || basename(common) !== ".git") return top;
+	return dirname(common);
 }
 function hookCwd(data) {
 	if (!data || typeof data !== "object") return void 0;
@@ -80,13 +87,35 @@ function hookCwd(data) {
 }
 //#endregion
 //#region src/functions/privacy.ts
-const PRIVATE_TAG_RE = /<private>[\s\S]*?<\/private>/gi;
+const PRIVATE_TAG_TOKEN_RE = /<private(?=\s|>)[^>]*>|<\/private\s*>/gi;
+function redactPrivateBlocks(input) {
+	const tokens = new RegExp(PRIVATE_TAG_TOKEN_RE.source, PRIVATE_TAG_TOKEN_RE.flags);
+	let out = "";
+	let cursor = 0;
+	let depth = 0;
+	for (let match = tokens.exec(input); match; match = tokens.exec(input)) {
+		const closing = match[0].startsWith("</");
+		if (depth === 0) {
+			if (closing) continue;
+			out += input.slice(cursor, match.index);
+			depth = 1;
+		} else if (closing) {
+			depth -= 1;
+			if (depth === 0) {
+				out += "[REDACTED]";
+				cursor = match.index + match[0].length;
+			}
+		} else depth += 1;
+	}
+	if (depth > 0) return `${out}[REDACTED]`;
+	return out + input.slice(cursor);
+}
 const SECRET_PATTERN_SOURCES = [
 	/(?:api[_-]?key|secret|token|password|credential|auth)[\s]*[=:]\s*["']?[A-Za-z0-9_\-/.+]{20,}["']?/gi,
 	/Bearer\s+[A-Za-z0-9._~\-+/=]{20,}/gi,
-	/sk-proj-[A-Za-z0-9\-_]{20,}/g,
-	/(?:sk|pk|rk|ak)-[A-Za-z0-9][A-Za-z0-9\-_]{19,}/g,
-	/sk-ant-[A-Za-z0-9\-_]{20,}/g,
+	/(?<![\p{L}\p{N}\p{M}_])sk-proj-[A-Za-z0-9\-_]{20,}/gu,
+	/(?<![\p{L}\p{N}\p{M}_])(?:sk|pk|rk|ak)-[A-Za-z0-9][A-Za-z0-9\-_]{19,}/gu,
+	/(?<![\p{L}\p{N}\p{M}_])sk-ant-[A-Za-z0-9\-_]{20,}/gu,
 	/gh[pus]_[A-Za-z0-9]{36,}/g,
 	/github_pat_[A-Za-z0-9_]{22,}/g,
 	/xoxb-[A-Za-z0-9\-]+/g,
@@ -100,8 +129,10 @@ const SECRET_PATTERN_SOURCES = [
 const PRIVATE_KEY_BLOCK_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/g;
 const URL_CREDENTIALS_RE = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@:"'<>]*:[^\s/?#@"'<>]+@/gi;
 function stripPrivateData(input) {
-	let result = input.replace(PRIVATE_TAG_RE, "[REDACTED]");
-	result = result.replace(new RegExp(PRIVATE_KEY_BLOCK_RE.source, PRIVATE_KEY_BLOCK_RE.flags), "[REDACTED_SECRET]");
+	return stripSecrets(redactPrivateBlocks(input));
+}
+function stripSecrets(input) {
+	let result = input.replace(new RegExp(PRIVATE_KEY_BLOCK_RE.source, PRIVATE_KEY_BLOCK_RE.flags), "[REDACTED_SECRET]");
 	result = result.replace(new RegExp(URL_CREDENTIALS_RE.source, URL_CREDENTIALS_RE.flags), "$1[REDACTED_SECRET]@");
 	for (const source of SECRET_PATTERN_SOURCES) {
 		const pattern = new RegExp(source.source, source.flags);
@@ -179,7 +210,7 @@ function isRememberRequest(prompt) {
 //#region src/secret-store.ts
 const SECRET_KEY = "AGENTMEMORY_SECRET";
 function agentmemoryHomeDir() {
-	return join(homedir(), ".agentmemory");
+	return process.env["AGENTMEMORY_DATA_DIR"] || join(homedir(), ".agentmemory");
 }
 function secretFilePath() {
 	return join(agentmemoryHomeDir(), "secret");
@@ -200,10 +231,10 @@ function unquote(value) {
 	const hash = value.indexOf(" #");
 	return hash === -1 ? value : value.slice(0, hash).trim();
 }
-function readEnvFileSecret() {
+function readEnvFileValue(name) {
 	let content;
 	try {
-		content = readFileSync(join(agentmemoryHomeDir(), ".env"), "utf-8");
+		content = readFileSync(process.env["AGENTMEMORY_ENV_FILE"] || join(homedir(), ".agentmemory", ".env"), "utf-8");
 	} catch {
 		return "";
 	}
@@ -214,17 +245,39 @@ function readEnvFileSecret() {
 		if (trimmed.startsWith("#")) continue;
 		const eq = trimmed.indexOf("=");
 		if (eq === -1) continue;
-		if (trimmed.slice(0, eq).replace(/^export\s+/, "").trim() !== SECRET_KEY) continue;
-		found = usable(unquote(trimmed.slice(eq + 1).trim()));
+		if (trimmed.slice(0, eq).replace(/^export\s+/, "").trim() !== name) continue;
+		found = unquote(trimmed.slice(eq + 1).trim());
 	}
 	return found;
 }
-function readStoredSecret() {
+function readEnvFileSecret() {
+	return usable(readEnvFileValue(SECRET_KEY));
+}
+function readSecretFile(path) {
 	try {
-		return usable(readFileSync(secretFilePath(), "utf-8"));
+		return usable(readFileSync(path, "utf-8"));
 	} catch {
 		return "";
 	}
+}
+function legacyDataDirSecretPaths(env = process.env) {
+	const dataDir = env["AGENTMEMORY_DATA_DIR"];
+	if (!dataDir) return [];
+	const paths = [
+		join(dataDir, "secret"),
+		join(dataDir, ".hmac"),
+		join(dataDir, "..", ".hmac")
+	];
+	return [...new Set(paths.filter((path) => path !== secretFilePath()))];
+}
+function readStoredSecret(env = process.env) {
+	const canonicalPath = canonicalSecretPath();
+	const localPath = secretFilePath();
+	const legacyPaths = legacyDataDirSecretPaths(env);
+	return readSecretFile(canonicalPath) || (localPath === canonicalPath ? "" : readSecretFile(localPath)) || legacyPaths.map(readSecretFile).find(Boolean) || "";
+}
+function explicitSecret(env = process.env) {
+	return usable(env[SECRET_KEY]) || readEnvFileSecret();
 }
 function isLoopbackUrl(url) {
 	let hostname;
@@ -239,8 +292,12 @@ function isLoopbackUrl(url) {
 function resolveClientSecret(baseUrl, env = process.env) {
 	const fromEnv = usable(env[SECRET_KEY]);
 	if (fromEnv) return fromEnv;
+	if (env.AGENTMEMORY_CREDENTIAL_MODE === "explicit") return "";
 	if (!isLoopbackUrl(baseUrl)) return "";
-	return readEnvFileSecret() || readStoredSecret();
+	return readEnvFileSecret() || readStoredSecret(env);
+}
+function canonicalSecretPath() {
+	return join(homedir(), ".agentmemory", "secret");
 }
 //#endregion
 //#region src/hooks/_selective-settings.ts
@@ -253,7 +310,7 @@ function selectiveSettings() {
 	return {
 		enabled: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT !== void 0 ? process.env.AGENTMEMORY_SELECTIVE_CONTEXT_INJECT === "true" : local?.enabled === true,
 		url,
-		secret: process.env.AGENTMEMORY_SECRET || local?.secret || resolveClientSecret(url),
+		secret: explicitSecret() || local?.secret || resolveClientSecret(url),
 		selectiveSecret: process.env.AGENTMEMORY_SELECTIVE_CONTEXT_SECRET || local?.selectiveSecret || "",
 		owner: local?.owner
 	};

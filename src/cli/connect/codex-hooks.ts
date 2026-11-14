@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-type HookHandler = { type: string; command?: string; [key: string]: unknown };
+type HookHandler = { type: string; command?: string; args?: string[]; [key: string]: unknown };
 type HookEntry = { matcher?: string; hooks: HookHandler[]; [key: string]: unknown };
 export type HookManifest = { hooks: Record<string, HookEntry[]> };
 
@@ -51,13 +51,14 @@ export function findPluginRoot(startUrl: string = import.meta.url): string {
 /**
  * Build the merged hooks.json content.
  *
- *   1. Strip AgentMemory command handlers from `existing`. This lets us
- *      re-install idempotently without leaving stale references while
- *      preserving command-less Claude Code prompt and agent handlers.
+ *   1. Strip every handler in `existing` whose command points under
+ *      `<pluginRoot>/scripts/`, and an entry only once nothing else is left
+ *      in it. This lets us re-install idempotently without leaving stale
+ *      references or dropping the user's own handlers.
  *   2. Append fresh entries from the bundled Codex manifest with
  *      `${CLAUDE_PLUGIN_ROOT}` rewritten to the absolute plugin path.
- *      Matcher values from the bundled manifest are preserved so PreToolUse
- *      event routing keeps working.
+ *      Matchers and the other handler fields from the bundled manifest are
+ *      preserved so PreToolUse event routing keeps working.
  */
 export function buildMergedHooks(
   existing: HookManifest | null,
@@ -76,6 +77,7 @@ export function buildMergedHooks(
         const hooks = entry.hooks.filter(
           (handler) => !isAgentmemoryHandler(handler, scriptsDir),
         );
+        if (hooks.length === entry.hooks.length) return [entry];
         return hooks.length > 0 ? [{ ...entry, hooks }] : [];
       });
       if (kept.length > 0) out.hooks[event] = kept;
@@ -85,17 +87,11 @@ export function buildMergedHooks(
   for (const [event, entries] of Object.entries(ours.hooks)) {
     const resolvedEntries: HookEntry[] = entries.map((entry) => {
       const next: HookEntry = {
-        hooks: entry.hooks.map((handler) =>
-          typeof handler.command === "string"
-            ? {
-                ...handler,
-                command: handler.command.replace(
-                  /\$\{CLAUDE_PLUGIN_ROOT\}/g,
-                  pluginRoot,
-                ),
-              }
-            : { ...handler },
-        ),
+        hooks: entry.hooks.map((handler) => {
+          const resolved: HookHandler = { ...handler, command: withPluginRoot(handler.command, pluginRoot) };
+          if (handler.args) resolved.args = handler.args.map((arg) => withPluginRoot(arg, pluginRoot)!);
+          return resolved;
+        }),
       };
       if (entry.matcher !== undefined) next.matcher = entry.matcher;
       return next;
@@ -106,15 +102,22 @@ export function buildMergedHooks(
   return out;
 }
 
+function withPluginRoot(value: string | undefined, pluginRoot: string): string | undefined {
+  return value?.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => pluginRoot);
+}
+
 function isAgentmemoryHandler(handler: HookHandler, scriptsDir: string): boolean {
-  if (typeof handler.command !== "string") return false;
   const normalizedScriptsDir = normalizePathForCommandMatch(scriptsDir);
-  const command = normalizePathForCommandMatch(handler.command);
-  if (command.includes(normalizedScriptsDir)) return true;
-  return [...KNOWN_AGENTMEMORY_HOOK_SCRIPT_NAMES].some(
-    (script) =>
-      command.includes(`/@agentmemory/agentmemory/plugin/scripts/${script}`) ||
-      command.includes(`/agentmemory/plugin/scripts/${script}`),
+  const parts = [handler.command, ...(Array.isArray(handler.args) ? handler.args : [])];
+  return parts.some(
+    (part) =>
+      typeof part === "string" &&
+      (normalizePathForCommandMatch(part).includes(normalizedScriptsDir) ||
+        [...KNOWN_AGENTMEMORY_HOOK_SCRIPT_NAMES].some(
+          (script) =>
+            normalizePathForCommandMatch(part).includes(`/@agentmemory/agentmemory/plugin/scripts/${script}`) ||
+            normalizePathForCommandMatch(part).includes(`/agentmemory/plugin/scripts/${script}`),
+        )),
   );
 }
 

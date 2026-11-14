@@ -4,7 +4,7 @@
 
 agentmemory is a persistent memory system for AI coding agents, built on iii-engine's three primitives (Worker/Function/Trigger). Everything goes through `registerFunction`/`registerTrigger`/`sdk.trigger()` — never bypass iii-engine with standalone SQLite or in-process alternatives.
 
-- **Engine**: iii-sdk 0.22.1 with @iii-dev/helpers 0.22.1 (WebSocket to iii-engine 0.22.1 on port 49134; the client type is `IIIClient`, HTTP requests are `HttpRequest` from `@iii-dev/helpers/http`)
+- **Engine**: iii-sdk 0.25.1 with @iii-dev/helpers 0.25.1 (Worker Compose-managed iii-engine 0.25.1 on port 49134; the client type is `IIIClient`, HTTP requests are `HttpRequest` from `@iii-dev/helpers/http`)
 - **State**: iii-engine StateWorker KV; `file_based` uses a directory at `./data/state_store.db/` with asynchronous snapshot writes, not a SQLite file.
 - **Build**: TypeScript → ESM via tsdown, output to `dist/`
 - **Test**: vitest (`npm test` excludes integration tests)
@@ -88,7 +88,7 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 - **Context-injecting hooks** (`pre-tool-use`, `pre-compact`, `session-start`) write recalled context to stdout for Claude Code to inject. `prompt-submit` joins this group only when `AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=true`; it must await the bounded selective-context response and otherwise remain silent. These paths MUST use `try/catch` with `await fetch(..., { signal: AbortSignal.timeout(N) })` — the timeout is the only bound on hang time.
 - **Explicit saves/replacements**: An opted-in `prompt-submit` beginning with `記住：`, `請記住：`, or the three-line `確認取代：` form awaits `/observe` for at most 5 seconds and emits only its capture acknowledgement. Replacement syntax and limits are in README's Explicit project memory section. `mem::context-knowledge-capture` must read the stored user event before compression. Internal iii invocations include `_caller_worker_id`; allow that metadata only in internal schemas, never loosen the public HTTP schemas.
 - **Selective project scope**: `_project.ts` keeps the legacy display label separate from `resolveContextProjectId`. New scoped recall requires identity equality, never basename equality. Backup validation/restoration is shared by export/import and Git snapshots in `state/context-knowledge-backup.ts`; keep record links and namespace revision invalidation intact.
-- **Selective authentication**: The global API secret takes precedence over `AGENTMEMORY_SELECTIVE_CONTEXT_SECRET`. With only the latter configured, legacy telemetry remains unchanged but explicit-save observations and both selective endpoints require its bearer token or `X-AgentMemory-Selective-Secret` (separate from relay authentication). Client prompt hooks may opt in through private `~/.config/agentmemory/selective-context.json`.
+- **Selective authentication**: The global API secret takes precedence over `AGENTMEMORY_SELECTIVE_CONTEXT_SECRET`. The server generates a global secret unless `AGENTMEMORY_AUTH=none` (fork switch in `secret-store.ts`, ignored when `AGENTMEMORY_SECRET` is set), so the selective-secret-only mode exists only under that switch. In that mode legacy telemetry remains unchanged but explicit-save observations and both selective endpoints require its bearer token or `X-AgentMemory-Selective-Secret` (separate from relay authentication). Client prompt hooks may opt in through private `~/.config/agentmemory/selective-context.json`.
 - **Shared recall ownership**: With private config `owner: "agent-hooks"`, native adapters use `selective-client.mjs --stdin`; standalone prompt hooks retain telemetry but do not inject. `AGENTMEMORY_SHARED_CLIENT=1` is internal routing, not authorization. The shared client skips ordinary observation writes, but explicit saves still require authenticated, source-backed capture. Do not enable both native shared recall and separate extension recall.
 - **Historical lessons**: `lessonId` links adoption evidence to an existing lesson without another mutable lesson copy. Filter approved IDs before BM25 top-k, verify exact text/project against KV, then recheck source versions and catalog revision after Jev. Missing provenance never implies global adoption. Shared ownership also suppresses broad startup/tool/precompact injection.
 - **Telemetry-only hooks** (`notification`, `post-tool-failure`, `post-tool-use`, `prompt-submit` by default, `stop`, `session-end`, `subagent-start`, `subagent-stop`, `task-completed`) write nothing to stdout. A hook that posts an observation sends it with `captureObservation(...)` from `_capture.ts`, which spools the event on disk when the server does not acknowledge it, and pairs it with an unref'd `setTimeout(() => process.exit(0), EXIT_CAP_MS)`. `EXIT_CAP_MS` MUST exceed `OBSERVE_TIMEOUT_MS` so the request or the spool write can finish; `test/hook-exit-timing.test.ts` enforces this. `prompt-submit` uses the shared capture module only when its selective settings resolve the same URL and secret as `_capture.ts`; a private config that points elsewhere keeps the direct request. `stop` and `session-end` keep a 1500ms exit timer for their remaining fire-and-forget requests.
@@ -106,17 +106,17 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 
 ## Testing
 
-- Before every commit run, in order: `npm run build`, `npm run skills:gen`, `npm run docs:sync`, `npm run skills:check`, `npm test` (2,500+ tests). Commit anything the generators changed. CI runs the same build, skills check and tests.
+- Before every commit run, in order: `npm run build`, `npm run skills:gen`, `npm run docs:sync`, `npm run skills:check`, `npm test` (4,700+ tests). Commit anything the generators changed. CI runs the same build, skills check and tests.
 - Before any npm publish: `npm run release:gate` must pass. It installs the packed tarballs into a clean home and runs capture, recovery, restart, export/import, MCP and status checks against the installed CLI (see CONTRIBUTING.md, Release process)
 - Mock pattern: `vi.mock("iii-sdk")` with mock `sdk.trigger`, `kv.get/set/list`
 - Test files go in `test/` with `.test.ts` extension
 - Follow existing patterns in `test/crystallize.test.ts` for function tests
 
-## Current Stats (v0.9.30)
+## Current Stats (v0.9.33)
 
-- 54 MCP tools (8 visible by default, `AGENTMEMORY_TOOLS=all` for all)
-- 140 REST endpoints
+- 54 MCP tools visible by default; `AGENTMEMORY_TOOLS=core` selects 8 essentials
+- 149 REST endpoints
 - 6 MCP resources, 3 MCP prompts
 - 12 hooks, 17 skills
-- 311+ iii functions
-- 2,500+ tests
+- 322+ iii functions
+- 4,700+ tests
