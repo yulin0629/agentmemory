@@ -1,0 +1,13 @@
+[Unit]
+Description=Forward DevSpace tool events to Agent Memory
+
+[Service]
+Type=simple
+ExecStart=__NODE__ __BUNDLE__ __CONFIG__
+Restart=on-failure
+RestartSec=10
+UMask=0077
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

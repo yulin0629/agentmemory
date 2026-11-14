@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -10,6 +12,7 @@ async function runHook(
   payload: Record<string, unknown>,
   env: Record<string, string> = {},
   responseDelayMs = 0,
+  responseByPath: Record<string, unknown> = {},
 ) {
   const requests: { path: string; body: Record<string, unknown> }[] = [];
   const server = createServer((req, res) => {
@@ -25,7 +28,7 @@ async function runHook(
           body: raw ? (JSON.parse(raw) as Record<string, unknown>) : {},
         });
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ context: "remembered context" }));
+        res.end(JSON.stringify(responseByPath[req.url ?? ""] ?? { context: "remembered context" }));
       }, responseDelayMs);
     });
   });
@@ -42,6 +45,7 @@ async function runHook(
         ...process.env,
         AGENTMEMORY_URL: `http://127.0.0.1:${address.port}`,
         AGENTMEMORY_SECRET: "",
+        AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "false",
         ...env,
       },
       stdio: ["pipe", "pipe", "pipe"],
@@ -84,6 +88,53 @@ function codexPayload(event: string, extra: Record<string, unknown> = {}) {
 }
 
 describe("Codex hook runtime contract", () => {
+  it("shared ownership silences standalone recall but keeps prompt telemetry", async () => {
+    const home = mkdtempSync(join(tmpdir(), "shared-memory-owner-"));
+    try {
+      mkdirSync(join(home, ".config", "agentmemory"), { recursive: true });
+      writeFileSync(join(home, ".config", "agentmemory", "selective-context.json"),
+        JSON.stringify({ enabled: true, owner: "agent-hooks" }));
+      const result = await runHook("prompt-submit.mjs", codexPayload("UserPromptSubmit", { prompt: "draw the flow" }),
+        { HOME: home, USERPROFILE: home, AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" });
+      expect(result.stdout).toBe("");
+      expect(result.requests.map(r => r.path)).toEqual(["/agentmemory/observe"]);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it("the shared client recalls without duplicating ordinary prompt telemetry", async () => {
+    const result = await runHook("prompt-submit.mjs", codexPayload("UserPromptSubmit", { prompt: "draw the flow" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true", AGENTMEMORY_SHARED_CLIENT: "1" }, 0,
+      { "/agentmemory/selective-context": { status: "selected", spans: [{ text: "Use ASCII diagrams." }] } });
+    expect(result.requests.map(r => r.path)).toEqual(["/agentmemory/selective-context"]);
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("Use ASCII diagrams.");
+  });
+
+  it("shared ownership disables broad startup, tool, and precompact injection", async () => {
+    const home = mkdtempSync(join(tmpdir(), "shared-memory-broad-"));
+    try {
+      mkdirSync(join(home, ".config", "agentmemory"), { recursive: true });
+      writeFileSync(join(home, ".config", "agentmemory", "selective-context.json"), JSON.stringify({ enabled: true, owner: "agent-hooks" }));
+      for (const [script, event] of [["session-start.mjs", "SessionStart"], ["pre-tool-use.mjs", "PreToolUse"], ["pre-compact.mjs", "PreCompact"]]) {
+        const result = await runHook(script, codexPayload(event, { tool_name: "Read", tool_input: { file_path: "/tmp/test" } }),
+          { HOME: home, USERPROFILE: home, AGENTMEMORY_INJECT_CONTEXT: "true", AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" });
+        expect(result.stdout).toBe("");
+        expect(result.requests.some(r => r.path.endsWith("/context") || r.path.endsWith("/enrich"))).toBe(false);
+      }
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    [{ text: "valid" }, { text: 123 }],
+    [{ text: "one" }, { text: "two" }, { text: "three" }],
+    [{ text: "x".repeat(1201) }],
+    [{ text: "same" }, { text: "same" }],
+  ])("silences malformed or over-budget recall responses %#", async (...spans) => {
+    const result = await runHook("prompt-submit.mjs", codexPayload("UserPromptSubmit", { prompt: "draw the flow" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true", AGENTMEMORY_SHARED_CLIENT: "1" }, 0,
+      { "/agentmemory/selective-context": { status: "selected", spans } });
+    expect(result.stdout).toBe("");
+  });
+
   it("SessionStart registers the session and emits Codex JSON context", async () => {
     const result = await runHook(
       "session-start.mjs",
@@ -122,6 +173,28 @@ describe("Codex hook runtime contract", () => {
     expect(result.stdout).toBe("");
   });
 
+  it("UserPromptSubmit injects only an explicitly selected context result", async () => {
+    const result = await runHook(
+      "prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { turn_id: "turn-1", prompt: "draw the flow" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" },
+      0,
+      {
+        "/agentmemory/selective-context": {
+          status: "selected",
+          spans: [{ text: "Use ASCII diagrams in TUI." }],
+        },
+      },
+    );
+    expect(result.requests.some(request => request.path === "/agentmemory/selective-context")).toBe(true);
+    expect(JSON.parse(result.stdout)).toEqual({
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
+        additionalContext: "[Verified background relevant to this request]\n- Use ASCII diagrams in TUI.",
+      },
+    });
+  });
+
   it("PostToolUse waits for a remote observation response", async () => {
     const result = await runHook(
       "post-tool-use.mjs",
@@ -137,6 +210,65 @@ describe("Codex hook runtime contract", () => {
     );
     expect(result.requests[0]?.path).toBe("/agentmemory/observe");
     expect(result.stdout).toBe("");
+  });
+
+  it("UserPromptSubmit forwards same-session dialogue and accepts a response after 1.2 seconds", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "memory-hook-"));
+    const path = join(dir, "transcript.jsonl");
+    try {
+      writeFileSync(path, [
+        { type: "session_meta", payload: { id: "codex-session" } },
+        { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Draw the flow" }] } },
+      ].map(row => JSON.stringify(row)).join("\n") + "\n");
+      const result = await runHook("prompt-submit.mjs",
+        codexPayload("UserPromptSubmit", { prompt: "continue", transcript_path: path }),
+        { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 1600,
+        { "/agentmemory/selective-context": { status: "selected", spans: [{ text: "Use ASCII." }] } });
+      expect(result.requests.find(r => r.path === "/agentmemory/selective-context")?.body).toMatchObject({
+        prompt: "continue", previous: JSON.stringify([{ role: "user", text: "Draw the flow" }]),
+      });
+      expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("Use ASCII.");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("UserPromptSubmit stays silent past its response deadline", async () => {
+    const result = await runHook("prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { prompt: "draw the flow" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 2300,
+      { "/agentmemory/selective-context": { status: "selected", spans: [{ text: "Use ASCII." }] } });
+    expect(result.stdout).toBe("");
+  });
+
+  it.each([
+    ["active", "stored for this project"],
+    ["candidate", "candidate only"],
+    ["retracted", "did not reactivate"],
+  ])("UserPromptSubmit reports %s capture without claiming more", async (status, message) => {
+    const result = await runHook("prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { prompt: "記住：報告要附來源。" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 50,
+      { "/agentmemory/observe": { knowledgeCapture: { success: true, status, action: "saved" } } });
+    expect(result.requests.map(r => r.path)).toEqual(["/agentmemory/observe"]);
+    expect(result.requests[0]!.body.data).toMatchObject({ explicitMemoryRequest: true });
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain(message);
+  });
+
+  it("UserPromptSubmit does not claim storage when capture is missing or failed", async () => {
+    const result = await runHook("prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { prompt: "記住：報告要附來源。" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 0,
+      { "/agentmemory/observe": { observationId: "obs-only" } });
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("Storage could not be confirmed");
+  });
+
+  it("UserPromptSubmit marks explicit replacements and reports only confirmed success", async () => {
+    const result = await runHook("prompt-submit.mjs",
+      codexPayload("UserPromptSubmit", { prompt: "確認取代：\n舊規則：報告用英文。\n新規則：報告用中文。" }),
+      { AGENTMEMORY_SELECTIVE_CONTEXT_INJECT: "true" }, 0,
+      { "/agentmemory/observe": { knowledgeCapture: { success: true, status: "active", action: "replaced" } } });
+    expect(result.requests.map(r => r.path)).toEqual(["/agentmemory/observe"]);
+    expect(result.requests[0]!.body.data).toMatchObject({ explicitMemoryRequest: true });
+    expect(JSON.parse(result.stdout).hookSpecificOutput.additionalContext).toContain("old project rule was superseded");
   });
 
   it.each([

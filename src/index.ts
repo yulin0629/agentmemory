@@ -13,6 +13,7 @@ import {
   isConsolidationEnabled,
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
+  getSelectiveContextConfig,
 } from "./config.js";
 import {
   createProvider,
@@ -83,6 +84,8 @@ import { registerFacetsFunction } from "./functions/facets.js";
 import { registerVerifyFunction } from "./functions/verify.js";
 import { registerCascadeFunction } from "./functions/cascade.js";
 import { registerLessonsFunctions } from "./functions/lessons.js";
+import { registerSelectiveContextFunctions } from "./functions/selective-context.js";
+import { createFailoverCaptureJudge, createFailoverContextJudge } from "./state/judge-failover.js";
 import { registerObsidianExportFunction } from "./functions/obsidian-export.js";
 import { registerReflectFunctions } from "./functions/reflect.js";
 import { registerWorkingMemoryFunctions } from "./functions/working-memory.js";
@@ -221,7 +224,10 @@ async function main() {
 
   const kv = new StateKV(sdk);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
+  const selectiveContext = getSelectiveContextConfig();
+  const selectiveSecret = secret || selectiveContext.secret;
   const remoteMcpSecret = getEnvVar("AGENTMEMORY_MCP_BEARER_TOKEN");
+  const remoteMcpLessonSave = getEnvVar("AGENTMEMORY_MCP_REMOTE_LESSON_SAVE") === "true";
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
@@ -237,7 +243,8 @@ async function main() {
   initMetrics(meterAccessor as ((name: string) => import("@opentelemetry/api").Meter) | undefined);
 
   registerPrivacyFunction(sdk);
-  registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession);
+  registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession,
+    Boolean(selectiveSecret && selectiveContext.enabled && selectiveContext.namespace && selectiveContext.hasJudge));
   registerImageQuotaCleanup(sdk, kv);
   registerVisionSearchFunctions(sdk, kv, imageEmbeddingProvider);
   if (isSlotsEnabled()) {
@@ -325,6 +332,14 @@ async function main() {
   registerFacetsFunction(sdk, kv);
   registerVerifyFunction(sdk, kv);
   registerLessonsFunctions(sdk, kv);
+  if (selectiveContext.enabled && selectiveContext.namespace && selectiveContext.hasJudge) {
+    registerSelectiveContextFunctions(sdk, kv, {
+      namespace: selectiveContext.namespace,
+      judge: createFailoverContextJudge(selectiveContext),
+      captureJudge: selectiveSecret ? createFailoverCaptureJudge(selectiveContext) : undefined,
+    });
+    bootLog(`Selective context: enabled for namespace ${selectiveContext.namespace}`);
+  }
   registerObsidianExportFunction(sdk, kv);
   registerReflectFunctions(sdk, kv, provider);
   registerWorkingMemoryFunctions(sdk, kv, config.tokenBudget);
@@ -392,7 +407,7 @@ async function main() {
 
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
-  registerMcpEndpoints(sdk, kv, secret, remoteMcpSecret);
+  registerMcpEndpoints(sdk, kv, secret, remoteMcpSecret, remoteMcpLessonSave);
 
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
@@ -504,14 +519,14 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 132 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 134 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
   );
   if (remoteMcpSecret) {
     bootLog(
-      `Remote MCP: 8 read-only tools at http://localhost:${config.restPort}/mcp`,
+      `Remote MCP: 8 read-only tools${remoteMcpLessonSave ? " + memory_lesson_save" : ""} at http://localhost:${config.restPort}/mcp`,
     );
   }
 

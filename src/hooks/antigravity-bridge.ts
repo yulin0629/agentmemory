@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { openSync, closeSync, fstatSync, readSync } from "node:fs";
 
 // Antigravity CLI (`agy`) bridge — sits in front of the canonical hooks
 // because three parts of agy's contract make them unusable as direct
@@ -99,6 +100,27 @@ export function normalizePayload(event: string, raw: Json): Json {
     raw["transcriptPath"],
   );
   if (transcriptPath) out["transcript_path"] = transcriptPath;
+  if (event === "PreInvocation" && transcriptPath && sessionId !== "unknown"
+    && resolve(transcriptPath).split(/[/\\]/).includes(sessionId)) {
+    let fd: number | undefined;
+    try {
+      fd = openSync(transcriptPath, "r");
+      const size = fstatSync(fd).size;
+      const buffer = Buffer.alloc(Math.min(size, 65536));
+      readSync(fd, buffer, 0, buffer.length, size - buffer.length);
+      const lines = buffer.toString("utf8").split("\n");
+      if (size > buffer.length) lines.shift();
+      for (const line of lines.reverse()) {
+        if (!line.trim()) continue;
+        const step = JSON.parse(line);
+        if (step.type === "USER_INPUT" && typeof step.content === "string") {
+          out["prompt"] = step.content;
+          break;
+        }
+      }
+    } catch { /* Missing or malformed transcripts do not establish a prompt. */ }
+    finally { if (fd !== undefined) closeSync(fd); }
+  }
 
   if (toolCall) {
     const args = normalizeToolArgs(
@@ -182,9 +204,9 @@ async function main() {
     // timeout, so the worst case here is bounded by those.
     spawnSync(process.execPath, [join(SCRIPTS_DIR, script)], {
       input: payload,
-      // Child stdout is discarded on purpose: Antigravity parses this
-      // process's stdout as the hook response, and the bundled scripts
-      // emit prose when context injection is enabled.
+      encoding: "utf8",
+      timeout: 6500,
+      // Native recall belongs to the shared agent-hooks adapter.
       stdio: ["pipe", "ignore", "ignore"],
     });
   }

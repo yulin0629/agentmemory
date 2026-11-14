@@ -2,7 +2,7 @@ import { TriggerAction, type IIIClient } from "iii-sdk";
 import type { RawObservation, HookPayload, Origin } from "../types.js";
 
 const TOOL_HOOKS = new Set(["pre_tool_use", "post_tool_use", "post_tool_failure"]);
-import { KV, STREAM, generateId } from "../state/schema.js";
+import { KV, STREAM, generateId, isEventId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { stripPrivateData } from "./privacy.js";
 import { DedupMap } from "./dedup.js";
@@ -13,6 +13,7 @@ import { getSearchIndex, scheduleIndexSave, vectorIndexAddGuarded } from "./sear
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
+import { isRememberRequest } from "../state/explicit-memory.js";
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -42,6 +43,7 @@ export function registerObserveFunction(
   kv: StateKV,
   dedupMap?: DedupMap,
   maxObservationsPerSession?: number,
+  captureExplicitKnowledge = false,
 ): void {
   sdk.registerFunction("mem::observe", 
     async (payload: HookPayload) => {
@@ -61,89 +63,103 @@ export function registerObserveFunction(
         };
       }
 
-      const obsId = generateId("obs");
-
-      let dedupHash: string | undefined;
-      if (dedupMap) {
-        const dataIsObject =
-          typeof payload.data === "object" && payload.data !== null;
-        const d = dataIsObject
-          ? (payload.data as Record<string, unknown>)
-          : {};
-        const toolName = (d["tool_name"] as string) || payload.hookType;
-        // Hash the full payload when tool_input is absent so distinct
-        // events never collapse onto one key.
-        const dedupInput =
-          d["tool_input"] !== undefined
-            ? d["tool_input"]
-            : dataIsObject
-              ? d
-              : payload.data;
-        dedupHash = dedupMap.computeHash(
-          payload.sessionId,
-          toolName,
-          dedupInput,
-        );
-        if (dedupMap.isDuplicate(dedupHash)) {
-          return { deduplicated: true, sessionId: payload.sessionId };
-        }
+      if (payload.event_id !== undefined && !isEventId(payload.event_id)) {
+        return { success: false, error: "event_id must be a UUID" };
       }
-
-      let sanitizedRaw: unknown = payload.data;
-      try {
-        const jsonStr = JSON.stringify(payload.data);
-        const sanitized = stripPrivateData(jsonStr);
-        sanitizedRaw = JSON.parse(sanitized);
-      } catch {
-        sanitizedRaw = stripPrivateData(String(payload.data));
-      }
-
-      let originChannel: Origin["channel"] = "agent";
-      if (payload.hookType === "prompt_submit") originChannel = "user";
-      else if (TOOL_HOOKS.has(payload.hookType)) originChannel = "tool";
-      const raw: RawObservation = {
-        id: obsId,
-        sessionId: payload.sessionId,
-        timestamp: payload.timestamp,
-        hookType: payload.hookType,
-        raw: sanitizedRaw,
-        origin: {
-          channel: originChannel,
-          capturedAt: payload.timestamp,
-        },
-      };
-
-      let extractedImage: string | undefined;
-
-      if (typeof sanitizedRaw === "object" && sanitizedRaw !== null) {
-        const d = sanitizedRaw as Record<string, unknown>;
-        if (
-          payload.hookType === "post_tool_use" ||
-          payload.hookType === "post_tool_failure"
-        ) {
-          raw.toolName = d["tool_name"] as string | undefined;
-          raw.toolInput = d["tool_input"];
-          raw.toolOutput = d["tool_output"] || d["error"];
-          if (raw.origin && raw.toolName) raw.origin.detail = raw.toolName;
-        }
-        if (payload.hookType === "prompt_submit") {
-          raw.userPrompt = d["prompt"] as string | undefined;
-        }
-
-        extractedImage = extractImage(sanitizedRaw);
-        if (extractedImage) {
-          raw.modality = (raw.toolInput || raw.toolOutput || raw.userPrompt) ? "mixed" : "image";
-        }
-      } else if (typeof sanitizedRaw === "string") {
-        extractedImage = extractImage(sanitizedRaw);
-        if (extractedImage) {
-          raw.modality = "image";
-        }
-      }
-
-      const pendingImageData = extractedImage;
-
+      const obsId = payload.event_id
+        ? `obs_event_${payload.event_id.toLowerCase().replace(/-/g, "")}`
+        : generateId("obs");
       return withKeyedLock(`obs:${payload.sessionId}`, async () => {
+        if (payload.event_id && await kv.get(KV.observations(payload.sessionId), obsId)) {
+          return { observationId: obsId, sessionId: payload.sessionId, deduplicated: true };
+        }
+        const incomingProjectId = (payload.data as { contextProjectId?: unknown } | null)?.contextProjectId;
+        const contextProjectId = typeof incomingProjectId === "string" && incomingProjectId.trim().length > 0
+          && incomingProjectId.length <= 200 ? incomingProjectId.trim() : undefined;
+        const explicitRequest = captureExplicitKnowledge && payload.hookType === "prompt_submit"
+          && (payload.data as { explicitMemoryRequest?: unknown } | null)?.explicitMemoryRequest === true
+          && isRememberRequest((payload.data as { prompt?: unknown } | null)?.prompt);
+
+        let dedupHash: string | undefined;
+        if (dedupMap && !payload.event_id) {
+          const dataIsObject =
+            typeof payload.data === "object" && payload.data !== null;
+          const d = dataIsObject
+            ? (payload.data as Record<string, unknown>)
+            : {};
+          const toolName = (d["tool_name"] as string) || payload.hookType;
+          // Hash the full payload when tool_input is absent so distinct
+          // events never collapse onto one key.
+          const dedupInput =
+            d["tool_input"] !== undefined
+              ? d["tool_input"]
+              : dataIsObject
+                ? d
+                : payload.data;
+          dedupHash = dedupMap.computeHash(
+            payload.sessionId,
+            toolName,
+            dedupInput,
+          );
+          if (!explicitRequest && dedupMap.isDuplicate(dedupHash)) {
+            return { deduplicated: true, sessionId: payload.sessionId };
+          }
+        }
+
+        let sanitizedRaw: unknown = payload.data;
+        try {
+          const jsonStr = JSON.stringify(payload.data);
+          const sanitized = stripPrivateData(jsonStr);
+          sanitizedRaw = JSON.parse(sanitized);
+        } catch {
+          sanitizedRaw = stripPrivateData(String(payload.data));
+        }
+
+        let originChannel: Origin["channel"] = "agent";
+        if (payload.hookType === "prompt_submit") originChannel = "user";
+        else if (TOOL_HOOKS.has(payload.hookType)) originChannel = "tool";
+        const raw: RawObservation = {
+          id: obsId,
+          sessionId: payload.sessionId,
+          timestamp: payload.timestamp,
+          hookType: payload.hookType,
+          raw: sanitizedRaw,
+          origin: {
+            channel: originChannel,
+            capturedAt: payload.timestamp,
+          },
+        };
+
+        let extractedImage: string | undefined;
+
+        if (typeof sanitizedRaw === "object" && sanitizedRaw !== null) {
+          const d = sanitizedRaw as Record<string, unknown>;
+          if (
+            payload.hookType === "post_tool_use" ||
+            payload.hookType === "post_tool_failure"
+          ) {
+            raw.toolName = d["tool_name"] as string | undefined;
+            raw.toolInput = d["tool_input"];
+            raw.toolOutput = d["tool_output"] || d["error"];
+            if (raw.origin && raw.toolName) raw.origin.detail = raw.toolName;
+          }
+          if (payload.hookType === "prompt_submit") {
+            raw.userPrompt = d["prompt"] as string | undefined;
+          }
+
+          extractedImage = extractImage(sanitizedRaw);
+          if (extractedImage) {
+            raw.modality = (raw.toolInput || raw.toolOutput || raw.userPrompt) ? "mixed" : "image";
+          }
+        } else if (typeof sanitizedRaw === "string") {
+          extractedImage = extractImage(sanitizedRaw);
+          if (extractedImage) {
+            raw.modality = "image";
+          }
+        }
+
+        const pendingImageData = extractedImage;
+
         if (maxObservationsPerSession && maxObservationsPerSession > 0) {
           const existing = await kv.list(KV.observations(payload.sessionId));
           if (existing.length >= maxObservationsPerSession) {
@@ -162,6 +178,8 @@ export function registerObserveFunction(
           agentId?: string;
           observationCount?: number;
           firstPrompt?: string;
+          project?: string;
+          contextProjectId?: string;
         }>(KV.sessions, payload.sessionId);
         const inheritedAgentId = existingSession
           ? existingSession.agentId
@@ -254,6 +272,9 @@ export function registerObserveFunction(
               value: (session.observationCount || 0) + 1,
             },
           ];
+          if (!session.contextProjectId && contextProjectId && session.project === payload.project) {
+            updates.push({ type: "set", path: "contextProjectId", value: contextProjectId });
+          }
           if (!session.firstPrompt && typeof raw.userPrompt === "string") {
             const trimmed = raw.userPrompt.replace(/\s+/g, " ").trim();
             if (trimmed.length > 0) {
@@ -291,12 +312,27 @@ export function registerObserveFunction(
             startedAt: payload.timestamp ?? ts,
             updatedAt: ts,
             status: "active",
+            ...(contextProjectId ? { contextProjectId } : {}),
             observationCount: 1,
             ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
             ...(trimmedPrompt && trimmedPrompt.length > 0
               ? { firstPrompt: trimmedPrompt }
               : {}),
           });
+        }
+
+        let knowledgeCapture: unknown;
+        if (explicitRequest) {
+          try {
+            // The producer reads this stored user event before compression can
+            // replace its full text. Knowledge-level dedup handles retries.
+            knowledgeCapture = await sdk.trigger({
+              function_id: "mem::context-knowledge-capture",
+              payload: { sessionId: payload.sessionId, observationId: obsId },
+            });
+          } catch {
+            knowledgeCapture = { success: false, error: "capture_failed" };
+          }
         }
 
         // Per-observation LLM compression is opt-in as of 0.8.8.
@@ -358,7 +394,7 @@ export function registerObserveFunction(
           hook: payload.hookType,
           compress: isAutoCompressEnabled() ? "llm" : "synthetic",
         });
-        return { observationId: obsId };
+        return { observationId: obsId, ...(explicitRequest ? { knowledgeCapture } : {}) };
       });
     },
   );

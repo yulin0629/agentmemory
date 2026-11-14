@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 const expectedHermesHooks = [
   "prefetch",
   "sync_turn",
+  "on_session_switch",
   "on_session_end",
   "on_pre_compress",
   "on_memory_write",

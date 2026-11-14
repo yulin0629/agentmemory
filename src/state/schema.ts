@@ -62,6 +62,7 @@ export const KV = {
   sentinels: "mem:sentinels",
   crystals: "mem:crystals",
   lessons: "mem:lessons",
+  contextKnowledge: "mem:context-knowledge",
   insights: "mem:insights",
   graphEdgeHistory: "mem:graph:edge-history",
   enrichedChunks: (sessionId: string) => `mem:enriched:${sessionId}`,
@@ -89,6 +90,10 @@ export function generateId(prefix: string): string {
   const ts = Date.now().toString(36);
   const rand = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
   return `${prefix}_${ts}_${rand}`;
+}
+
+export function isEventId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 export function fingerprintId(prefix: string, content: string): string {

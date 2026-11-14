@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 //#region src/hooks/antigravity-bridge.ts
 const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
 const TOOL_NAME_MAP = {
@@ -54,6 +55,27 @@ function normalizePayload(event, raw) {
 	};
 	const transcriptPath = firstString(raw["transcript_path"], raw["transcriptPath"]);
 	if (transcriptPath) out["transcript_path"] = transcriptPath;
+	if (event === "PreInvocation" && transcriptPath && sessionId !== "unknown" && resolve(transcriptPath).split(/[/\\]/).includes(sessionId)) {
+		let fd;
+		try {
+			fd = openSync(transcriptPath, "r");
+			const size = fstatSync(fd).size;
+			const buffer = Buffer.alloc(Math.min(size, 65536));
+			readSync(fd, buffer, 0, buffer.length, size - buffer.length);
+			const lines = buffer.toString("utf8").split("\n");
+			if (size > buffer.length) lines.shift();
+			for (const line of lines.reverse()) {
+				if (!line.trim()) continue;
+				const step = JSON.parse(line);
+				if (step.type === "USER_INPUT" && typeof step.content === "string") {
+					out["prompt"] = step.content;
+					break;
+				}
+			}
+		} catch {} finally {
+			if (fd !== void 0) closeSync(fd);
+		}
+	}
 	if (toolCall) {
 		const args = normalizeToolArgs(asObject(toolCall["args"]) ?? asObject(toolCall["toolArgs"]));
 		const rawName = firstString(toolCall["name"], toolCall["toolName"], args["ToolName"], args["toolName"]);
@@ -97,6 +119,8 @@ async function main() {
 	const payload = JSON.stringify(normalizePayload(event, raw));
 	for (const script of targetsFor(event, raw)) spawnSync(process.execPath, [join(SCRIPTS_DIR, script)], {
 		input: payload,
+		encoding: "utf8",
+		timeout: 6500,
 		stdio: [
 			"pipe",
 			"ignore",

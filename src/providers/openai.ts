@@ -54,8 +54,14 @@ export class OpenAIProvider implements MemoryProvider {
   private timeoutMs: number;
   private isAzure: boolean;
   private azureApiVersion: string;
+  private systemRole: "system" | "developer";
 
   constructor(apiKey: string, model: string, maxTokens: number, baseURL?: string) {
+    const systemRole = getEnvVar("OPENAI_SYSTEM_ROLE") ?? "system";
+    if (systemRole !== "system" && systemRole !== "developer") {
+      throw new Error("OPENAI_SYSTEM_ROLE must be system or developer");
+    }
+    this.systemRole = systemRole;
     this.apiKey = apiKey;
     this.model = model;
     this.maxTokens = maxTokens;
@@ -88,7 +94,7 @@ export class OpenAIProvider implements MemoryProvider {
       // Send it explicitly so non-spec endpoints route to non-streaming too.
       stream: false,
       messages: [
-        { role: "system", content: systemPrompt },
+        { role: this.systemRole, content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
     };

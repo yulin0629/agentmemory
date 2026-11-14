@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.agentmemory.devspace-forwarder</string>
+  <key>ProgramArguments</key>
+  <array><string>__NODE__</string><string>__BUNDLE__</string><string>__CONFIG__</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardErrorPath</key><string>__LOG__</string>
+</dict>
+</plist>

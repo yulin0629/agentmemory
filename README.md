@@ -75,6 +75,23 @@
 
 ## Install
 
+DevSpace completion events can also be ingested through the optional
+[JSONL forwarder](integrations/devspace-forwarder/README.md). Deploy and verify
+the UUID-aware server before enabling either event production or forwarding.
+
+`POST /agentmemory/observe` accepts optional top-level UUID `event_id`. The
+existing observation row supplies deduplication: repeated IDs in
+the same session return `deduplicated: true` without repeating processing.
+Omitted IDs preserve legacy hooks, whose dedup hash now uses the complete
+input. See the integration guide for crash windows and deployment acceptance.
+
+Maintain the three privacy filters together: DevSpace's `src/events/privacy.ts`,
+this repository's `integrations/devspace-forwarder/src/privacy.mjs`, and
+`src/functions/privacy.ts`. DevSpace observations carry less context than CLI
+hooks and omit `contextProjectId`. The existing iii file store has a five-second
+periodic persistence window, so an engine/host crash can lose recently
+acknowledged observations. See the [forwarder limitations](integrations/devspace-forwarder/README.md#privacy-and-limitations).
+
 Requirements:
 
 - Node.js 20 or newer with npm and npx (`node -v`, `npm -v`, and `npx -v`).
@@ -680,7 +697,7 @@ mcp_servers:
 memory:
   provider: agentmemory
 
-Verify with `curl http://localhost:3111/agentmemory/health`. Open http://localhost:3113 for the real-time viewer. For deeper 6-hook memory provider integration (pre-LLM context injection, turn capture, MEMORY.md mirroring, system prompt block), copy integrations/hermes from the agentmemory repo to ~/.hermes/plugins/agentmemory.
+Verify with `curl http://localhost:3111/agentmemory/health`. Open http://localhost:3113 for the real-time viewer. For deeper 6-hook memory provider integration (private-turn selective recall, turn capture, owned memory mirroring), copy integrations/hermes from the agentmemory repo to ~/.hermes/plugins/agentmemory.
 ```
 
 Full guide: [`integrations/hermes/`](integrations/hermes/)
@@ -743,7 +760,7 @@ The agentmemory entry is the **same MCP server block** across every host that us
 | **OpenCode (MCP only)** | `opencode.json` | Different shape: top-level `mcp` key, command as array: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`. |
 | **OpenCode (full plugin)** | `plugin/opencode/` | 22 auto-capture hooks covering session lifecycle, messages, tools, errors. Project attribution is per-session, so one OpenCode process spanning several repositories files each session under its own project. Two slash commands (`/recall`, `/remember`). Copy `plugin/opencode/` into your OpenCode workspace and add the plugin entry to `opencode.json`. See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table + gap analysis. |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | `agentmemory connect pi` installs the bundled extension into pi's auto-discovery directory (recall on agent start, capture on agent end, `memory_search` / `memory_save` / `memory_health` tools, `/agentmemory-status`). `/reload` in a running pi picks it up. [`integrations/pi`](integrations/pi/) is also a pi package (`pi install ./integrations/pi` from a checkout). |
-| **Hermes Agent** | `~/.hermes/config.yaml` | `cp -r integrations/hermes ~/.hermes/plugins/agentmemory` + `memory.provider: agentmemory` gives the 6-hook memory provider (prefetch, turn capture, session end, pre-compress, MEMORY.md mirroring, system prompt block). Validate with `hermes plugins doctor` and `hermes memory status`. See [`integrations/hermes`](integrations/hermes/). |
+| **Hermes Agent** | `~/.hermes/config.yaml` | `cp -r integrations/hermes ~/.hermes/plugins/agentmemory` + `memory.provider: agentmemory` gives the 6-hook memory provider (private-turn selective prefetch, turn capture, session end, pre-compress, owned USER.md/MEMORY.md mirroring, static system block). Validate with `hermes plugins doctor` and `hermes memory status`. See [`integrations/hermes`](integrations/hermes/). |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` writes the standard `mcpServers` block. Hook payload is field-compatible with Claude Code, so the existing 12-hook scripts work without modification; wire them via the `hooks` section in the same `settings.json`. |
 | **Antigravity** (replaces Gemini CLI) | `mcp_config.json` (in Antigravity's User dir) | `agentmemory connect antigravity` writes the standard `mcpServers` block. macOS: `~/Library/Application Support/Antigravity/User/`. Linux: `~/.config/Antigravity/User/`. Use after the 2026-06-18 Gemini CLI sunset. |
 | **Antigravity CLI** (`agy`) | `~/.gemini/config/mcp_config.json` | `agentmemory connect antigravity-cli`. The `agy` CLI keeps its own config under `~/.gemini/`, separate from the Antigravity IDE above. Pass `--with-hooks` for native auto-capture via `~/.gemini/config/hooks.json`. |
@@ -1143,6 +1160,8 @@ AGENTMEMORY_MCP_BEARER_TOKEN=<random-secret> agentmemory
 
 The server then exposes `POST /mcp` on the same loopback REST port (`GET`/`DELETE /mcp` answer 405: the endpoint is stateless and has no SSE stream). The endpoint supports both the legacy initialize lifecycle and the stateless MCP `2026-07-28` discovery lifecycle. Result sizes are bounded at the MCP boundary (`memory_recall` and `memory_lesson_recall` limit 1–100, `memory_sessions` limit 1–100 with a `total` field, `memory_timeline` before/after ≤ 50). It intentionally exposes only eight read-only tools: `memory_recall`, `memory_file_history`, `memory_sessions`, `memory_smart_search`, `memory_timeline`, `memory_commit_lookup`, `memory_graph_query`, and `memory_lesson_recall`.
 
+Set `AGENTMEMORY_MCP_REMOTE_LESSON_SAVE=true` to also expose `memory_lesson_save`, the only write tool the remote endpoint can offer. Remote saves are limited to 10,000 characters of `content`, 2,000 of `context`, 200 of `project` and 500 of `tags` (string or array, measured after joining). A lesson created through `/mcp` carries the `remote-mcp` tag, plus the value of an `X-AgentMemory-MCP-Client` header (lowercase letters, digits and hyphens, at most 32 characters) when a gateway in front of the endpoint sets one, so remote writes can be found and removed later. The header is trusted as sent: anyone holding the remote bearer token can set it, so keep that token on the gateway only. Saving content that already exists only reinforces the existing lesson; its tags do not change.
+
 `AGENTMEMORY_MCP_BEARER_TOKEN` is separate from `AGENTMEMORY_SECRET`: use the former for the hosted MCP client and keep the broader REST API private. When publishing through a reverse proxy or tunnel, route only `/mcp` to port `3111` and return 404 for every other path on that public hostname. Do not expose the whole Agent Memory REST API just to support a remote MCP client.
 
 ### Standalone MCP
@@ -1507,6 +1526,11 @@ Create `~/.agentmemory/.env`:
 #                                          # api-key header + api-version query param.
 # OPENAI_API_VERSION=2024-08-01-preview    # Optional: Azure api-version query param
 # OPENAI_MODEL=gpt-5.6-luna                # Optional: default model
+# OPENAI_SYSTEM_ROLE=system               # Optional: exact values "system" (default) | "developer".
+#                                          # Opt in to developer only when the chat endpoint accepts it.
+#                                          # Applies to OpenAI-compatible compression and summaries,
+#                                          # including Azure; keeps instructions separate from user data.
+#                                          # Any other value (including empty) fails provider construction.
 # OPENAI_TIMEOUT_MS=60000                  # Optional: OpenAI-scoped alias for the outbound fetch
 #                                          # timeout. Takes precedence over AGENTMEMORY_LLM_TIMEOUT_MS
 #                                          # for back-compat with v0.9.17. New configs should
@@ -1551,6 +1575,7 @@ Create `~/.agentmemory/.env`:
 # Auth
 # AGENTMEMORY_SECRET=your-secret
 # AGENTMEMORY_MCP_BEARER_TOKEN=your-remote-mcp-token  # Optional: enables read-only POST /mcp
+# AGENTMEMORY_MCP_REMOTE_LESSON_SAVE=true  # Optional: adds memory_lesson_save to POST /mcp
 
 # Ports (defaults: 3111 API, 3113 viewer)
 # III_REST_PORT=3111
@@ -1596,6 +1621,19 @@ Create `~/.agentmemory/.env`:
                                    #   log only per Claude Code docs)
                                    # Observations are still captured via
                                    # PostToolUse regardless of this flag.
+# AGENTMEMORY_SELECTIVE_CONTEXT=false  # OFF by default. Requires a global or selective secret, namespace, key, and restart.
+# AGENTMEMORY_SELECTIVE_CONTEXT_SECRET=... # Optional dedicated credential for selective recall/capture; global secret takes precedence.
+# AGENTMEMORY_CONTEXT_NAMESPACE=personal # Fixed server namespace; callers cannot choose it per request.
+# TYPESAFE_API_KEY=...                  # Fast Jev judge key. Keep it out of source control.
+# TYPESAFE_MODEL=jev-preview           # Jev alias or pinned id (jev-x.y.z) for recall/capture judges.
+# AGENTMEMORY_JUDGE_ORDER=typesafe,decisions  # Judges in order; on an error the next one answers.
+# OPENAI_DECISIONS_KEY_FILE=...         # OpenAI Decisions fallback: agent.env-style org keys (or OPENAI_DECISIONS_API_KEY=sk-...).
+# AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=false # OFF by default. Ordinary recall waits at most 2s; explicit saves wait at most 5s for acknowledgement.
+# AGENTMEMORY_CONTEXT_PROJECT=shared-repo-alias # Optional CLIENT/hook environment setting for deliberately sharing one repo identity.
+# When enabled, the hook sends up to four recent dialogue messages (8,000 characters)
+# from a same-session Codex/Claude JSONL transcript to the server and Jev. Tool output
+# is excluded; private tags and recognized secrets are redacted, not all personal data.
+# Reads an 8 KiB identity header plus the last 64 KiB. Missing/unrecognized transcripts produce no previous context.
 # GRAPH_EXTRACTION_ENABLED=false
 # AGENTMEMORY_LLM_NOTHINK=1        # Local reasoning models only: ask the
                                    # model to skip its hidden thinking pass
@@ -1617,11 +1655,61 @@ Create `~/.agentmemory/.env`:
 # AGENTMEMORY_TOOLS=core
 ```
 
+### Selective recall MVP
+
+This opt-in MVP uses one adoption catalog for explicitly confirmed knowledge. Each namespace permits 12 records (including candidates and superseded rules) and 256 change events. An explicit save matching an existing lesson in the same project links that lesson by ID; it does not create a second editable lesson. Linked lessons use the existing warm BM25 index, filtered to approved IDs before taking at most ten hits. Unlinked curated records remain readable. Status, source evidence, repository identity, ten-candidate and 6,000-character limits apply before one Jev request. No vector search is required. Ungoverned historical lessons can also enter the default judge candidate set; the judge still decides whether to select them.
+
+The prompt client independently rejects malformed, duplicate, or oversized selections (more than two spans or 1,200 text characters), rather than injecting a partial response. Historical lesson saves deduplicate within the supplied project scope; matching legacy IDs are preserved only within that same scope. This does not establish repository identity or adoption evidence for historical lessons, and does not make them eligible for automatic injection.
+
+The adoption catalog is the authority for activation, withdrawal and atomic replacement. A linked lesson must still exist, retain its approved text and project, and remain unchanged through the Jev decision; otherwise recall fails closed. Linking through the knowledge API requires the stored explicit user event and matching session repository identity, not only `confirmedByUser`. Backups preserve `lessonId` references; missing or changed referenced lessons cannot be injected.
+
+Jev must find a span relevant, compatible with the current request, and additive to the recent dialogue. Otherwise the hook stays silent. A standalone acknowledgement with no preceding task should select nothing; a continuation with a known task may recall applicable knowledge. Selection is capped at two spans totaling 1,200 characters; the Hermes path keeps complete sentence boundaries or drops an overlong source. Judge errors and malformed decisions produce no context; the default judge deadline is 1.5 seconds, and historical recall has a 6.5-second server budget within the Hermes provider's 7-second timeout. The standalone hook's recall HTTP request has a two-second deadline.
+
+The optional Hermes request body adds `hermes: { sessionId, ownerId, visibility, verifiedSessionIds }` alongside the deployed `recallHistory`, `sessionId`, and `excludedSessionIds` fields. Only `visibility: "private"` can select context. The bounded proof IDs come from the Hermes host's exact same-principal, default-profile session metadata and require selective endpoint authentication; a conflicting nonempty stored owner still fails. Verified legacy conversation observations, memories, and completed-session summaries may be candidates; current-session echoes are excluded. Summary lookup is anchored by a matching indexed observation, so summaries with no indexed observation are not automatic candidates. The default selective request path for other clients remains unchanged. The Hermes provider records owned mirror IDs in a profile-local file; `/remember` and `/forget` accept its validated `mirrorOwner` field so deduplication and deletion cannot cross into another owner or unlabelled memory.
+
+Configure the server with `AGENTMEMORY_SELECTIVE_CONTEXT=true`, `AGENTMEMORY_CONTEXT_NAMESPACE`, `TYPESAFE_API_KEY` (or an OpenAI Decisions key, see `.env.example`), and either `AGENTMEMORY_SECRET` or `AGENTMEMORY_SELECTIVE_CONTEXT_SECRET`, then restart. The global secret takes precedence; a dedicated selective secret leaves legacy endpoint authentication unchanged and protects selective recall, knowledge writes, and explicit-save observations. Client hooks use `AGENTMEMORY_SELECTIVE_CONTEXT_INJECT=true` and the matching `AGENTMEMORY_URL` and `AGENTMEMORY_SECRET`. Alternatively, a private `~/.config/agentmemory/selective-context.json` supplies `enabled`, `url`, and `secret`; explicit environment settings take precedence. Keep `AGENTMEMORY_INJECT_CONTEXT=false` to avoid broad startup/tool context alongside selective recall. The explicit save flow below supplies initial knowledge.
+
+For a separately authenticated relay, private `selectiveSecret` (or `AGENTMEMORY_SELECTIVE_CONTEXT_SECRET`) supplies `X-AgentMemory-Selective-Secret`, leaving the relay's bearer token unchanged. This header cannot bypass a configured global API secret. With shared ownership enabled, startup, tool and precompact broad injection are disabled mechanically, even if the legacy broad flag is true.
+
+`node scripts/configure-selective-memory.mjs client [base-url]` reads a 32-byte hex selective secret from stdin, configures the installed Node/client paths privately, and updates existing non-Codex memory script registrations with backups. It preserves other hooks and redaction pipelines. `server` reads the same secret, backs up the Oracle environment and uses its existing private TypeSafe key; restart separately after taking a data backup. `disable` turns off shared recall locally. Codex hook definitions/trust are not rewritten. Preserve the old release and settings backups for rollback. This setup does not install missing native adapters or prove delivery.
+
+The shared `agent-hooks` integration uses that same private configuration with `owner: "agent-hooks"`, an absolute `clientScript` pointing to the installed `plugin/scripts/selective-client.mjs`, and an optional absolute `node` runtime path. Shared ownership suppresses standalone prompt-hook recall, not ordinary telemetry. The shared client performs selection without recording ordinary prompts a second time; explicit memory requests retain their source-backed capture flow. Native adapters pass normalized JSON through `selective-client.mjs --stdin` and render the resulting bounded text. This is an opt-in adapter contract, not a claim of fleet deployment. Ungoverned lessons can enter the default judge candidate set.
+
+Shared recall appends `kind: "memory"` events to the existing `~/.local/state/agent-hooks/injections.jsonl`, with session, harness, machine, elapsed time, output characters and a bounded reason code. Client/API timeouts, HTTP errors, invalid responses, disabled configuration and API empty selections are distinct. These records measure shared-client output, not platform delivery or model adherence. Candidate counts are `null` because the server does not expose them; `api_empty` does not distinguish no candidates from judge rejection. No prompt, knowledge text, credentials or raw error bodies are logged. Inspect with `jq 'select(.memory)' ~/.local/state/agent-hooks/injections.jsonl`.
+
+Run `npm run build` and `npm run test:mvp` for the bounded, offline acceptance suite. It covers source-backed capture and replacement, scope isolation, invalid/expired decisions, dialogue extraction, backup preservation, and the packaged hook's output and timeout behavior. These tests do not call paid APIs or prove model adherence. The opt-in live Jev evaluation in `test/selective-context-live.test.ts` checks semantic decisions separately; actual harness acceptance additionally requires the model to use the selected fact in its answer. Passing this suite is not equivalent to passing the repository-wide suite or deploying the feature.
+
+### Explicit project memory
+
+With selective context enabled on the server and the prompt hook opted in, a live `UserPromptSubmit` prompt beginning with `記住：` or `請記住：` enters the capture path. The hook marks the observation with `explicitMemoryRequest: true`; historical transcript backfills and unmarked observations do not activate knowledge. For example:
+
+```text
+記住：本專案的回歸測試命令是 npm run test:regression。
+```
+
+The producer reads the stored user event before observation compression, preserves the full prompt, session ID and observation ID, and uses only an exact source span (up to 1,200 characters). Selective memory uses a separate project identity: normalized HTTP(S)/SSH Git origin when available, otherwise the machine and canonical local path/common Git directory. Legacy project display names remain unchanged. Client-only settings must be present in the harness/hook environment; setting them only on the server does not configure clients. `AGENTMEMORY_CONTEXT_PROJECT` deliberately shares an identity across checkouts and should be configured per project, not globally. A session's bound identity cannot silently switch repositories. Name-only legacy knowledge remains preserved but is not automatically recalled; reconfirm it in the intended repository to establish its scope. Ordinary confirmations such as `好`, `1`, and `照做`, quoted commands, and tool output do not enter the capture path.
+
+Jev classifies an explicit request before activation. Task-only, unclear, quoted-but-unadopted, and conflicting save requests remain non-recallable candidates. Repeats do not duplicate knowledge or reactivate withdrawn records. A candidate caused by an unavailable judge can be retried by another explicit save request; other candidates are not automatically promoted.
+
+To explicitly replace a rule, submit this three-line form, with each rule on one line:
+
+```text
+確認取代：
+舊規則：報告使用英文。
+新規則：報告使用繁體中文。
+```
+
+The old text must exactly match the sole span of exactly one active rule in the current project. Jev checks the new rule against the remaining active rules; only a clear project rule proceeds. One catalog write retains the old record as `superseded` and adds the new active record, preserving both sources and `supersedes`/`supersededBy` links. An intact direct replacement can be replayed without another write. Ambiguous, missing, changed, cross-project, or non-active targets, full catalogs, failed judgments, and concurrent catalog changes leave the old rule untouched. This creates a new history record and consumes one of the pilot's 12 record slots; it does not automatically reconcile arbitrary prose or prune old records.
+
+Exports and Git snapshots include `contextKnowledge` catalogs with namespace, source evidence, project identities, statuses, replacement links, and deduplication history. Restore validates these links before writing. Import `merge` rejects a differing existing namespace instead of merging competing rules; `skip` preserves it, and `replace` replaces only included namespaces. Missing collections in older backups leave current knowledge unchanged. Restores advance the live catalog revision so in-flight decisions become stale. Catalog writes are atomic per namespace; the overall multi-collection import is not transactional.
+
+An opted-in prompt hook waits up to five seconds for an explicit-save acknowledgement and distinguishes active, candidate, inactive, and unconfirmed writes. Ordinary recall keeps its two-second API deadline. The underlying iii file store writes asynchronously: an acknowledgement confirms the store accepted the write, not crash-safe disk persistence. A persistence test must wait for the record to reach disk before restarting the engine. The pilot catalog still permits at most 12 records and 256 change events per namespace.
+
 ---
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-132 endpoints on port `3111` make up the REST API, which binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers. Setting `AGENTMEMORY_MCP_BEARER_TOKEN` additionally enables the standard read-only remote MCP route at `/mcp`; it is deliberately outside the `/agentmemory/*` REST surface.
+134 endpoints on port `3111` make up the REST API, which binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers. Setting `AGENTMEMORY_MCP_BEARER_TOKEN` additionally enables the standard read-only remote MCP route at `/mcp`; it is deliberately outside the `/agentmemory/*` REST surface.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1637,6 +1725,8 @@ Create `~/.agentmemory/.env`:
 | `POST` | `/agentmemory/remember` | Save to long-term memory |
 | `POST` | `/agentmemory/forget` | Delete observations |
 | `POST` | `/agentmemory/enrich` | File context + memories + bugs |
+| `POST` | `/agentmemory/context-knowledge` | Save a user-confirmed, evidence-backed context record |
+| `POST` | `/agentmemory/selective-context` | Return at most two applicable source-exact context spans |
 | `GET` | `/agentmemory/profile` | Project profile |
 | `GET` | `/agentmemory/export` | Export all data |
 | `POST` | `/agentmemory/import` | Import from JSON |

@@ -76,6 +76,10 @@ describe("stripPrivateData", () => {
     ).toBe("Authorization: [REDACTED_SECRET]");
   });
 
+  it("strips complete bearer tokens containing tilde without retaining a suffix", () => {
+    expect(stripPrivateData(`Bearer ${"a".repeat(20)}~fixture/_.+-==`)).toBe("[REDACTED_SECRET]");
+  });
+
   it("handles multiple secrets in one string", () => {
     const input =
       "sk-abcdefghijklmnopqrstuv and ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";

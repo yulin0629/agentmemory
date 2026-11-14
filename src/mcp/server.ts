@@ -31,6 +31,12 @@ const REMOTE_MCP_TOOL_NAMES = new Set([
   "memory_lesson_recall",
 ]);
 
+const REMOTE_MCP_LESSON_SAVE = "memory_lesson_save";
+
+const REMOTE_MCP_CLIENT_TAG = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+const REMOTE_LESSON_LIMITS = { content: 10_000, context: 2_000, project: 200, tags: 500 };
+
 const REMOTE_MCP_PROTOCOL_VERSIONS = [
   "2026-07-28",
   "2025-11-25",
@@ -39,18 +45,45 @@ const REMOTE_MCP_PROTOCOL_VERSIONS = [
   "2024-11-05",
 ];
 
-function remoteMcpTools() {
+function remoteMcpTools(allowLessonSave: boolean) {
   return getAllTools()
-    .filter((tool) => REMOTE_MCP_TOOL_NAMES.has(tool.name))
+    .filter(
+      (tool) =>
+        REMOTE_MCP_TOOL_NAMES.has(tool.name) ||
+        (allowLessonSave && tool.name === REMOTE_MCP_LESSON_SAVE),
+    )
     .map((tool) => ({
       ...tool,
       annotations: {
-        readOnlyHint: true,
+        readOnlyHint: tool.name !== REMOTE_MCP_LESSON_SAVE,
         destructiveHint: false,
-        idempotentHint: true,
+        idempotentHint: tool.name !== REMOTE_MCP_LESSON_SAVE,
         openWorldHint: false,
       },
     }));
+}
+
+function remoteLessonTooLarge(args: Record<string, unknown>): string | undefined {
+  for (const [field, max] of Object.entries(REMOTE_LESSON_LIMITS)) {
+    const value = field === "tags" ? parseCsvList(args.tags).join(",") : args[field];
+    if (typeof value === "string" && value.length > max) {
+      return `${field} exceeds ${max} characters`;
+    }
+  }
+  return undefined;
+}
+
+function remoteLessonTags(
+  tags: unknown,
+  headers: Record<string, unknown> | undefined,
+): string {
+  const client =
+    headers?.["x-agentmemory-mcp-client"] ?? headers?.["X-AgentMemory-MCP-Client"];
+  const provenance = ["remote-mcp"];
+  if (typeof client === "string" && REMOTE_MCP_CLIENT_TAG.test(client)) {
+    provenance.push(client);
+  }
+  return [...new Set([...parseCsvList(tags), ...provenance])].join(",");
 }
 
 // MCP 2026-07-28 requires resultType on every result; earlier clients ignore it.
@@ -100,6 +133,7 @@ export function registerMcpEndpoints(
   kv: StateKV,
   secret?: string,
   remoteSecret?: string,
+  remoteLessonSave = false,
 ): void {
   function checkAuth(
     req: HttpRequest,
@@ -1163,6 +1197,12 @@ export function registerMcpEndpoints(
             if (typeof args.content !== "string" || !args.content.trim()) {
               return { status_code: 400, body: { error: "content is required" } };
             }
+            if (args.context !== undefined && typeof args.context !== "string") {
+              return { status_code: 400, body: { error: "context must be a string" } };
+            }
+            if (args.project !== undefined && typeof args.project !== "string") {
+              return { status_code: 400, body: { error: "project must be a string" } };
+            }
             const lessonTags = typeof args.tags === "string" && args.tags.trim()
               ? args.tags.split(",").map((t: string) => t.trim()).filter(Boolean)
               : [];
@@ -1916,7 +1956,7 @@ export function registerMcpEndpoints(
           return notification
             ? { status_code: 202, body: {} }
             : rpcResult(id, {
-                tools: remoteMcpTools(),
+                tools: remoteMcpTools(remoteLessonSave),
                 ttlMs: 60_000,
                 cacheScope: "private",
               });
@@ -1930,24 +1970,32 @@ export function registerMcpEndpoints(
           if (typeof name !== "string" || !name) {
             return rpcError(id, -32602, "Tool name is required");
           }
-          if (!REMOTE_MCP_TOOL_NAMES.has(name)) {
+          const lessonSave = remoteLessonSave && name === REMOTE_MCP_LESSON_SAVE;
+          if (!REMOTE_MCP_TOOL_NAMES.has(name) && !lessonSave) {
             return rpcResult(id, {
               content: [
                 {
                   type: "text",
-                  text: `Tool is not exposed by the read-only remote MCP: ${name}`,
+                  text: `Tool is not exposed by the remote MCP: ${name}`,
                 },
               ],
               isError: true,
             });
           }
 
-          const args =
+          const requestedArgs =
             params?.arguments &&
             typeof params.arguments === "object" &&
             !Array.isArray(params.arguments)
               ? (params.arguments as Record<string, unknown>)
               : {};
+          const oversized = lessonSave ? remoteLessonTooLarge(requestedArgs) : undefined;
+          if (oversized) {
+            return rpcResult(id, { content: [{ type: "text", text: oversized }], isError: true });
+          }
+          const args = lessonSave
+            ? { ...requestedArgs, tags: remoteLessonTags(requestedArgs.tags, req.headers) }
+            : requestedArgs;
           const result = (await sdk.trigger({
             function_id: "mcp::tools::call",
             payload: {

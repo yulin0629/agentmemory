@@ -46,8 +46,7 @@ Verify it's working with
 http://localhost:3113 to watch memories being captured live.
 
 If I want deeper integration — pre-LLM context injection, turn-level
-capture, memory-write mirroring to MEMORY.md, and system prompt block
-injection — copy `integrations/hermes` from the agentmemory repo to
+capture, memory-write mirroring from Hermes memory, and selective recall — copy `integrations/hermes` from the agentmemory repo to
 `~/.hermes/plugins/agentmemory` instead. That gives me the
 6-hook memory provider plugin on top of the MCP server.
 ```
@@ -92,12 +91,14 @@ npx @agentmemory/agentmemory
 
 The plugin auto-detects the running server and hooks into the Hermes agent loop. Make sure `memory.provider` is set to `agentmemory` in `~/.hermes/config.yaml`:
 
-- `prefetch()` injects relevant memories before each LLM call
+- `prefetch()` requests selective historical evidence for identified private turns and local CLI turns, using bounded prior dialogue and host-verified session IDs
 - `sync_turn()` captures every conversation turn in the background
 - `on_session_end()` marks sessions complete for summarization
-- `on_pre_compress()` re-injects context before compaction
-- `on_memory_write()` mirrors MEMORY.md writes to agentmemory
-- `system_prompt_block()` injects project profile at session start
+- `on_pre_compress()` returns previously selected evidence for the host summary without changing message roles
+- `on_memory_write()` mirrors exact owned USER.md and MEMORY.md entries using profile-local `agentmemory-mirror.json`
+- `system_prompt_block()` leaves startup history empty
+
+Automatic recall requires the server's selective-context configuration and a Hermes host that passes the optional `previous`, `author_id`, `visibility`, and `verified_session_ids` prefetch keywords. Unknown or group visibility, missing DM author identity, empty selection, and selector errors produce no injection. Local CLI turns without an author use the initialized local principal. The host derives a bounded proof list from exact default-profile session metadata; the server checks stored source IDs and owner conflicts. This proof is sent only to the authenticated selective endpoint, never to the external judge. The provider preserves the deployed `recallHistory` request fields, 7-second provider budget, and origin-bound private selective credential. Old unlabelled mirrored memories are not deleted automatically. The provider records only its own mirror IDs and keeps user and memory targets separate.
 
 ### Environment variables
 

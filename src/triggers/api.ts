@@ -3,7 +3,7 @@ import type { HttpRequest } from "@iii-dev/helpers/http";
 import { randomBytes } from "node:crypto";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { KV } from "../state/schema.js";
+import { KV, isEventId } from "../state/schema.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
 import { getLatestHealth } from "../health/monitor.js";
@@ -22,6 +22,10 @@ import {
 } from "../functions/search.js";
 import { timingSafeCompare } from "../auth.js";
 import { isSlotsEnabled, isReflectEnabled } from "../functions/slots.js";
+import {
+  contextKnowledgePutSchema,
+  selectiveContextSchema,
+} from "../functions/selective-context.js";
 import { renderViewerDocument } from "../viewer/document.js";
 import { getBoundViewerPort, getViewerSkipped } from "../viewer/server.js";
 import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
@@ -31,6 +35,7 @@ import {
   isConsolidationEnabled,
   isAutoCompressEnabled,
   isContextInjectionEnabled,
+  getSelectiveContextConfig,
   detectEmbeddingProvider,
   detectLlmProviderKind,
   getAgentId,
@@ -124,6 +129,21 @@ function reflectDisabledResponse(): Response {
   });
 }
 
+function selectiveContextDisabledResponse(): Response {
+  const config = getSelectiveContextConfig();
+  const missing = [
+    !config.enabled ? "AGENTMEMORY_SELECTIVE_CONTEXT=true" : "",
+    !config.namespace ? "AGENTMEMORY_CONTEXT_NAMESPACE" : "",
+    !config.hasJudge ? "TYPESAFE_API_KEY or OPENAI_DECISIONS_API_KEY" : "",
+  ].filter(Boolean);
+  return flagDisabledResponse({
+    error: "Selective context is not configured",
+    flag: "AGENTMEMORY_SELECTIVE_CONTEXT",
+    enableHow: `Set ${missing.join(", ")} and restart.`,
+    docsHref: "https://github.com/rohitg00/agentmemory#selective-context",
+  });
+}
+
 function asNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -205,6 +225,13 @@ export function registerApiTriggers(
   metricsStore?: MetricsStore,
   provider?: ResilientProvider | { circuitState?: unknown },
 ): void {
+  const selectiveSecret = secret || getSelectiveContextConfig().secret;
+  const authorizeSelective = (req: HttpRequest): Response | null =>
+    !selectiveSecret
+      ? { status_code: 503, body: { error: "selective context requires AGENTMEMORY_SECRET or AGENTMEMORY_SELECTIVE_CONTEXT_SECRET" } }
+      : checkAuth(!secret && (req.headers?.["x-agentmemory-selective-secret"] || req.headers?.["X-AgentMemory-Selective-Secret"])
+        ? { ...req, headers: { ...req.headers, authorization: `Bearer ${req.headers?.["x-agentmemory-selective-secret"] || req.headers?.["X-AgentMemory-Selective-Secret"]}` } }
+        : req, selectiveSecret);
   sdk.registerFunction(
     "middleware::api-auth",
     async (input: {
@@ -410,11 +437,18 @@ export function registerApiTriggers(
   sdk.registerFunction("api::observe",
     async (req: HttpRequest<HookPayload>): Promise<Response> => {
       const body = (req.body ?? {}) as Record<string, unknown>;
+      if ((body.data as { explicitMemoryRequest?: unknown } | null)?.explicitMemoryRequest === true) {
+        const denied = authorizeSelective(req);
+        if (denied) return denied;
+      }
       const hookType = asNonEmptyString(body.hookType);
       const sessionId = asNonEmptyString(body.sessionId);
       const project = asNonEmptyString(body.project);
       const cwd = asNonEmptyString(body.cwd);
       const timestamp = asNonEmptyString(body.timestamp);
+      if (body.event_id !== undefined && !isEventId(body.event_id)) {
+        return { status_code: 400, body: { error: "event_id must be a UUID" } };
+      }
       if (!hookType || !sessionId || !project || !cwd || !timestamp) {
         return {
           status_code: 400,
@@ -425,6 +459,7 @@ export function registerApiTriggers(
         };
       }
       const payload: HookPayload = {
+        ...(body.event_id !== undefined ? { event_id: body.event_id as string } : {}),
         hookType: hookType as HookPayload["hookType"],
         sessionId,
         project,
@@ -1152,6 +1187,7 @@ export function registerApiTriggers(
         sourceObservationIds?: string[];
         project?: string;
         agentId?: string;
+        mirrorOwner?: string;
       }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
@@ -1169,6 +1205,10 @@ export function registerApiTriggers(
       ) {
         return { status_code: 400, body: { error: "project must be a non-empty string" } };
       }
+      if (req.body.mirrorOwner !== undefined && (typeof req.body.mirrorOwner !== "string"
+        || !/^hermes:[a-f0-9]{32}:(?:user|memory)$/.test(req.body.mirrorOwner))) {
+        return { status_code: 400, body: { error: "invalid mirrorOwner" } };
+      }
       const result = await sdk.trigger({
         function_id: "mem::remember",
         payload: {
@@ -1179,6 +1219,7 @@ export function registerApiTriggers(
           ...(req.body.ttlDays !== undefined && { ttlDays: req.body.ttlDays }),
           ...(req.body.sourceObservationIds !== undefined && { sourceObservationIds: req.body.sourceObservationIds }),
           ...(req.body.project !== undefined && { project: req.body.project }),
+          ...(req.body.mirrorOwner !== undefined && { mirrorOwner: req.body.mirrorOwner }),
           ...(typeof req.body.agentId === "string" && req.body.agentId.trim()
             ? { agentId: req.body.agentId.trim() }
             : {}),
@@ -1199,6 +1240,7 @@ export function registerApiTriggers(
         sessionId?: string;
         observationIds?: string[];
         memoryId?: string;
+        mirrorOwner?: string;
       }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
@@ -1209,7 +1251,16 @@ export function registerApiTriggers(
           body: { error: "sessionId or memoryId is required" },
         };
       }
-      const result = await sdk.trigger({ function_id: "mem::forget", payload: req.body });
+      if (req.body?.mirrorOwner !== undefined && (typeof req.body.mirrorOwner !== "string"
+        || !/^hermes:[a-f0-9]{32}:(?:user|memory)$/.test(req.body.mirrorOwner))) {
+        return { status_code: 400, body: { error: "invalid mirrorOwner" } };
+      }
+      const result = await sdk.trigger({ function_id: "mem::forget", payload: {
+        ...(req.body.sessionId ? { sessionId: req.body.sessionId } : {}),
+        ...(req.body.observationIds ? { observationIds: req.body.observationIds } : {}),
+        ...(req.body.memoryId ? { memoryId: req.body.memoryId } : {}),
+        ...(req.body.mirrorOwner ? { mirrorOwner: req.body.mirrorOwner } : {}),
+      } });
       return { status_code: 200, body: result };
     },
   );
@@ -3427,6 +3478,48 @@ export function registerApiTriggers(
     return { status_code: 200, body: result };
   });
   sdk.registerTrigger({ type: "http", function_id: "api::lesson-delete", config: { api_path: "/agentmemory/lessons/delete", http_method: "POST" } });
+
+  // This is intentionally a separate API from lessons: only callers that
+  // attest an exact user-confirmed source event can add recallable context.
+  sdk.registerFunction("api::context-knowledge-put", async (req: HttpRequest) => {
+    const denied = authorizeSelective(req);
+    if (denied) return denied;
+    if (!getSelectiveContextConfig().enabled || !getSelectiveContextConfig().namespace
+      || !getSelectiveContextConfig().hasJudge) {
+      return selectiveContextDisabledResponse();
+    }
+    const parsed = contextKnowledgePutSchema.safeParse(req.body);
+    if (!parsed.success) return { status_code: 400, body: { error: "invalid_knowledge" } };
+    const result = await sdk.trigger({
+      function_id: "mem::context-knowledge-put",
+      payload: parsed.data,
+    }) as { success?: boolean; error?: string; action?: string };
+    if (result.success === false) {
+      const statusCode = result.error === "revision_conflict" || result.error === "event_conflict"
+        ? 409
+        : result.error === "catalog_capacity" ? 429 : 400;
+      return { status_code: statusCode, body: result };
+    }
+    return { status_code: result.action === "saved" ? 201 : 200, body: result };
+  });
+  sdk.registerTrigger({ type: "http", function_id: "api::context-knowledge-put", config: { api_path: "/agentmemory/context-knowledge", http_method: "POST" } });
+
+  sdk.registerFunction("api::selective-context", async (req: HttpRequest) => {
+    const denied = authorizeSelective(req);
+    if (denied) return denied;
+    if (!getSelectiveContextConfig().enabled || !getSelectiveContextConfig().namespace
+      || !getSelectiveContextConfig().hasJudge) {
+      return selectiveContextDisabledResponse();
+    }
+    const parsed = selectiveContextSchema.safeParse(req.body);
+    if (!parsed.success) return { status_code: 400, body: { error: "invalid_request" } };
+    const result = await sdk.trigger({
+      function_id: "mem::selective-context",
+      payload: parsed.data,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({ type: "http", function_id: "api::selective-context", config: { api_path: "/agentmemory/selective-context", http_method: "POST" } });
 
   sdk.registerFunction("api::obsidian-export", async (req: HttpRequest) => {
     const denied = checkAuth(req, secret);
