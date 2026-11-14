@@ -82,7 +82,7 @@ function hookCwd(data) {
 const PRIVATE_TAG_RE = /<private>[\s\S]*?<\/private>/gi;
 const SECRET_PATTERN_SOURCES = [
 	/(?:api[_-]?key|secret|token|password|credential|auth)[\s]*[=:]\s*["']?[A-Za-z0-9_\-/.+]{20,}["']?/gi,
-	/Bearer\s+[A-Za-z0-9._\-+/=]{20,}/gi,
+	/Bearer\s+[A-Za-z0-9._~\-+/=]{20,}/gi,
 	/sk-proj-[A-Za-z0-9\-_]{20,}/g,
 	/(?:sk|pk|rk|ak)-[A-Za-z0-9][A-Za-z0-9\-_]{19,}/g,
 	/sk-ant-[A-Za-z0-9\-_]{20,}/g,
@@ -163,6 +163,7 @@ function previousContext(path, sessionId, prompt) {
 		if (fd !== void 0) closeSync(fd);
 	}
 }
+process.env["AGENTMEMORY_VERBOSE"] === "1" || process.env["AGENTMEMORY_VERBOSE"];
 //#endregion
 //#region src/state/explicit-memory.ts
 /** Only an explicit, top-level save command enters the knowledge-writing path. */
