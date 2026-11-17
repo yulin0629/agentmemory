@@ -158,6 +158,23 @@ describe("judge failover", () => {
     expect(viaFailover).toEqual(direct);
     expect(a.calls).toEqual(b.calls);
   });
+
+  it("sends Jev the guidance once in state.rubric and points every question at it", async () => {
+    const { fn, calls } = stubFetch({ [TYPESAFE]: () => json(jevContextAnswers) });
+    await createJevContextJudge("tk", "jev-preview", fn)(request, candidates, signal());
+    const { state, questions } = calls[0]!.body;
+    expect(Object.keys(questions)).toEqual(
+      ["useful_0", "compatibility_0", "addition_0", "useful_1", "compatibility_1", "addition_1"]);
+    for (const [name, question] of Object.entries<any>(questions)) {
+      const [key, index] = name.split("_");
+      expect(question.instructions).toContain(`candidates[${index}].text`);
+      expect(question.instructions).toContain(`\`rubric.${key}\``);
+      expect(state.rubric[key]).toBeTruthy();
+      if (question.type === "choice") {
+        expect(Object.keys(question.criteria)).toEqual(Object.keys(state.rubric[key].options));
+      }
+    }
+  });
 });
 
 describe("judge provider config", () => {
