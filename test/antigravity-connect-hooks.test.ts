@@ -285,6 +285,7 @@ describe("antigravity bridge payload normalization", () => {
       ["Path", "file_path", "/repo/c.ts"],
       ["DirectoryPath", "path", "/repo/src"],
       ["SearchDirectory", "path", "/repo/test"],
+      ["SearchPath", "path", "/repo/pkg"],
       ["Pattern", "pattern", "*.ts"],
       ["Query", "pattern", "normalizePayload"],
       ["CommandLine", "command", "npm test"],

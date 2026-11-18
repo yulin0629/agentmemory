@@ -53,6 +53,7 @@ const ARG_KEY_MAP: Record<string, string> = {
   Path: "file_path",
   DirectoryPath: "path",
   SearchDirectory: "path",
+  SearchPath: "path",
   Pattern: "pattern",
   Query: "pattern",
   CommandLine: "command",
