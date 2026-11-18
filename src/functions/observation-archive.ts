@@ -7,9 +7,6 @@ import { markCaptureEventDeleted } from "../capture/event-record.js";
 import { resolveDataDir } from "../cli-data-dir.js";
 import type {
   CompressedObservation,
-  GraphEdge,
-  GraphNode,
-  Memory,
   ObservationArchive,
   Session,
   SessionSummary,
@@ -21,7 +18,9 @@ import { indexObservationSession, unindexObservationSession } from "../state/obs
 import { logger } from "../logger.js";
 import { type AccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
+import { serverDurableAfterMs } from "./capture.js";
 import { needsCompression, type StoredObservation } from "./compression-state.js";
+import { withoutObservationSource } from "./observation-source.js";
 import { flushIndexSave, getSearchIndex, indexRecords, vectorIndexRemove } from "./search.js";
 import { requestSummaryRefresh, summaryCovers, summaryFingerprint, summaryObservations } from "./summary-state.js";
 
@@ -34,11 +33,12 @@ const MIN_OLDER_THAN_DAYS = 7;
 const DEFAULT_KEEP_IMPORTANCE = 6;
 const DEFAULT_MAX_SESSIONS = 50;
 const MAX_SESSIONS_PER_CALL = 500;
-const DELETE_CONCURRENCY = 16;
+const WRITE_CONCURRENCY = 16;
 const DEFAULT_SEARCH_LIMIT = 20;
 const MAX_SEARCH_LIMIT = 200;
 const SEARCH_BUDGET_MS = 15_000;
-const MAX_SESSION_ID_LENGTH = 256;
+const MAX_FILE_NAME_BYTES = 200;
+const CITING_SCOPES = [KV.memories, KV.graphNodes, KV.graphEdges, KV.actions, KV.procedural];
 
 export type ArchiveSkipReason =
   | "active"
@@ -46,6 +46,8 @@ export type ArchiveSkipReason =
   | "summary_stale"
   | "repair_pending"
   | "nothing_eligible";
+
+export type ArchiveRestoreError = "archive_not_found" | "archive_unreadable" | "session_not_found";
 
 export interface ArchiveObservationsInput {
   dryRun?: boolean;
@@ -77,28 +79,24 @@ export function observationArchiveDir(env: NodeJS.ProcessEnv = process.env): str
   return join(resolveDataDir({ args: [], env }).dataDir, "observation-archive");
 }
 
-function archiveFileName(sessionId: string): string {
-  return `${encodeURIComponent(sessionId)}.jsonl.gz`;
-}
-
-function isSessionId(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= MAX_SESSION_ID_LENGTH;
+function archiveFile(sessionId: unknown): string | null {
+  if (typeof sessionId !== "string" || !sessionId) return null;
+  let name: string;
+  try {
+    name = encodeURIComponent(sessionId);
+  } catch {
+    return null;
+  }
+  return name.length <= MAX_FILE_NAME_BYTES ? join(observationArchiveDir(), `${name}.jsonl.gz`) : null;
 }
 
 async function readArchive(file: string): Promise<CompressedObservation[]> {
-  let packed: Buffer;
-  try {
-    packed = await readFile(file);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw err;
-  }
-  const text = (await gunzipAsync(packed)).toString("utf8");
+  const text = (await gunzipAsync(await readFile(file))).toString("utf8");
   return text.split("\n").filter(Boolean).map((line) => JSON.parse(line) as CompressedObservation);
 }
 
-async function writeArchive(dir: string, file: string, rows: CompressedObservation[]): Promise<number> {
-  await mkdir(dir, { recursive: true, mode: 0o700 });
+async function writeArchive(file: string, rows: CompressedObservation[]): Promise<number> {
+  await mkdir(observationArchiveDir(), { recursive: true, mode: 0o700 });
   const packed = await gzipAsync(Buffer.from(rows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf8"));
   const tmp = `${file}.${process.pid}.tmp`;
   try {
@@ -121,24 +119,30 @@ function sessionCursor(session: Session): string {
   return `${session.startedAt}|${session.id}`;
 }
 
-function byTimestamp(a: CompressedObservation, b: CompressedObservation): number {
-  return a.timestamp.localeCompare(b.timestamp) || a.id.localeCompare(b.id);
+function newestFirst(a: CompressedObservation, b: CompressedObservation): number {
+  return b.timestamp.localeCompare(a.timestamp) || b.id.localeCompare(a.id);
 }
 
 function numberInRange(value: unknown, fallback: number, min: number, max: number): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
 }
 
+async function inChunks<T>(items: T[], run: (item: T) => Promise<unknown>): Promise<void> {
+  for (let i = 0; i < items.length; i += WRITE_CONCURRENCY) {
+    await Promise.all(items.slice(i, i + WRITE_CONCURRENCY).map(run));
+  }
+}
+
 async function protectedObservationIds(kv: StateKV): Promise<Set<string>> {
-  const [access, memories, nodes, edges] = await Promise.all([
+  const [access, lessons, ...citing] = await Promise.all([
     collectAll<AccessLog>(kv, KV.accessLog),
-    collectAll<Memory>(kv, KV.memories),
-    collectAll<GraphNode>(kv, KV.graphNodes),
-    collectAll<GraphEdge>(kv, KV.graphEdges),
+    collectAll<{ sourceIds?: string[] }>(kv, KV.lessons),
+    ...CITING_SCOPES.map((scope) => collectAll<{ sourceObservationIds?: string[] }>(kv, scope)),
   ]);
   const ids = new Set<string>();
   for (const row of access) if (row?.memoryId && row.count > 0) ids.add(row.memoryId);
-  for (const row of [...memories, ...nodes, ...edges]) {
+  for (const row of lessons) if (Array.isArray(row?.sourceIds)) for (const id of row.sourceIds) ids.add(id);
+  for (const row of citing.flat()) {
     if (Array.isArray(row?.sourceObservationIds)) for (const id of row.sourceObservationIds) ids.add(id);
   }
   return ids;
@@ -165,9 +169,63 @@ function summaryIsCurrent(session: Session, summary: SessionSummary, rows: Store
     : summary.observationCount === compressed.length;
 }
 
-export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV): void {
-  const dir = () => observationArchiveDir();
+// Call with the obs:<sessionId> lock held. The caller indexes the returned rows.
+export async function restoreArchivedSession(
+  kv: StateKV,
+  sessionId: string,
+  functionId = "mem::archive-restore",
+): Promise<{ restored: CompressedObservation[] } | { error: ArchiveRestoreError }> {
+  const archive = await kv.get<ObservationArchive>(KV.observationArchives, sessionId);
+  const file = archiveFile(sessionId);
+  if (!archive || !file) return { error: "archive_not_found" };
+  const session = await kv.get<Session>(KV.sessions, sessionId);
+  if (!session) return { error: "session_not_found" };
+  let archived: CompressedObservation[];
+  try {
+    archived = await readArchive(file);
+  } catch (err) {
+    logger.warn("Observation archive unreadable", { sessionId, error: err instanceof Error ? err.message : String(err) });
+    return { error: "archive_unreadable" };
+  }
+  if (archived.length < archive.observationCount) return { error: "archive_unreadable" };
 
+  const before = await kv.list<StoredObservation>(KV.observations(sessionId));
+  const summary = await kv.get<SessionSummary>(KV.summaries, sessionId);
+  const covered = Boolean(summary && summaryIsCurrent(session, summary, before));
+  const present = new Set(before.map((row) => row.id));
+  const restored = archived.filter((row) => !present.has(row.id));
+  await inChunks(restored, async (row) => {
+    await kv.set(KV.observations(sessionId), row.id, row);
+    await indexObservationSession(kv, row.id, sessionId);
+  });
+  if (summary && covered) await rebaseSummary(kv, session, summary, [...before, ...restored]);
+  else if (summary) await requestSummaryRefresh(kv, sessionId);
+  await kv.delete(KV.observationArchives, sessionId);
+  // The restored rows reach the disk with the next state snapshot; the file is
+  // their only durable copy until then.
+  setTimeout(() => void rm(file, { force: true }).catch(() => {}), serverDurableAfterMs()).unref();
+  await recordAudit(kv, "observation_archive", functionId, [sessionId], {
+    action: "restore",
+    observations: restored.length,
+    archivedTotal: archived.length,
+  });
+  return { restored };
+}
+
+// Call with the obs:<sessionId> lock held.
+export async function dropObservationArchive(kv: StateKV, sessionId: string): Promise<void> {
+  await kv.delete(KV.observationArchives, sessionId);
+  const file = archiveFile(sessionId);
+  if (file) await rm(file, { force: true });
+}
+
+export async function clearObservationArchives(kv: StateKV): Promise<void> {
+  const archives = await kv.list<ObservationArchive>(KV.observationArchives);
+  await inChunks(archives, (archive) => kv.delete(KV.observationArchives, archive.sessionId));
+  await rm(observationArchiveDir(), { recursive: true, force: true });
+}
+
+export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction(
     "mem::archive-observations",
     async (data: ArchiveObservationsInput | undefined): Promise<ArchiveObservationsResult> => {
@@ -190,10 +248,10 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
         failedSessions: 0,
       };
 
-      const wanted = Array.isArray(data?.sessionIds) ? new Set(data.sessionIds.filter(isSessionId)) : null;
+      const wanted = Array.isArray(data?.sessionIds) ? new Set(data.sessionIds) : null;
       const project = typeof data?.project === "string" && data.project ? data.project : null;
       const candidates = (await kv.list<Session>(KV.sessions))
-        .filter((session) => isSessionId(session?.id) && typeof session.startedAt === "string" &&
+        .filter((session) => archiveFile(session?.id) && typeof session.startedAt === "string" &&
           Date.parse(session.startedAt) < cutoff &&
           (!wanted || wanted.has(session.id)) && (!project || session.project === project))
         .sort((a, b) => (sessionCursor(a) < sessionCursor(b) ? -1 : sessionCursor(a) > sessionCursor(b) ? 1 : 0));
@@ -231,36 +289,41 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
               result.skipped.repair_pending++;
               return;
             }
+            const file = archiveFile(session.id)!;
             const rows = await kv.list<StoredObservation>(KV.observations(session.id));
-            const selected = rows.filter(eligible);
-            if (selected.length === 0) {
-              result.skipped.nothing_eligible++;
-              result.keptObservations += rows.length;
-              return;
-            }
-            if (!summaryIsCurrent(session, summary, rows)) {
+            const hot = new Set(rows.map((row) => row.id));
+            const previous = await kv.get<ObservationArchive>(KV.observationArchives, session.id);
+            const alreadyArchived = previous ? (await readArchive(file)).filter((row) => !hot.has(row.id)) : [];
+            // A run that died between the file write and the last delete leaves a
+            // summary that covers the hot rows plus the archived ones.
+            const interrupted = !summaryIsCurrent(session, summary, rows);
+            if (interrupted && !(previous && summaryIsCurrent(session, summary, [...rows, ...alreadyArchived]))) {
               result.skipped.summary_stale++;
               result.keptObservations += rows.length;
               return;
             }
+            const selected = rows.filter(eligible);
             result.keptObservations += rows.length - selected.length;
             if (dryRun) {
-              result.archivedSessions++;
-              result.archivedObservations += selected.length;
+              if (selected.length === 0) result.skipped.nothing_eligible++;
+              else {
+                result.archivedSessions++;
+                result.archivedObservations += selected.length;
+              }
+              return;
+            }
+            if (selected.length === 0) {
+              if (interrupted) await rebaseSummary(kv, session, summary, rows);
+              result.skipped.nothing_eligible++;
               return;
             }
 
-            const file = join(dir(), archiveFileName(session.id));
-            const merged = new Map((await readArchive(file)).map((row) => [row.id, row]));
-            for (const row of selected) merged.set(row.id, row);
-            const archived = [...merged.values()].sort(byTimestamp);
-            const bytes = await writeArchive(dir(), file, archived);
+            const archived = [...alreadyArchived, ...selected].sort(newestFirst).reverse();
+            const bytes = await writeArchive(file, archived);
             const now = new Date().toISOString();
-            const previous = await kv.get<ObservationArchive>(KV.observationArchives, session.id);
             await kv.set<ObservationArchive>(KV.observationArchives, session.id, {
               sessionId: session.id,
               project: session.project,
-              file: archiveFileName(session.id),
               observationCount: archived.length,
               bytes,
               firstTimestamp: archived[0].timestamp,
@@ -270,29 +333,29 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
             });
 
             indexChanged = true;
+            let removed = 0;
             try {
-              for (let i = 0; i < selected.length; i += DELETE_CONCURRENCY) {
-                await Promise.all(selected.slice(i, i + DELETE_CONCURRENCY).map(async (row) => {
-                  await markCaptureEventDeleted(kv, row);
-                  await kv.delete(KV.observations(session.id), row.id);
-                  getSearchIndex().remove(row.id);
-                  vectorIndexRemove(row.id);
-                  await unindexObservationSession(kv, row.id).catch(() => {});
-                }));
-              }
+              await inChunks(selected, async (row) => {
+                await markCaptureEventDeleted(kv, row);
+                await kv.delete(KV.observations(session.id), row.id);
+                getSearchIndex().remove(row.id);
+                vectorIndexRemove(row.id);
+                await unindexObservationSession(kv, row.id).catch(() => {});
+                removed++;
+              });
             } finally {
               await rebaseSummary(kv, session, summary, await kv.list<StoredObservation>(KV.observations(session.id)));
+              await recordAudit(kv, "observation_archive", "mem::archive-observations", [session.id], {
+                action: "archive",
+                observations: removed,
+                archivedTotal: archived.length,
+                olderThanDays,
+                keepImportance,
+              });
+              result.archivedSessions++;
+              result.archivedObservations += removed;
+              result.archivedBytes += bytes;
             }
-            await recordAudit(kv, "observation_archive", "mem::archive-observations", [session.id], {
-              action: "archive",
-              observations: selected.length,
-              archivedTotal: archived.length,
-              olderThanDays,
-              keepImportance,
-            });
-            result.archivedSessions++;
-            result.archivedObservations += selected.length;
-            result.archivedBytes += bytes;
           });
         } catch (err) {
           result.failedSessions++;
@@ -330,17 +393,20 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
     "mem::archive-search",
     async (data: { query?: string; sessionId?: string; project?: string; limit?: number } | undefined) => {
       const terms = (typeof data?.query === "string" ? data.query : "").toLowerCase().split(/\s+/).filter(Boolean);
-      const sessionId = isSessionId(data?.sessionId) ? data.sessionId : null;
+      const sessionId = typeof data?.sessionId === "string" && data.sessionId ? data.sessionId : null;
       if (terms.length === 0 && !sessionId) return { success: false, error: "query or sessionId is required" };
       const limit = Math.floor(numberInRange(data?.limit, DEFAULT_SEARCH_LIMIT, 1, MAX_SEARCH_LIMIT));
-      const archives = sessionId
-        ? [await kv.get<ObservationArchive>(KV.observationArchives, sessionId)].filter((row): row is ObservationArchive => Boolean(row))
-        : (await kv.list<ObservationArchive>(KV.observationArchives))
-          .filter((row) => row && (!data?.project || row.project === data.project))
-          .sort((a, b) => b.lastTimestamp.localeCompare(a.lastTimestamp));
+      const listed = sessionId
+        ? [await kv.get<ObservationArchive>(KV.observationArchives, sessionId)]
+        : await kv.list<ObservationArchive>(KV.observationArchives);
+      const archives = listed
+        .filter((row): row is ObservationArchive => Boolean(row) && (!data?.project || row?.project === data.project))
+        .sort((a, b) => b.lastTimestamp.localeCompare(a.lastTimestamp));
       const deadline = Date.now() + SEARCH_BUDGET_MS;
-      const hits: CompressedObservation[] = [];
+      let hits: CompressedObservation[] = [];
+      let total = 0;
       let scannedSessions = 0;
+      let unreadableSessions = 0;
       let truncated = false;
       for (const archive of archives) {
         if (Date.now() > deadline) {
@@ -348,10 +414,12 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
           break;
         }
         scannedSessions++;
+        const file = archiveFile(archive.sessionId);
         let rows: CompressedObservation[];
         try {
-          rows = await readArchive(join(dir(), archiveFileName(archive.sessionId)));
+          rows = file ? await readArchive(file) : [];
         } catch (err) {
+          unreadableSessions++;
           logger.warn("Observation archive unreadable", {
             sessionId: archive.sessionId,
             error: err instanceof Error ? err.message : String(err),
@@ -363,16 +431,19 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
             ? [row.title, row.subtitle, row.narrative, ...(row.facts ?? []), ...(row.concepts ?? []), ...(row.files ?? [])]
               .join("\n").toLowerCase()
             : "";
-          if (terms.every((term) => text.includes(term))) hits.push(row);
+          if (!terms.every((term) => text.includes(term))) continue;
+          total++;
+          hits.push(row);
         }
+        if (hits.length > limit * 4) hits = hits.sort(newestFirst).slice(0, limit);
       }
-      hits.sort((a, b) => byTimestamp(b, a));
       return {
         success: true,
         scannedSessions,
+        unreadableSessions,
         truncated,
-        total: hits.length,
-        observations: hits.slice(0, limit),
+        total,
+        observations: hits.sort(newestFirst).slice(0, limit).map(withoutObservationSource),
       };
     },
   );
@@ -380,41 +451,12 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
   sdk.registerFunction(
     "mem::archive-restore",
     async (data: { sessionId?: string } | undefined) => {
-      if (!isSessionId(data?.sessionId)) return { success: false, error: "sessionId is required" };
+      if (typeof data?.sessionId !== "string" || !data.sessionId) return { success: false, error: "sessionId is required" };
       const sessionId = data.sessionId;
-      const restored = await withKeyedLock(`obs:${sessionId}`, async () => {
-        const archive = await kv.get<ObservationArchive>(KV.observationArchives, sessionId);
-        if (!archive) return null;
-        const file = join(dir(), archiveFileName(sessionId));
-        const archived = await readArchive(file);
-        const session = await kv.get<Session>(KV.sessions, sessionId);
-        const before = await kv.list<StoredObservation>(KV.observations(sessionId));
-        const summary = await kv.get<SessionSummary>(KV.summaries, sessionId);
-        const covered = Boolean(session && summary && summaryIsCurrent(session, summary, before));
-        const present = new Set(before.map((row) => row.id));
-        const missing = archived.filter((row) => !present.has(row.id));
-        for (let i = 0; i < missing.length; i += DELETE_CONCURRENCY) {
-          await Promise.all(missing.slice(i, i + DELETE_CONCURRENCY).map(async (row) => {
-            await kv.set(KV.observations(sessionId), row.id, row);
-            await indexObservationSession(kv, row.id, sessionId);
-          }));
-        }
-        if (session && summary) {
-          if (covered) await rebaseSummary(kv, session, summary, [...before, ...missing]);
-          else await requestSummaryRefresh(kv, sessionId);
-        }
-        await kv.delete(KV.observationArchives, sessionId);
-        await rm(file, { force: true });
-        await recordAudit(kv, "observation_archive", "mem::archive-restore", [sessionId], {
-          action: "restore",
-          observations: missing.length,
-          archivedTotal: archived.length,
-        });
-        return missing;
-      });
-      if (!restored) return { success: false, error: "archive_not_found" };
-      await indexRecords(restored, []);
-      return { success: true, sessionId, restoredObservations: restored.length };
+      const outcome = await withKeyedLock(`obs:${sessionId}`, () => restoreArchivedSession(kv, sessionId));
+      if ("error" in outcome) return { success: false, error: outcome.error };
+      await indexRecords(outcome.restored, []);
+      return { success: true, sessionId, restoredObservations: outcome.restored.length };
     },
   );
 }

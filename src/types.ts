@@ -193,7 +193,6 @@ export interface SessionSummary {
 export interface ObservationArchive {
   sessionId: string;
   project: string;
-  file: string;
   observationCount: number;
   bytes: number;
   firstTimestamp: string;

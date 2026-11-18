@@ -2017,7 +2017,8 @@ export function registerApiTriggers(
         payload: { sessionId },
         timeoutMs: ARCHIVE_TRIGGER_TIMEOUT_MS,
       });
-      return { status_code: result?.error === "archive_not_found" ? 404 : 200, body: result };
+      const missing = result?.error === "archive_not_found" || result?.error === "session_not_found";
+      return { status_code: missing ? 404 : 200, body: result };
     },
   );
   sdk.registerTrigger({

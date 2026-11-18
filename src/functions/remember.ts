@@ -1,6 +1,6 @@
 import { TriggerAction, type IIIClient } from "iii-sdk";
 import { markCaptureEventDeleted } from "../capture/event-record.js";
-import type { Memory, Session } from "../types.js";
+import type { CompressedObservation, Memory, Session } from "../types.js";
 import { KV, generateId, jaccardSimilarity } from "../state/schema.js";
 import { StateKV, collectAll } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -10,7 +10,8 @@ import { memoryToObservation, observationEmbedText, supersededAt } from "../stat
 import { deleteAccessLog } from "./access-tracker.js";
 import { deleteFacetsForTargets } from "./facets.js";
 import { recordAudit } from "./audit.js";
-import { getSearchIndex, getVectorIndex, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { getSearchIndex, getVectorIndex, indexRecords, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { dropObservationArchive, restoreArchivedSession } from "./observation-archive.js";
 import { requestSummaryRefresh } from "./summary-state.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
@@ -388,7 +389,13 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       ) {
         const sessionId = data.sessionId;
         const observationIds = data.observationIds;
+        let unarchived: CompressedObservation[] = [];
         const remaining = await withKeyedLock(`obs:${sessionId}`, () => withKeyedLock(`obs-write:${sessionId}`, async () => {
+          // The ids may be in cold storage, and the summary rebuilt below needs
+          // every observation of the session.
+          const archive = await restoreArchivedSession(kv, sessionId, "mem::forget");
+          if ("restored" in archive) unarchived = archive.restored;
+          else if (archive.error !== "archive_not_found") recordFailure(`archive:${sessionId}`, new Error(archive.error));
           const before = deletedObservationIds.length;
           for (const obsId of observationIds) {
             await attempt(obsId, () => forgetObservation(sessionId, obsId));
@@ -405,6 +412,8 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           if (left > 0) await requestSummaryRefresh(kv, sessionId);
           return left;
         }));
+        const forgotten = new Set(deletedObservationIds);
+        await indexRecords(unarchived.filter((row) => !forgotten.has(row.id)), []);
         // Outside the locks: summarize takes obs-write:<sid> to write, and
         // mocked SDKs run triggers inline.
         if (remaining > 0) {
@@ -437,6 +446,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
             for (const obs of observations) {
               await attempt(obs.id, () => forgetObservation(sessionId, obs.id, obs));
             }
+            await dropObservationArchive(kv, sessionId).catch((err) => recordFailure(`archive:${sessionId}`, err));
             await attempt(sessionId, () => withKeyedLock(`session:${sessionId}`, async () => {
               const session = await kv.get<Session>(KV.sessions, sessionId);
               if (!session) return false;
