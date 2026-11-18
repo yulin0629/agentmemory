@@ -41,6 +41,7 @@ import { withKeyedLock, withKeyedLocks } from "../state/keyed-mutex.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
 import { indexRecords } from "./search.js";
+import { clearObservationArchives } from "./observation-archive.js";
 import { resetLessonIndex } from "./lessons.js";
 import { logger } from "../logger.js";
 import { exportContextKnowledge, parseContextKnowledgeBackups, restoreContextKnowledge } from "../state/context-knowledge-backup.js";
@@ -521,6 +522,7 @@ export function registerExportImportFunction(sdk: IIIClient, state: StateKV): vo
             kv.delete(KV.memories, m.id),
           );
           await runChunked(summaries, (s) => kv.delete(KV.summaries, s.sessionId));
+          await clearObservationArchives(kv);
           await runChunked(actions, (a) =>
             kv.delete(KV.actions, a.id),
           );
