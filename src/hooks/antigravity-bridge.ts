@@ -34,7 +34,9 @@ const TOOL_NAME_MAP: Record<string, string> = {
   read_url_content: "read",
   edit_file: "edit",
   replace_file_content: "edit",
+  multi_replace_file_content: "edit",
   propose_code: "edit",
+  write_file: "write",
   write_to_file: "write",
   create_file: "write",
   grep_search: "grep",
@@ -48,6 +50,7 @@ const TOOL_NAME_MAP: Record<string, string> = {
 const ARG_KEY_MAP: Record<string, string> = {
   AbsolutePath: "file_path",
   TargetFile: "file_path",
+  Path: "file_path",
   DirectoryPath: "path",
   SearchDirectory: "path",
   Pattern: "pattern",

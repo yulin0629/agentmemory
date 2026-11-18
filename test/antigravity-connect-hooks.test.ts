@@ -115,7 +115,14 @@ describe("buildMergedAntigravityHooks", () => {
   it("scopes PreToolUse to the file tools agy actually exposes", () => {
     const matcher = eventEntries(build()["agentmemory"], "PreToolUse")[0]!
       .matcher!;
-    for (const tool of ["view_file", "edit_file", "write_to_file", "grep_search"]) {
+    for (const tool of [
+      "view_file",
+      "edit_file",
+      "write_file",
+      "write_to_file",
+      "multi_replace_file_content",
+      "grep_search",
+    ]) {
       expect(matcher.split("|")).toContain(tool);
     }
     // run_command is deliberately excluded — shell invocations are captured
@@ -275,6 +282,7 @@ describe("antigravity bridge payload normalization", () => {
     const cases: [string, string, string][] = [
       ["AbsolutePath", "file_path", "/repo/a.ts"],
       ["TargetFile", "file_path", "/repo/b.ts"],
+      ["Path", "file_path", "/repo/c.ts"],
       ["DirectoryPath", "path", "/repo/src"],
       ["SearchDirectory", "path", "/repo/test"],
       ["Pattern", "pattern", "*.ts"],
@@ -308,6 +316,16 @@ describe("antigravity bridge payload normalization", () => {
     expect(out["tool_name"]).toBe("run_command");
     expect((out["tool_input"] as Record<string, unknown>)["command"]).toBe(
       "npm test",
+    );
+  });
+
+  it("maps CLI write_file and Path onto write + file_path on PostToolUse", () => {
+    const out = normalizePayload("PostToolUse", {
+      toolCall: { name: "write_file", args: { Path: "/repo/new.ts" } },
+    });
+    expect(out["tool_name"]).toBe("write");
+    expect((out["tool_input"] as Record<string, unknown>)["file_path"]).toBe(
+      "/repo/new.ts",
     );
   });
 
