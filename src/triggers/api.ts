@@ -358,6 +358,7 @@ function describeEmbeddingProvider(): string {
 }
 
 const STATUS_CHECK_TIMEOUT_MS = 5000;
+const ARCHIVE_TRIGGER_TIMEOUT_MS = 120_000;
 
 async function valueWithin<T>(work: Promise<T>, ms: number): Promise<T | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1926,6 +1927,103 @@ export function registerApiTriggers(
     type: "http",
     function_id: "api::evict",
     config: { api_path: "/agentmemory/evict", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::archive-observations",
+    async (req: HttpRequest<Record<string, unknown>>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const body = req.body ?? {};
+      const result = await sdk.trigger({
+        function_id: "mem::archive-observations",
+        payload: {
+          dryRun: body.dryRun !== false,
+          olderThanDays: typeof body.olderThanDays === "number" ? body.olderThanDays : undefined,
+          keepImportance: typeof body.keepImportance === "number" ? body.keepImportance : undefined,
+          maxSessions: typeof body.maxSessions === "number" ? body.maxSessions : undefined,
+          cursor: typeof body.cursor === "string" ? body.cursor : undefined,
+          sessionIds: Array.isArray(body.sessionIds)
+            ? body.sessionIds.filter((id): id is string => typeof id === "string").slice(0, 500)
+            : undefined,
+          project: typeof body.project === "string" ? body.project : undefined,
+        },
+        timeoutMs: ARCHIVE_TRIGGER_TIMEOUT_MS,
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::archive-observations",
+    config: { api_path: "/agentmemory/archive/observations", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::archive-list",
+    async (req: HttpRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const project = asNonEmptyString(req.query_params?.["project"]) ?? undefined;
+      const limit = Number(req.query_params?.["limit"]);
+      const result = await sdk.trigger({
+        function_id: "mem::archive-list",
+        payload: { project, limit: Number.isFinite(limit) ? limit : undefined },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::archive-list",
+    config: { api_path: "/agentmemory/archive/observations", http_method: "GET" },
+  });
+
+  sdk.registerFunction("api::archive-search",
+    async (req: HttpRequest<Record<string, unknown>>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const body = req.body ?? {};
+      const query = asNonEmptyString(body.query) ?? undefined;
+      const sessionId = asNonEmptyString(body.sessionId) ?? undefined;
+      if (!query && !sessionId) {
+        return { status_code: 400, body: { error: "query or sessionId is required" } };
+      }
+      const result = await sdk.trigger({
+        function_id: "mem::archive-search",
+        payload: {
+          query,
+          sessionId,
+          project: asNonEmptyString(body.project) ?? undefined,
+          limit: typeof body.limit === "number" ? body.limit : undefined,
+        },
+        timeoutMs: ARCHIVE_TRIGGER_TIMEOUT_MS,
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::archive-search",
+    config: { api_path: "/agentmemory/archive/search", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::archive-restore",
+    async (req: HttpRequest<Record<string, unknown>>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const sessionId = asNonEmptyString(req.body?.sessionId);
+      if (!sessionId) return { status_code: 400, body: { error: "sessionId is required" } };
+      const result = await sdk.trigger<{ sessionId: string }, { success?: boolean; error?: string }>({
+        function_id: "mem::archive-restore",
+        payload: { sessionId },
+        timeoutMs: ARCHIVE_TRIGGER_TIMEOUT_MS,
+      });
+      return { status_code: result?.error === "archive_not_found" ? 404 : 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::archive-restore",
+    config: { api_path: "/agentmemory/archive/restore", http_method: "POST" },
   });
 
   sdk.registerFunction("api::smart-search",

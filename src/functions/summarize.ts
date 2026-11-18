@@ -2,6 +2,7 @@ import type { IIIClient } from "iii-sdk";
 import { randomUUID } from "node:crypto";
 import type {
   CompressedObservation,
+  ObservationArchive,
   SessionSummary,
   MemoryProvider,
   Session,
@@ -293,13 +294,18 @@ export function registerSummarizeFunction(
       const existing = data.force === true ? null : storedSummary;
       const fingerprint = summaryFingerprint(session, compressed);
       const coveredCount = existing?.observationCount ?? 0;
+      const archivedCount = (await kv.get<ObservationArchive>(KV.observationArchives, sessionId))?.observationCount ?? 0;
       const prefixMatches = existing?.coveredFingerprint && Number.isSafeInteger(coveredCount) &&
-        coveredCount > 0 && coveredCount <= compressed.length &&
+        (coveredCount > 0 || archivedCount > 0) && coveredCount <= compressed.length &&
         summaryFingerprint(session, compressed.slice(0, coveredCount)) === existing.coveredFingerprint;
       if (existing && prefixMatches && coveredCount === compressed.length) {
         return { success: true, unchanged: true, summary: existing };
       }
       const incremental = existing && prefixMatches ? existing : null;
+      if (archivedCount > 0 && !incremental) {
+        logger.warn("Summarize refused: the hot observations are only part of an archived session", { sessionId, archivedCount });
+        return { success: false, error: "observations_archived" };
+      }
       const input = incremental ? compressed.slice(coveredCount) : compressed;
       const coveredThrough = visibleAt(compressed[compressed.length - 1]);
 

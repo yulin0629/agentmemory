@@ -345,6 +345,22 @@ agentmemory --data-dir ~/.agentmemory-projects/main
 agentmemory --instance 1
 ```
 
+### Cold storage for old observations
+
+Every observation in the state store is held in memory by the engine and by the search index. `POST /agentmemory/archive/observations` moves observations that are unlikely to be needed again out of the store into one gzip JSON Lines file per session under `<data dir>/observation-archive/`. Summaries, memories, lessons and the graph stay where they are.
+
+An observation is moved only when all of these hold: it is older than `olderThanDays` (default 60, minimum 7), its importance is below `keepImportance` (default 6), it was never returned by a recall, no memory or graph node or edge cites it, it has no image, and its session has ended and has a summary that covers the session's current observations. The call is a dry run unless the body has `"dryRun": false`. Each call scans at most `maxSessions` sessions (default 50, maximum 500) and returns `nextCursor` while more remain; `sessionIds` and `project` narrow the scan.
+
+```bash
+curl -X POST localhost:3111/agentmemory/archive/observations -d '{"maxSessions": 500}'
+curl -X POST localhost:3111/agentmemory/archive/observations -d '{"dryRun": false, "maxSessions": 500}'
+curl localhost:3111/agentmemory/archive/observations
+curl -X POST localhost:3111/agentmemory/archive/search -d '{"query": "systemd restart"}'
+curl -X POST localhost:3111/agentmemory/archive/restore -d '{"sessionId": "<id>"}'
+```
+
+Archived observations leave keyword and vector search. `archive/search` scans the files instead (every term must appear; `sessionId` alone returns that session's rows), and `archive/restore` puts a whole session back into the store and the search index (its observations are embedded again when an embedding provider is configured). The session summary keeps its text; a later observation in an archived session is merged into it, and a forced full re-summary is refused with `observations_archived` until the session is restored. The files are not part of `export`; back up the `observation-archive` directory together with the state store.
+
 `--instance 1` uses an `instance-1` subdirectory, API port `3211` and viewer port `3213`. See [storage and backups](docs/reliability/state-storage.md) for Redis and backend migration.
 
 Latest release notes: [CHANGELOG.md](CHANGELOG.md).
@@ -1310,7 +1326,7 @@ An opted-in prompt hook waits up to five seconds for an explicit-save acknowledg
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-149 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>`, and mesh sync endpoints require an explicitly set `AGENTMEMORY_SECRET` on both peers. Setting `AGENTMEMORY_MCP_BEARER_TOKEN` additionally enables the standard read-only remote MCP route at `/mcp`; it is deliberately outside the `/agentmemory/*` REST surface. This fork also accepts `AGENTMEMORY_AUTH=none`, which skips the generated secret for a loopback-bound server whose clients arrive over their own authenticated transport; any process that can reach the port can then read and write memory.
+153 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>`, and mesh sync endpoints require an explicitly set `AGENTMEMORY_SECRET` on both peers. Setting `AGENTMEMORY_MCP_BEARER_TOKEN` additionally enables the standard read-only remote MCP route at `/mcp`; it is deliberately outside the `/agentmemory/*` REST surface. This fork also accepts `AGENTMEMORY_AUTH=none`, which skips the generated secret for a loopback-bound server whose clients arrive over their own authenticated transport; any process that can reach the port can then read and write memory.
 
 **Authentication is on by default.** When `AGENTMEMORY_SECRET` is not set (in the shell or in `~/.agentmemory/.env`), the CLI generates a random secret on first start and stores it at `~/.agentmemory/secret`, mirrored to the selected data directory as `secret`, with mode `0600` (the platform-specific default data directory is described above). Bundled clients read the canonical secret first when they talk to a local server: the CLI, the viewer, the hooks under `plugin/scripts`, the MCP server and the `@agentmemory/mcp` shim, the configs written by `agentmemory connect`, and the bundled OpenCode, Pi, OpenClaw, Hermes and filesystem-watcher integrations. The stored secret is only sent to loopback URLs (`localhost`, `127.0.0.0/8`, `::1`). An explicit `AGENTMEMORY_SECRET` always wins, and remote clients need the secret set in their environment. Repository-based Docker self-host deployments and the `deploy/` entrypoints generate and export their own secret. To call the API by hand:
 
