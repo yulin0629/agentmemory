@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: zh-TW
+reviews:
+  profile: chill
+  poem: false
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: false
+  path_filters:
+    - "!dist/**"
+    - "!node_modules/**"
+    - "!docs/**"
+    - "!READMEs/**"
+    - "!**/*.lock"
+    - "!package-lock.json"
+    - "!**/*.md"
+  path_instructions:
+    - path: "**/*"
+      instructions: >-
+        聚焦真實 bug、記憶體成長與洩漏風險、資料持久化一致性、並行競爭條件、安全／去敏邊界與錯誤處理。
+        跳過排版風格、命名偏好與單純要求補 mock 單元測試的建議。
