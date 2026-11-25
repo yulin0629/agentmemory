@@ -15,6 +15,22 @@ interface IndexEntry {
   termCount: number;
   layer: SearchResultLayer;
   timestamp?: string;
+  slot: number;
+}
+
+const INITIAL_TERM_CAPACITY = 1024;
+const INITIAL_POSTING_PAIRS = 4;
+// V8 keeps a 13+ character token as a slice of the text it was split from.
+const SLICED_STRING_MIN_LENGTH = 13;
+
+function grown(array: Uint32Array, minLength: number): Uint32Array {
+  let length = array.length;
+  while (length < minLength) {
+    length = length < 2048 ? length * 2 : (Math.ceil(length * 1.25) + 1) & ~1;
+  }
+  const next = new Uint32Array(length);
+  next.set(array);
+  return next;
 }
 
 const USER_PROMPT_TERM_CAP = 2000;
@@ -27,9 +43,23 @@ export interface SearchIndexRevision {
 }
 
 export class SearchIndex {
+  // Documents and terms are numbered, and postings are [slot, tf] pairs in
+  // typed arrays: one Map entry and one string per posting cost about 125
+  // bytes each, which was 2.6 GB for 21 million postings. A term found in one
+  // document keeps that posting in singleSlot/singleTf and has no array.
   private entries: Map<string, IndexEntry> = new Map();
-  private invertedIndex: Map<string, Set<string>> = new Map();
-  private docTermCounts: Map<string, Map<string, number>> = new Map();
+  private slotEntries: Array<IndexEntry | undefined> = [];
+  private slotTermIds: Array<Uint32Array | undefined> = [];
+  private freeSlots: number[] = [];
+  private termIds: Map<string, number> = new Map();
+  private termNames: Array<string | undefined> = [];
+  private postings: Array<Uint32Array | undefined> = [];
+  private postingCounts: Uint32Array = new Uint32Array(INITIAL_TERM_CAPACITY);
+  private singleSlot: Uint32Array = new Uint32Array(INITIAL_TERM_CAPACITY);
+  private singleTf: Uint32Array = new Uint32Array(INITIAL_TERM_CAPACITY);
+  private freeTermIds: number[] = [];
+  private matchMarks: Uint32Array = new Uint32Array(INITIAL_TERM_CAPACITY);
+  private matchEpoch = 0;
   private totalDocLength = 0;
   private sortedTerms: string[] | null = null;
   private revisionGeneration: object = {};
@@ -50,24 +80,99 @@ export class SearchIndex {
       termCount++;
     }
 
-    this.entries.set(obs.id, {
+    const slot = this.freeSlots.pop() ?? this.slotEntries.length;
+    const entry: IndexEntry = {
       obsId: obs.id,
       sessionId: obs.sessionId,
       termCount,
       layer,
       timestamp: obs.timestamp,
-    });
-    this.docTermCounts.set(obs.id, termFreq);
+      slot,
+    };
+    this.entries.set(obs.id, entry);
+    this.slotEntries[slot] = entry;
     this.totalDocLength += termCount;
 
-    for (const term of termFreq.keys()) {
-      if (!this.invertedIndex.has(term)) {
-        this.invertedIndex.set(term, new Set());
-      }
-      this.invertedIndex.get(term)!.add(obs.id);
+    const termIds = new Uint32Array(termFreq.size);
+    let position = 0;
+    for (const [term, tf] of termFreq) {
+      const termId = this.termIdFor(term);
+      this.appendPosting(termId, slot, tf);
+      termIds[position++] = termId;
     }
+    this.slotTermIds[slot] = termIds;
 
     this.sortedTerms = null;
+  }
+
+  private termIdFor(term: string): number {
+    const known = this.termIds.get(term);
+    if (known !== undefined) return known;
+    const termId = this.freeTermIds.pop() ?? this.termNames.length;
+    if (termId >= this.postingCounts.length) {
+      this.postingCounts = grown(this.postingCounts, termId + 1);
+      this.singleSlot = grown(this.singleSlot, termId + 1);
+      this.singleTf = grown(this.singleTf, termId + 1);
+    }
+    // The copy lets the document text a long token was sliced from be freed.
+    const name = term.length < SLICED_STRING_MIN_LENGTH
+      ? term
+      : Buffer.from(term, "utf16le").toString("utf16le");
+    this.termIds.set(name, termId);
+    this.termNames[termId] = name;
+    this.postings[termId] = undefined;
+    return termId;
+  }
+
+  private appendPosting(termId: number, slot: number, tf: number): void {
+    const count = this.postingCounts[termId];
+    if (count === 0) {
+      this.singleSlot[termId] = slot;
+      this.singleTf[termId] = tf;
+    } else {
+      let pairs = this.postings[termId];
+      if (!pairs) {
+        pairs = new Uint32Array(INITIAL_POSTING_PAIRS * 2);
+        pairs[0] = this.singleSlot[termId];
+        pairs[1] = this.singleTf[termId];
+        this.postings[termId] = pairs;
+      } else if (count * 2 === pairs.length) {
+        pairs = grown(pairs, count * 2 + 2);
+        this.postings[termId] = pairs;
+      }
+      pairs[count * 2] = slot;
+      pairs[count * 2 + 1] = tf;
+    }
+    this.postingCounts[termId] = count + 1;
+  }
+
+  // Keeps the remaining postings in insertion order, as Set.delete did:
+  // equal scores come back in that order.
+  private removePosting(termId: number, slot: number): void {
+    const count = this.postingCounts[termId];
+    const pairs = this.postings[termId];
+    let remaining = count;
+    if (!pairs) {
+      if (count === 1 && this.singleSlot[termId] === slot) remaining = 0;
+    } else {
+      for (let i = 0; i < count; i++) {
+        if (pairs[i * 2] !== slot) continue;
+        pairs.copyWithin(i * 2, i * 2 + 2, count * 2);
+        remaining = count - 1;
+        break;
+      }
+    }
+    this.postingCounts[termId] = remaining;
+    if (remaining > 0) return;
+    this.termIds.delete(this.termNames[termId]!);
+    this.termNames[termId] = undefined;
+    this.postings[termId] = undefined;
+    this.freeTermIds.push(termId);
+  }
+
+  private documentFrequency(term: string): number {
+    const termId = this.termIds.get(term);
+    return termId === undefined ? 0 : this.postingCounts[termId];
   }
 
   watchRevision(id: string): SearchIndexRevision {
@@ -109,7 +214,11 @@ export class SearchIndex {
   invalidateRevision(id: string): void {
     this.invalidateAbsentRevision(id);
     const entry = this.entries.get(id);
-    if (entry) this.entries.set(id, { ...entry });
+    if (entry) {
+      const copy = { ...entry };
+      this.entries.set(id, copy);
+      this.slotEntries[entry.slot] = copy;
+    }
   }
 
   has(id: string): boolean {
@@ -159,19 +268,15 @@ export class SearchIndex {
     const entry = this.entries.get(id);
     if (!entry) return;
 
-    const termFreq = this.docTermCounts.get(id);
-    if (termFreq) {
-      for (const term of termFreq.keys()) {
-        const postingList = this.invertedIndex.get(term);
-        if (postingList) {
-          postingList.delete(id);
-          if (postingList.size === 0) {
-            this.invertedIndex.delete(term);
-          }
-        }
+    const termIds = this.slotTermIds[entry.slot];
+    if (termIds) {
+      for (let i = 0; i < termIds.length; i++) {
+        this.removePosting(termIds[i], entry.slot);
       }
-      this.docTermCounts.delete(id);
     }
+    this.slotTermIds[entry.slot] = undefined;
+    this.slotEntries[entry.slot] = undefined;
+    this.freeSlots.push(entry.slot);
 
     this.totalDocLength = Math.max(0, this.totalDocLength - entry.termCount);
     this.entries.delete(id);
@@ -206,20 +311,33 @@ export class SearchIndex {
       }
     }
 
-    const scores = new Map<string, number>();
+    const scores = new Map<number, number>();
     const sorted = this.getSortedTerms();
+    if (this.matchMarks.length < this.slotEntries.length) {
+      this.matchMarks = new Uint32Array(Math.max(this.slotEntries.length, this.matchMarks.length * 2));
+    }
+    const marks = this.matchMarks;
+    const slotEntries = this.slotEntries;
 
     for (const { term, weight } of this.costBoundedTerms(queryTerms, N)) {
-      const matchingDocs = this.invertedIndex.get(term);
-      if (matchingDocs) {
-        const df = matchingDocs.size;
+      const termId = this.termIds.get(term);
+      let exactMatch = 0;
+      if (termId !== undefined) {
+        if (this.matchEpoch === 0xffffffff) {
+          marks.fill(0);
+          this.matchEpoch = 0;
+        }
+        exactMatch = ++this.matchEpoch;
+        const df = this.postingCounts[termId];
         const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);
+        const pairs = this.postings[termId];
 
-        for (const obsId of matchingDocs) {
-          const entry = this.entries.get(obsId)!;
-          if (!matchesSearchLayer(obsId, entry.sessionId, targetLayer, entry.layer)) continue;
-          const docTerms = this.docTermCounts.get(obsId);
-          const tf = docTerms?.get(term) || 0;
+        for (let i = 0; i < df; i++) {
+          const slot = pairs ? pairs[i * 2] : this.singleSlot[termId];
+          marks[slot] = exactMatch;
+          const entry = slotEntries[slot]!;
+          if (!matchesSearchLayer(entry.obsId, entry.sessionId, targetLayer, entry.layer)) continue;
+          const tf = pairs ? pairs[i * 2 + 1] : this.singleTf[termId];
           const docLen = entry.termCount;
 
           const numerator = tf * (this.k1 + 1);
@@ -227,11 +345,11 @@ export class SearchIndex {
             tf + this.k1 * (1 - this.b + this.b * (docLen / avgDocLen));
           const bm25Score = idf * (numerator / denominator) * weight;
 
-          scores.set(obsId, (scores.get(obsId) || 0) + bm25Score);
+          scores.set(slot, (scores.get(slot) || 0) + bm25Score);
         }
       }
 
-      const prefixScores = new Map<string, number>();
+      const prefixScores = new Map<number, number>();
       const expandPrefix = hasCjk(term) || Array.from(term).length >= MIN_PREFIX_TERM_LENGTH;
       const startIdx = expandPrefix ? this.lowerBound(sorted, term) : sorted.length;
       for (let si = startIdx; si < sorted.length; si++) {
@@ -239,34 +357,35 @@ export class SearchIndex {
         if (!indexTerm.startsWith(term)) break;
         if (indexTerm === term) continue;
 
-        const obsIds = this.invertedIndex.get(indexTerm)!;
-        const prefixDf = obsIds.size;
+        const prefixTermId = this.termIds.get(indexTerm)!;
+        const prefixDf = this.postingCounts[prefixTermId];
         const prefixIdf =
           Math.log((N - prefixDf + 0.5) / (prefixDf + 0.5) + 1) * 0.5;
-        for (const obsId of obsIds) {
-          if (matchingDocs?.has(obsId)) continue;
-          const entry = this.entries.get(obsId)!;
-          if (!matchesSearchLayer(obsId, entry.sessionId, targetLayer, entry.layer)) continue;
-          const docTerms = this.docTermCounts.get(obsId);
-          const tf = docTerms?.get(indexTerm) || 0;
+        const pairs = this.postings[prefixTermId];
+        for (let i = 0; i < prefixDf; i++) {
+          const slot = pairs ? pairs[i * 2] : this.singleSlot[prefixTermId];
+          if (exactMatch !== 0 && marks[slot] === exactMatch) continue;
+          const entry = slotEntries[slot]!;
+          if (!matchesSearchLayer(entry.obsId, entry.sessionId, targetLayer, entry.layer)) continue;
+          const tf = pairs ? pairs[i * 2 + 1] : this.singleTf[prefixTermId];
           const docLen = entry.termCount;
           const numerator = tf * (this.k1 + 1);
           const denominator =
             tf + this.k1 * (1 - this.b + this.b * (docLen / avgDocLen));
           const score = prefixIdf * (numerator / denominator) * weight;
-          prefixScores.set(obsId, Math.max(prefixScores.get(obsId) ?? 0, score));
+          prefixScores.set(slot, Math.max(prefixScores.get(slot) ?? 0, score));
         }
       }
-      for (const [obsId, score] of prefixScores) {
-        scores.set(obsId, (scores.get(obsId) ?? 0) + score);
+      for (const [slot, score] of prefixScores) {
+        scores.set(slot, (scores.get(slot) ?? 0) + score);
       }
     }
 
     return Array.from(scores.entries())
-      .filter(([obsId]) => (filter ? filter(obsId) : true))
-      .map(([obsId, score]) => {
-        const entry = this.entries.get(obsId)!;
-        return { obsId, sessionId: entry.sessionId, score };
+      .filter(([slot]) => (filter ? filter(slotEntries[slot]!.obsId) : true))
+      .map(([slot, score]) => {
+        const entry = slotEntries[slot]!;
+        return { obsId: entry.obsId, sessionId: entry.sessionId, score };
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
@@ -281,7 +400,7 @@ export class SearchIndex {
     queryTerms: Array<{ term: string; weight: number }>,
     docCount: number,
   ): Array<{ term: string; weight: number }> {
-    const ranked = queryTerms.map((q, order) => ({ ...q, order, df: this.invertedIndex.get(q.term)?.size ?? 0 }));
+    const ranked = queryTerms.map((q, order) => ({ ...q, order, df: this.documentFrequency(q.term) }));
     const informative = docCount >= COMMON_TERM_MIN_DOCS
       ? ranked.filter((q) => q.df <= docCount * COMMON_TERM_DOC_RATIO)
       : ranked;
@@ -301,8 +420,16 @@ export class SearchIndex {
     this.revisionGeneration = {};
     this.absentRevisions.clear();
     this.entries.clear();
-    this.invertedIndex.clear();
-    this.docTermCounts.clear();
+    this.slotEntries = [];
+    this.slotTermIds = [];
+    this.freeSlots = [];
+    this.termIds.clear();
+    this.termNames = [];
+    this.postings = [];
+    this.postingCounts = new Uint32Array(INITIAL_TERM_CAPACITY);
+    this.singleSlot = new Uint32Array(INITIAL_TERM_CAPACITY);
+    this.singleTf = new Uint32Array(INITIAL_TERM_CAPACITY);
+    this.freeTermIds = [];
     this.totalDocLength = 0;
     this.sortedTerms = null;
   }
@@ -310,34 +437,58 @@ export class SearchIndex {
   restoreFrom(other: SearchIndex): void {
     this.revisionGeneration = {};
     this.absentRevisions.clear();
-    this.entries = new Map(
-      Array.from(other.entries.entries()).map(([k, v]) => [k, { ...v }]),
-    );
-    this.invertedIndex = new Map(
-      Array.from(other.invertedIndex.entries()).map(([k, v]) => [
-        k,
-        new Set(v),
-      ]),
-    );
-    this.docTermCounts = new Map(
-      Array.from(other.docTermCounts.entries()).map(([k, v]) => [
-        k,
-        new Map(v),
-      ]),
-    );
+    this.entries = new Map();
+    this.slotEntries = new Array(other.slotEntries.length);
+    for (const [id, entry] of other.entries) {
+      const copy = { ...entry };
+      this.entries.set(id, copy);
+      this.slotEntries[copy.slot] = copy;
+    }
+    this.slotTermIds = other.slotTermIds.map((ids) => ids?.slice());
+    this.freeSlots = other.freeSlots.slice();
+    this.termIds = new Map(other.termIds);
+    this.termNames = other.termNames.slice();
+    this.postings = other.postings.map((pairs) => pairs?.slice());
+    this.postingCounts = other.postingCounts.slice();
+    this.singleSlot = other.singleSlot.slice();
+    this.singleTf = other.singleTf.slice();
+    this.freeTermIds = other.freeTermIds.slice();
     this.totalDocLength = other.totalDocLength;
     this.sortedTerms = null;
   }
 
   serialize(): string {
-    const entries = Array.from(this.entries.entries());
-    const inverted = Array.from(this.invertedIndex.entries()).map(
-      ([term, ids]) => [term, Array.from(ids)] as [string, string[]],
+    const entries = Array.from(
+      this.entries,
+      ([id, { slot: _slot, ...entry }]) => [id, entry] as const,
     );
-    const docTerms = Array.from(this.docTermCounts.entries()).map(
-      ([id, counts]) =>
-        [id, Array.from(counts.entries())] as [string, [string, number][]],
-    );
+    const tfBySlot = new Map<number, Map<number, number>>();
+    const inverted: [string, string[]][] = [];
+    for (const [term, termId] of this.termIds) {
+      const count = this.postingCounts[termId];
+      const pairs = this.postings[termId];
+      const ids: string[] = [];
+      for (let i = 0; i < count; i++) {
+        const slot = pairs ? pairs[i * 2] : this.singleSlot[termId];
+        const tf = pairs ? pairs[i * 2 + 1] : this.singleTf[termId];
+        ids.push(this.slotEntries[slot]!.obsId);
+        let counts = tfBySlot.get(slot);
+        if (!counts) {
+          counts = new Map();
+          tfBySlot.set(slot, counts);
+        }
+        counts.set(termId, tf);
+      }
+      inverted.push([term, ids]);
+    }
+    const docTerms = Array.from(this.entries.values(), (entry) => {
+      const counts = tfBySlot.get(entry.slot);
+      const terms = Array.from(
+        this.slotTermIds[entry.slot] ?? [],
+        (termId) => [this.termNames[termId]!, counts?.get(termId) ?? 0] as [string, number],
+      );
+      return [entry.obsId, terms] as [string, [string, number][]];
+    });
     return JSON.stringify({
       v: 3,
       entries,
@@ -353,16 +504,34 @@ export class SearchIndex {
       const data = JSON.parse(json);
       if (!data?.entries || !data?.inverted || !data?.docTerms) return idx;
       for (const [key, val] of data.entries) {
-        idx.entries.set(key, {
+        const entry: IndexEntry = {
           ...val,
           layer: isSearchResultLayer(val.layer) ? val.layer : getSearchResultLayer(key, val.sessionId),
-        });
+          slot: idx.slotEntries.length,
+        };
+        idx.entries.set(key, entry);
+        idx.slotEntries.push(entry);
+      }
+      const termCounts = new Map<string, Map<string, number>>();
+      for (const [id, counts] of data.docTerms) {
+        termCounts.set(id, new Map(counts));
       }
       for (const [term, ids] of data.inverted) {
-        idx.invertedIndex.set(term, new Set(ids));
+        for (const id of new Set<string>(ids)) {
+          const entry = idx.entries.get(id);
+          if (!entry) continue;
+          idx.appendPosting(idx.termIdFor(term), entry.slot, termCounts.get(id)?.get(term) || 0);
+        }
       }
-      for (const [id, counts] of data.docTerms) {
-        idx.docTermCounts.set(id, new Map(counts));
+      for (const [id, counts] of termCounts) {
+        const entry = idx.entries.get(id);
+        if (!entry) continue;
+        const termIds: number[] = [];
+        for (const term of counts.keys()) {
+          const termId = idx.termIds.get(term);
+          if (termId !== undefined) termIds.push(termId);
+        }
+        idx.slotTermIds[entry.slot] = Uint32Array.from(termIds);
       }
       const rawLen = Number(data.totalDocLength);
       idx.totalDocLength =
@@ -418,7 +587,7 @@ export class SearchIndex {
 
   private getSortedTerms(): string[] {
     if (!this.sortedTerms) {
-      this.sortedTerms = Array.from(this.invertedIndex.keys()).sort();
+      this.sortedTerms = Array.from(this.termIds.keys()).sort();
     }
     return this.sortedTerms;
   }
