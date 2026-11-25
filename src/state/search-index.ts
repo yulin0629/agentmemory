@@ -51,6 +51,8 @@ export class SearchIndex {
   private slotEntries: Array<IndexEntry | undefined> = [];
   private slotTermIds: Array<Uint32Array | undefined> = [];
   private freeSlots: number[] = [];
+  private slotSequences: number[] = [];
+  private nextSequence = 0;
   private termIds: Map<string, number> = new Map();
   private termNames: Array<string | undefined> = [];
   private postings: Array<Uint32Array | undefined> = [];
@@ -91,6 +93,7 @@ export class SearchIndex {
     };
     this.entries.set(obs.id, entry);
     this.slotEntries[slot] = entry;
+    this.slotSequences[slot] = this.nextSequence++;
     this.totalDocLength += termCount;
 
     const termIds = new Uint32Array(termFreq.size);
@@ -115,9 +118,11 @@ export class SearchIndex {
       this.singleTf = grown(this.singleTf, termId + 1);
     }
     // The copy lets the document text a long token was sliced from be freed.
-    const name = term.length < SLICED_STRING_MIN_LENGTH
-      ? term
-      : Buffer.from(term, "utf16le").toString("utf16le");
+    let name = term;
+    if (term.length >= SLICED_STRING_MIN_LENGTH) {
+      name = Buffer.from(term, "latin1").toString("latin1");
+      if (name !== term) name = Buffer.from(term, "utf16le").toString("utf16le");
+    }
     this.termIds.set(name, termId);
     this.termNames[termId] = name;
     this.postings[termId] = undefined;
@@ -150,16 +155,19 @@ export class SearchIndex {
   // equal scores come back in that order.
   private removePosting(termId: number, slot: number): void {
     const count = this.postingCounts[termId];
+    if (count === 0) return;
     const pairs = this.postings[termId];
     let remaining = count;
     if (!pairs) {
-      if (count === 1 && this.singleSlot[termId] === slot) remaining = 0;
+      if (this.singleSlot[termId] === slot) remaining = 0;
     } else {
-      for (let i = 0; i < count; i++) {
-        if (pairs[i * 2] !== slot) continue;
-        pairs.copyWithin(i * 2, i * 2 + 2, count * 2);
+      const at = this.postingPosition(pairs, count, slot);
+      if (at >= 0) {
+        pairs.copyWithin(at * 2, at * 2 + 2, count * 2);
         remaining = count - 1;
-        break;
+        if (remaining * 8 <= pairs.length && pairs.length > INITIAL_POSTING_PAIRS * 2) {
+          this.postings[termId] = pairs.slice(0, Math.max(INITIAL_POSTING_PAIRS * 2, remaining * 4));
+        }
       }
     }
     this.postingCounts[termId] = remaining;
@@ -168,6 +176,27 @@ export class SearchIndex {
     this.termNames[termId] = undefined;
     this.postings[termId] = undefined;
     this.freeTermIds.push(termId);
+  }
+
+  // Postings are appended in the order documents were added, so a slot is
+  // found by its add sequence; a loaded snapshot may list them in another
+  // order, which the scan covers.
+  private postingPosition(pairs: Uint32Array, count: number, slot: number): number {
+    const sequences = this.slotSequences;
+    const target = sequences[slot];
+    let low = 0;
+    let high = count - 1;
+    while (low <= high) {
+      const mid = (low + high) >>> 1;
+      const midSlot = pairs[mid * 2];
+      if (midSlot === slot) return mid;
+      if (sequences[midSlot] < target) low = mid + 1;
+      else high = mid - 1;
+    }
+    for (let i = 0; i < count; i++) {
+      if (pairs[i * 2] === slot) return i;
+    }
+    return -1;
   }
 
   private documentFrequency(term: string): number {
@@ -381,12 +410,11 @@ export class SearchIndex {
       }
     }
 
-    return Array.from(scores.entries())
-      .filter(([slot]) => (filter ? filter(slotEntries[slot]!.obsId) : true))
-      .map(([slot, score]) => {
-        const entry = slotEntries[slot]!;
-        return { obsId: entry.obsId, sessionId: entry.sessionId, score };
-      })
+    return Array.from(scores, ([slot, score]) => {
+      const entry = slotEntries[slot]!;
+      return { obsId: entry.obsId, sessionId: entry.sessionId, score };
+    })
+      .filter((hit) => (filter ? filter(hit.obsId) : true))
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
   }
@@ -423,6 +451,8 @@ export class SearchIndex {
     this.slotEntries = [];
     this.slotTermIds = [];
     this.freeSlots = [];
+    this.slotSequences = [];
+    this.nextSequence = 0;
     this.termIds.clear();
     this.termNames = [];
     this.postings = [];
@@ -430,6 +460,8 @@ export class SearchIndex {
     this.singleSlot = new Uint32Array(INITIAL_TERM_CAPACITY);
     this.singleTf = new Uint32Array(INITIAL_TERM_CAPACITY);
     this.freeTermIds = [];
+    this.matchMarks = new Uint32Array(INITIAL_TERM_CAPACITY);
+    this.matchEpoch = 0;
     this.totalDocLength = 0;
     this.sortedTerms = null;
   }
@@ -437,6 +469,7 @@ export class SearchIndex {
   restoreFrom(other: SearchIndex): void {
     this.revisionGeneration = {};
     this.absentRevisions.clear();
+    if (other === this) return;
     this.entries = new Map();
     this.slotEntries = new Array(other.slotEntries.length);
     for (const [id, entry] of other.entries) {
@@ -446,6 +479,8 @@ export class SearchIndex {
     }
     this.slotTermIds = other.slotTermIds.map((ids) => ids?.slice());
     this.freeSlots = other.freeSlots.slice();
+    this.slotSequences = other.slotSequences.slice();
+    this.nextSequence = other.nextSequence;
     this.termIds = new Map(other.termIds);
     this.termNames = other.termNames.slice();
     this.postings = other.postings.map((pairs) => pairs?.slice());
@@ -511,16 +546,24 @@ export class SearchIndex {
         };
         idx.entries.set(key, entry);
         idx.slotEntries.push(entry);
+        idx.slotSequences.push(idx.nextSequence++);
       }
       const termCounts = new Map<string, Map<string, number>>();
       for (const [id, counts] of data.docTerms) {
         termCounts.set(id, new Map(counts));
       }
+      const posted = new Map<string, Set<string>>();
       for (const [term, ids] of data.inverted) {
-        for (const id of new Set<string>(ids)) {
+        posted.set(term, new Set<string>(ids));
+      }
+      // A posting is kept only when both halves of the snapshot list it, so
+      // every posting can be found again when its document is removed.
+      for (const [term, ids] of posted) {
+        for (const id of ids) {
           const entry = idx.entries.get(id);
-          if (!entry) continue;
-          idx.appendPosting(idx.termIdFor(term), entry.slot, termCounts.get(id)?.get(term) || 0);
+          const tf = termCounts.get(id)?.get(term);
+          if (!entry || tf === undefined) continue;
+          idx.appendPosting(idx.termIdFor(term), entry.slot, tf);
         }
       }
       for (const [id, counts] of termCounts) {
@@ -528,8 +571,7 @@ export class SearchIndex {
         if (!entry) continue;
         const termIds: number[] = [];
         for (const term of counts.keys()) {
-          const termId = idx.termIds.get(term);
-          if (termId !== undefined) termIds.push(termId);
+          if (posted.get(term)?.has(id)) termIds.push(idx.termIds.get(term)!);
         }
         idx.slotTermIds[entry.slot] = Uint32Array.from(termIds);
       }

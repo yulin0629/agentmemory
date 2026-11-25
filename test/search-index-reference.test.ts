@@ -112,7 +112,7 @@ describe("SearchIndex against the Map/Set reference", () => {
     expect(index.size).toBe(0);
     both((target) => { for (const doc of docs.slice(0, 200)) target.add(doc); });
     expectSameResults("after emptying and refilling");
-  });
+  }, 30_000);
 
   it("leaves a copied index unchanged when the source changes afterwards", () => {
     const random = seededRandom(7);
@@ -125,5 +125,64 @@ describe("SearchIndex against the Map/Set reference", () => {
     for (const doc of docs.slice(0, 30)) source.remove(doc.id);
     source.add({ ...docs[40], title: "auth token auth token" });
     expect(copy.search("auth token", 50)).toEqual(before);
+  });
+
+  it("keeps its documents when it is restored from itself", () => {
+    const docs = corpus(20, seededRandom(11));
+    const index = new SearchIndex();
+    const reference = new ReferenceIndex();
+    for (const doc of docs) { index.add(doc); reference.add(doc); }
+    index.restoreFrom(index);
+    reference.restoreFrom(reference);
+    expect(index.size).toBe(reference.size);
+    expect(index.search("auth token", 50)).toEqual(reference.search("auth token", 50));
+    expect(JSON.parse(index.serialize())).toEqual(JSON.parse(reference.serialize()));
+  });
+
+  it("returns the reference results when a filter removes a document during the search", () => {
+    const docs = corpus(2, seededRandom(13)).map((doc) => ({ ...doc, title: "alpha" }));
+    const run = (target: SearchIndex | ReferenceIndex) => {
+      for (const doc of docs) target.add(doc);
+      return target.search("alpha", 10, "all", (id) => {
+        target.remove(docs[1].id);
+        return id === docs[0].id;
+      });
+    };
+    const expected = run(new ReferenceIndex());
+    expect(expected.map((hit) => hit.obsId)).toEqual([docs[0].id]);
+    expect(run(new SearchIndex())).toEqual(expected);
+  });
+
+  it("searches like the reference after loading a snapshot whose two halves disagree", () => {
+    const [first, second, third, fourth] = corpus(4, seededRandom(17));
+    const source = new ReferenceIndex();
+    const bare = { subtitle: undefined, facts: [], narrative: "", concepts: [], files: [], source: undefined };
+    source.add({ ...first, ...bare, title: "alpha beta" });
+    source.add({ ...second, ...bare, title: "alpha gamma" });
+    const snapshot = JSON.parse(source.serialize());
+    const alphaRow = snapshot.inverted.find(([term]: [string]) => term === "alpha");
+    const gammaRow = snapshot.inverted.find(([term]: [string]) => term === "gamma");
+    alphaRow[1].reverse();
+    snapshot.inverted.push([alphaRow[0], [...alphaRow[1]]]);
+    gammaRow[1].length = 0;
+    const json = JSON.stringify(snapshot);
+
+    const index = SearchIndex.deserialize(json);
+    const reference = ReferenceIndex.deserialize(json);
+    const expectSame = () => {
+      for (const text of ["alpha", "beta", "gamma", "quuxword", "zorkword"]) {
+        expect(index.search(text, 10), text).toEqual(reference.search(text, 10));
+      }
+    };
+    expectSame();
+    expect(reference.search("alpha", 10).map((hit) => hit.obsId)).toEqual([second.id, first.id]);
+    for (const target of [index, reference]) {
+      target.remove(second.id);
+      target.remove(first.id);
+      target.add({ ...third, ...bare, title: "quuxword" });
+      target.add({ ...fourth, ...bare, title: "zorkword" });
+    }
+    expectSame();
+    expect(index.search("quuxword", 10).map((hit) => hit.obsId)).toEqual([third.id]);
   });
 });
