@@ -46,6 +46,7 @@ type VectorMeta = {
   savedAt: string;
   count: number;
   backfillSince?: string | null;
+  space?: string;
 };
 
 type PersistedVector = {
@@ -82,6 +83,7 @@ type IndexPersistenceOptions = {
   bucketSize?: number;
   now?: () => number;
   requireRecoveryPlan?: boolean;
+  vectorSpace?: string;
 };
 
 export interface IndexLegStatus {
@@ -118,6 +120,8 @@ export interface VectorLoadResult {
   savedAt: string | null;
   expectedCount?: number;
   backfillSince?: string | null;
+  // The embedding provider's vectorSpace when the vectors were saved.
+  vectorSpace?: string;
 }
 
 export function vectorBucketScope(bucket: number): string {
@@ -215,6 +219,7 @@ export class IndexPersistence {
   private readonly saveIntervalMs: number;
   private readonly bucketSize: number;
   private readonly now: () => number;
+  private readonly vectorSpace: string | undefined;
   private bucketOfId: Map<string, number> = new Map();
   private bucketCounts: Map<number, number> = new Map();
   private highestBucket = 0;
@@ -244,6 +249,7 @@ export class IndexPersistence {
     this.recoveryReady = !options.requireRecoveryPlan || !vector;
     this.vector?.setChangeListener((id, entry) => this.logChange(id, entry));
     this.now = options.now ?? Date.now;
+    this.vectorSpace = options.vectorSpace;
     const interval = options.saveIntervalMs;
     this.saveIntervalMs =
       typeof interval === "number" && Number.isFinite(interval) && interval > 0
@@ -296,7 +302,9 @@ export class IndexPersistence {
     };
   }
 
-  async replayPendingLog(expectedDimensions = 0): Promise<PendingReplayResult> {
+  // discardVectors: the logged vectors come from another model; only the
+  // removals are replayed, and the skipped records are embedded again.
+  async replayPendingLog(expectedDimensions = 0, discardVectors = false): Promise<PendingReplayResult> {
     const result: PendingReplayResult = { entries: 0, added: 0, removed: 0, cleared: false, skipped: 0 };
     const vector = this.vector;
     if (!vector || this.recoveryError) return result;
@@ -329,6 +337,10 @@ export class IndexPersistence {
             vector.remove(id);
             result.removed++;
           }
+          continue;
+        }
+        if (discardVectors) {
+          result.skipped++;
           continue;
         }
         let embedding: Float32Array;
@@ -602,7 +614,10 @@ export class IndexPersistence {
           ...this.vectorCountShortfall,
         });
       }
-      return { vector: loaded, state: "buckets", savedAt: meta.savedAt ?? null, expectedCount, backfillSince: meta.backfillSince };
+      return {
+        vector: loaded, state: "buckets", savedAt: meta.savedAt ?? null, expectedCount, backfillSince: meta.backfillSince,
+        vectorSpace: typeof meta.space === "string" ? meta.space : undefined,
+      };
     }
 
     return this.migrateLegacy();
@@ -743,6 +758,7 @@ export class IndexPersistence {
         savedAt: new Date(this.now()).toISOString(),
         count: vector.size,
         ...(backfillSince !== undefined ? { backfillSince } : {}),
+        ...(this.vectorSpace ? { space: this.vectorSpace } : {}),
       });
       this.checkpointBackfillSince = backfillSince;
     } catch (err) {

@@ -236,6 +236,14 @@ describe("withDimensionGuard", () => {
     );
   });
 
+  it("guards embedQuery when the provider has one", async () => {
+    const provider = fakeProvider({ dimensions: 4, embed: () => new Float32Array([1, 2, 3, 4]) });
+    provider.embedQuery = async () => new Float32Array([1, 2]);
+    await expect(withDimensionGuard(provider).embedQuery!("x")).rejects.toThrow(
+      /dimension mismatch in fake\.embedQuery: expected 4, got 2/,
+    );
+  });
+
   it("guards embedImage when present and omits it when absent", async () => {
     const withImage = withDimensionGuard(
       fakeProvider({

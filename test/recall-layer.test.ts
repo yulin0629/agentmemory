@@ -331,3 +331,30 @@ it.each(["mem::search", "mem::smart-search"])("does not traverse a foreign proje
   const result = await f.call(handler, { query: "Cobalt", project: "own", agentId: "own-agent", cwd: "/own" });
   expect(result.results).toEqual([]);
 });
+
+it("ranks saved memories by the query embedding when the provider tells queries from records", async () => {
+  const saved = (id: string, title: string): Memory => ({
+    id, createdAt: timestamp, updatedAt: timestamp, type: "fact", title, content: title,
+    concepts: [], files: [], sessionIds: [], strength: 7, version: 1, isLatest: true,
+  });
+  const index = getSearchIndex();
+  index.clear();
+  const vector = new VectorIndex();
+  for (const [id, title, embedding] of [["mem_as_record", "alpha note", [1, 0]], ["mem_as_query", "beta note", [0, 1]]] as const) {
+    index.add(memoryToObservation(saved(id, title)), "memory");
+    vector.add(id, "memory", new Float32Array(embedding));
+  }
+  setVectorIndex(vector);
+  setEmbeddingProvider({
+    name: "test", dimensions: 2, embedBatch: vi.fn(),
+    embed: async () => new Float32Array([1, 0]),
+    embedQuery: async () => new Float32Array([0, 1]),
+  });
+  try {
+    expect((await rankMemoryIds("unrelated words", 1)).ids).toEqual(["mem_as_query"]);
+  } finally {
+    index.clear();
+    setVectorIndex(null);
+    setEmbeddingProvider(null);
+  }
+});

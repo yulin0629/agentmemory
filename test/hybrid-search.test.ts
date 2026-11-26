@@ -119,6 +119,26 @@ describe("HybridSearch", () => {
     expect(results[0].observation.id).toBe("obs_target");
   });
 
+  it("embeds the question as a query when the provider tells queries from records", async () => {
+    const asRecord = makeObs({ id: "obs_as_record", sessionId: "ses_a", title: "alpha note", narrative: "alpha", facts: [], concepts: [], files: [] });
+    const asQuery = makeObs({ id: "obs_as_query", sessionId: "ses_b", title: "beta note", narrative: "beta", facts: [], concepts: [], files: [] });
+    const vector = new VectorIndex();
+    for (const obs of [asRecord, asQuery]) {
+      bm25.add(obs);
+      await kv.set(KV.observations(obs.sessionId), obs.id, obs);
+    }
+    vector.add(asRecord.id, asRecord.sessionId, new Float32Array([1, 0]));
+    vector.add(asQuery.id, asQuery.sessionId, new Float32Array([0, 1]));
+    const provider = {
+      name: "test", dimensions: 2, embedBatch: vi.fn(),
+      embed: async () => new Float32Array([1, 0]),
+      embedQuery: async () => new Float32Array([0, 1]),
+    };
+    const hybrid = new HybridSearch(bm25, vector, provider, kv as never, 0.4, 0.6, 0, false);
+    const results = await hybrid.search("unrelated words", 2);
+    expect(results[0].observation.id).toBe("obs_as_query");
+  });
+
   it("returns a valid lower-ranked record when stale index entries fill the first enrichment pass", async () => {
     for (let i = 0; i < 25; i++) {
       bm25.add(makeObs({ id: `obs_stale_${i}`, sessionId: `ses_stale_${i}`, title: "nebula nebula nebula", narrative: "nebula nebula nebula", facts: [], concepts: [], files: [] }));

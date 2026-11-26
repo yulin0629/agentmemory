@@ -7,19 +7,32 @@ const BATCH_LIMIT = 100;
 const MAX_RETRIES = 4;
 const BASE_RETRY_MS = 1000;
 const MAX_RETRY_MS = 8000;
-const MODEL = "models/gemini-embedding-001";
-const API_BASE = `https://generativelanguage.googleapis.com/v1beta/${MODEL}:batchEmbedContents`;
+const DEFAULT_MODEL = "gemini-embedding-001";
+const API_ROOT = "https://generativelanguage.googleapis.com/v1beta";
+// gemini-embedding-2 has no task type field: the text itself says whether it
+// is a stored record or a search query. gemini-embedding-001 gets the text
+// as it is, which is how every index written before the model could be chosen
+// was embedded.
+const DOCUMENT_PREFIX = "title: none | text: ";
+const QUERY_PREFIX = "task: search result | query: ";
 
 export class GeminiEmbeddingProvider implements EmbeddingProvider {
   readonly name = "gemini";
   readonly dimensions = 768;
+  readonly vectorSpace?: string;
   private apiKey: string;
   private fallbackKey: string;
+  private model: string;
+  private prefixed: boolean;
 
   constructor(apiKey?: string) {
     this.apiKey = apiKey || getEnvVar("GEMINI_API_KEY") || "";
     this.fallbackKey = getEnvVar("GEMINI_API_KEY_FALLBACK") || "";
     if (!this.apiKey) throw new Error("GEMINI_API_KEY is required");
+    const model = (getEnvVar("GEMINI_EMBEDDING_MODEL") || "").trim() || DEFAULT_MODEL;
+    this.model = `models/${model}`;
+    this.prefixed = model.startsWith("gemini-embedding-2");
+    if (model !== DEFAULT_MODEL) this.vectorSpace = model;
   }
 
   async embed(text: string): Promise<Float32Array> {
@@ -27,13 +40,22 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
     return result;
   }
 
+  async embedQuery(text: string): Promise<Float32Array> {
+    const [result] = await this.request([this.prefixed ? QUERY_PREFIX + text : text]);
+    return result;
+  }
+
+  embedBatch(texts: string[]): Promise<Float32Array[]> {
+    return this.request(this.prefixed ? texts.map((t) => DOCUMENT_PREFIX + t) : texts);
+  }
+
   private async postChunk(chunk: string[], key: string): Promise<Response> {
-    return fetchWithTimeout(`${API_BASE}?key=${key}`, {
+    return fetchWithTimeout(`${API_ROOT}/${this.model}:batchEmbedContents?key=${key}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         requests: chunk.map((t) => ({
-          model: MODEL,
+          model: this.model,
           content: { parts: [{ text: t }] },
           outputDimensionality: this.dimensions,
         })),
@@ -41,7 +63,7 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
     });
   }
 
-  async embedBatch(texts: string[]): Promise<Float32Array[]> {
+  private async request(texts: string[]): Promise<Float32Array[]> {
     const results: Float32Array[] = [];
 
     for (let i = 0; i < texts.length; i += BATCH_LIMIT) {
@@ -101,7 +123,7 @@ function l2Normalize(vec: Float32Array): Float32Array {
     if (!zeroNormWarned) {
       zeroNormWarned = true;
       process.stderr.write(
-        `[agentmemory] warn: gemini-embedding-001 returned a zero-norm ` +
+        `[agentmemory] warn: the Gemini embedding model returned a zero-norm ` +
           `embedding (length=${vec.length}); leaving it un-normalized. ` +
           `Subsequent zero-norm vectors will not be reported.\n`,
       );

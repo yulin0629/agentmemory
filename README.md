@@ -898,7 +898,7 @@ The normal npm install includes the optional `@huggingface/transformers` runtime
 | Provider | Model | Cost | Notes |
 |---|---|---|---|
 | **Local (recommended opt-in)** | `all-MiniLM-L6-v2` | Free | On-device after the first model download |
-| Gemini | `gemini-embedding-001` | Free tier | 100+ languages, 768/1536/3072 dims (MRL), 2048-token input. Replaces `text-embedding-004` ([deprecated, shutdown Jan 14, 2026](https://ai.google.dev/gemini-api/docs/deprecations)) |
+| Gemini | `gemini-embedding-001` | Free tier | 100+ languages, 768/1536/3072 dims (MRL), 2048-token input. Replaces `text-embedding-004` ([deprecated, shutdown Jan 14, 2026](https://ai.google.dev/gemini-api/docs/deprecations)) `GEMINI_EMBEDDING_MODEL=gemini-embedding-2` selects the newer, paid model at the same 768 dims; after a model change the server asks for `AGENTMEMORY_DROP_STALE_INDEX=true` and `AGENTMEMORY_VECTOR_BACKFILL=all` so that every stored record is embedded again |
 | OpenAI | `text-embedding-3-small` | [Provider pricing](https://openai.com/api/pricing/) | Remote embeddings |
 | Voyage AI | `voyage-code-3` | Paid | Optimized for code |
 | Cohere | `embed-english-v3.0` | Free trial | General purpose |
