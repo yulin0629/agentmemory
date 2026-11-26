@@ -100,6 +100,25 @@ describe("HybridSearch", () => {
     expect(results.map((r) => r.observation.id)).toEqual(["obs_both"]);
   });
 
+  it("ranks the closest vector match first when keyword search matches only a passing word of the question", async () => {
+    // A question in Chinese about a record written in English: the two share no word.
+    const target = makeObs({ id: "obs_target", sessionId: "ses_t", title: "Rotate the deploy credential", narrative: "Replaced the expired credential used by the deploy job", facts: [], concepts: [], files: [] });
+    const closeness = [0.8, 0.7, 0.6];
+    const passing = closeness.map((_, i) =>
+      makeObs({ id: `obs_passing_${i}`, sessionId: `ses_p${i}`, title: `kvrocks note ${i}`, narrative: `kvrocks backup schedule ${i}`, facts: [], concepts: [], files: [] }));
+    const vector = new VectorIndex();
+    for (const obs of [target, ...passing]) {
+      bm25.add(obs);
+      await kv.set(KV.observations(obs.sessionId), obs.id, obs);
+    }
+    vector.add(target.id, target.sessionId, new Float32Array([1, 0]));
+    closeness.forEach((x, i) => vector.add(passing[i].id, passing[i].sessionId, new Float32Array([x, Math.sqrt(1 - x * x)])));
+    const provider = { name: "test", dimensions: 2, embed: vi.fn(async () => new Float32Array([1, 0])), embedBatch: vi.fn() };
+    const hybrid = new HybridSearch(bm25, vector, provider, kv as never, 0.4, 0.6, 0, false);
+    const results = await hybrid.search("部署用的憑證過期了要怎麼更換 kvrocks", 4);
+    expect(results[0].observation.id).toBe("obs_target");
+  });
+
   it("returns a valid lower-ranked record when stale index entries fill the first enrichment pass", async () => {
     for (let i = 0; i < 25; i++) {
       bm25.add(makeObs({ id: `obs_stale_${i}`, sessionId: `ses_stale_${i}`, title: "nebula nebula nebula", narrative: "nebula nebula nebula", facts: [], concepts: [], files: [] }));

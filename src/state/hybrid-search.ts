@@ -38,6 +38,20 @@ export interface HybridSearchRequest {
 const MEMORY_QUOTA = 3;
 const isMemoryId = (id: string): boolean => id.startsWith("mem_");
 
+// Maps one stream's scores onto 0..1 with its best candidate at 1. A stream
+// cut off at the pool limit puts its weakest candidate at 0; a stream that
+// returned everything it found has no cut-off score and scales from 0.
+function unitScale(results: Array<{ score: number }>, cutOff: boolean): (score: number) => number {
+  let max = -Infinity;
+  let min = Infinity;
+  for (const { score } of results) {
+    if (score > max) max = score;
+    if (score < min) min = score;
+  }
+  const floor = cutOff ? min : Math.min(0, min);
+  return (score) => (max > floor ? (score - floor) / (max - floor) : 1);
+}
+
 export class HybridSearch {
   private graphRetrieval: GraphRetrieval;
   private lastGraphTimeoutWarningAt = -Infinity;
@@ -219,30 +233,32 @@ export class HybridSearch {
       }
     });
 
-    // Normalize once per query by the best attainable weighted score over
-    // the streams that produced results, so configured stream weights
-    // survive for single-stream hits and a silent stream carries no penalty.
-    const AGREEMENT_BONUS = 0.05;
-    const activeWeight =
-      (bm25Results.length > 0 ? this.bm25Weight : 0) +
-      (vectorResults.length > 0 ? this.vectorWeight : 0) +
-      (graphResults.length > 0 ? this.graphWeight : 0);
-    const maxAttainable = activeWeight * (1 / (RRF_K + 1));
+    // Each stream's scores go onto a 0..1 scale over its own candidates and
+    // are added by weight, over the streams that produced results. Fusing by
+    // rank placed any record listed by two streams above the vector stream's
+    // best hit, so a question in Chinese about a record written in English
+    // lost that record to weak keyword matches: over 160k records it ranked
+    // first for 28% of such questions, against 58% from the vector stream
+    // alone. The keyword weight shrinks with the share of the query that the
+    // best keyword hit covers.
+    const fullMatch = bm25Results.length > 0 ? this.bm25.fullMatchScore(query) : 0;
+    const coverage = fullMatch > 0 ? Math.min(1, bm25Results[0].score / fullMatch) : 1;
+    const bm25Share = bm25Results.length > 0 ? this.bm25Weight * coverage : 0;
+    const vectorShare = vectorResults.length > 0 ? this.vectorWeight : 0;
+    const graphShare = graphResults.length > 0 ? this.graphWeight : 0;
+    const activeWeight = bm25Share + vectorShare + graphShare;
+    const bm25Scale = unitScale(bm25Results, bm25Results.length >= poolLimit);
+    const vectorScale = unitScale(vectorResults, vectorResults.length >= poolLimit);
+    const graphScale = unitScale(graphResults, false);
     const ranked = Array.from(scores.entries()).map(([obsId, s]) => {
-      const wB = Number.isFinite(s.bm25Rank) ? this.bm25Weight : 0;
-      const wV = Number.isFinite(s.vectorRank) ? this.vectorWeight : 0;
-      const wG = Number.isFinite(s.graphRank) ? this.graphWeight : 0;
-      const matchedStreams =
-        (wB > 0 ? 1 : 0) + (wV > 0 ? 1 : 0) + (wG > 0 ? 1 : 0);
       const weighted =
-        wB * (1 / (RRF_K + s.bm25Rank)) +
-        wV * (1 / (RRF_K + s.vectorRank)) +
-        wG * (1 / (RRF_K + s.graphRank));
-      const rrf = maxAttainable > 0 ? weighted / maxAttainable : 0;
+        (Number.isFinite(s.bm25Rank) ? bm25Share * bm25Scale(s.bm25Score) : 0) +
+        (Number.isFinite(s.vectorRank) ? vectorShare * vectorScale(s.vectorScore) : 0) +
+        (Number.isFinite(s.graphRank) ? graphShare * graphScale(s.graphScore) : 0);
       return {
         obsId,
         s,
-        combinedScore: rrf * (1 + AGREEMENT_BONUS * (matchedStreams - 1)),
+        combinedScore: activeWeight > 0 ? weighted / activeWeight : 0,
         minRank: Math.min(s.bm25Rank, s.vectorRank, s.graphRank),
       };
     });

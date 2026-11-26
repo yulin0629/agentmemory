@@ -320,27 +320,11 @@ export class SearchIndex {
     targetLayer: SearchLayer = "all",
     filter?: (obsId: string) => boolean,
   ): Array<{ obsId: string; sessionId: string; score: number }> {
-    const rawTerms = this.tokenize(query.toLowerCase());
-    if (rawTerms.length === 0) return [];
-
     const N = this.entries.size;
     if (N === 0) return [];
+    const queryTerms = this.searchedTerms(query);
+    if (queryTerms.length === 0) return [];
     const avgDocLen = this.totalDocLength / N;
-
-    const queryTerms: Array<{ term: string; weight: number }> = [];
-    const seen = new Set<string>();
-    for (const term of rawTerms) {
-      if (!seen.has(term)) {
-        seen.add(term);
-        queryTerms.push({ term, weight: 1.0 });
-      }
-      for (const syn of getSynonyms(term)) {
-        if (!seen.has(syn)) {
-          seen.add(syn);
-          queryTerms.push({ term: syn, weight: 0.7 });
-        }
-      }
-    }
 
     const scores = new Map<number, number>();
     const sorted = this.getSortedTerms();
@@ -350,7 +334,7 @@ export class SearchIndex {
     const marks = this.matchMarks;
     const slotEntries = this.slotEntries;
 
-    for (const { term, weight } of this.costBoundedTerms(queryTerms, N)) {
+    for (const { term, weight } of queryTerms) {
       const termId = this.termIds.get(term);
       let exactMatch = 0;
       if (termId !== undefined) {
@@ -419,6 +403,38 @@ export class SearchIndex {
       .filter((hit) => (filter ? filter(hit.obsId) : true))
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
+  }
+
+  // The score of a record that holds every searched word of the query once,
+  // at average length: the yardstick for how much of a query a hit covers.
+  fullMatchScore(query: string): number {
+    const N = this.entries.size;
+    let total = 0;
+    for (const { term, weight } of this.searchedTerms(query)) {
+      // A synonym stands in for a word of the query; it is not one more word to match.
+      if (weight < 1) continue;
+      const df = this.documentFrequency(term);
+      total += Math.log((N - df + 0.5) / (df + 0.5) + 1);
+    }
+    return total;
+  }
+
+  private searchedTerms(query: string): Array<{ term: string; weight: number }> {
+    const queryTerms: Array<{ term: string; weight: number }> = [];
+    const seen = new Set<string>();
+    for (const term of this.tokenize(query.toLowerCase())) {
+      if (!seen.has(term)) {
+        seen.add(term);
+        queryTerms.push({ term, weight: 1.0 });
+      }
+      for (const syn of getSynonyms(term)) {
+        if (!seen.has(syn)) {
+          seen.add(syn);
+          queryTerms.push({ term: syn, weight: 0.7 });
+        }
+      }
+    }
+    return this.costBoundedTerms(queryTerms, this.entries.size);
   }
 
   // Each term walks its whole posting list synchronously, so a pasted prompt

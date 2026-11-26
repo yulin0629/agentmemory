@@ -844,7 +844,7 @@ The table below describes the Claude Code hook surface. Other integrations captu
 | Capability | Description |
 |---|---|
 | **Automatic capture** | Supported session and tool events recorded by native integrations |
-| **Semantic search** | BM25 + vector + knowledge graph with RRF fusion |
+| **Semantic search** | BM25 + vector + knowledge graph with weighted score fusion |
 | **Memory evolution** | Versioning, supersession, relationship graphs |
 | **Recall hygiene** | Superseded memory versions leave the search indexes; the version chain in KV keeps full history |
 | **Near-duplicate hints** | Saves report an advisory `similarTo` match when new content closely resembles an existing memory |
@@ -875,7 +875,7 @@ Triple-stream retrieval combining three signals:
 | **Vector** | Cosine similarity over dense embeddings | Embedding provider configured |
 | **Graph** | Knowledge graph traversal via entity matching | Entities detected in query |
 
-Fused with Reciprocal Rank Fusion (RRF, k=60) and session-diversified (max 3 results per session).
+Each stream's scores are scaled to 0–1 over its candidates and added by weight; the keyword weight shrinks when the best keyword hit covers little of the query. Results are session-diversified (max 3 results per session).
 
 When a vector index is populated, `mem::search` (behind `memory_recall`) uses the hybrid BM25 + vector ranker. Without embeddings it uses BM25. `smart-search` can additionally fuse structural graph matches when graph data exists, including in keyless mode. Lesson recall runs on a dedicated in-memory BM25 index instead of scanning the whole corpus per query. Superseded memory versions are excluded from every recall path; the version chain keeps their history.
 
