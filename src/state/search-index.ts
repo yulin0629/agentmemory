@@ -425,7 +425,9 @@ export class SearchIndex {
   // (a Hermes cron job sends ~1.8k chars) held the event loop for 15-35 s.
   // In an index of COMMON_TERM_MIN_DOCS or more, terms in more than half of
   // all documents add an idf below ln 2 and are dropped while another term
-  // still matches; a long query keeps its rarest terms.
+  // still matches; a long query keeps its rarest terms. Terms that no document
+  // uses go last: they can only match by prefix, and kept first they pushed
+  // every matching term out of a short prompt sent with its conversation.
   private costBoundedTerms(
     queryTerms: Array<{ term: string; weight: number }>,
     docCount: number,
@@ -437,7 +439,7 @@ export class SearchIndex {
     const pool = informative.some((q) => q.df > 0) ? informative : ranked;
     if (pool.length <= MAX_QUERY_TERMS) return pool;
     return [...pool]
-      .sort((a, b) => a.df - b.df || a.order - b.order)
+      .sort((a, b) => Number(a.df === 0) - Number(b.df === 0) || a.df - b.df || a.order - b.order)
       .slice(0, MAX_QUERY_TERMS)
       .sort((a, b) => a.order - b.order);
   }
