@@ -22,7 +22,7 @@ const INITIAL_TERM_CAPACITY = 1024;
 const INITIAL_POSTING_PAIRS = 4;
 // V8 keeps a 13+ character token as a slice of the text it was split from.
 const SLICED_STRING_MIN_LENGTH = 13;
-// Past this many vocabulary changes one full sort is cheaper than patching.
+// Bounds the work of patching the sorted vocabulary; past it one full sort runs.
 const SORTED_TERMS_PATCH_LIMIT = 512;
 
 function grown(array: Uint32Array, minLength: number): Uint32Array {
