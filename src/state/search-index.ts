@@ -22,6 +22,8 @@ const INITIAL_TERM_CAPACITY = 1024;
 const INITIAL_POSTING_PAIRS = 4;
 // V8 keeps a 13+ character token as a slice of the text it was split from.
 const SLICED_STRING_MIN_LENGTH = 13;
+// Past this many vocabulary changes one full sort is cheaper than patching.
+const SORTED_TERMS_PATCH_LIMIT = 512;
 
 function grown(array: Uint32Array, minLength: number): Uint32Array {
   let length = array.length;
@@ -64,6 +66,7 @@ export class SearchIndex {
   private matchEpoch = 0;
   private totalDocLength = 0;
   private sortedTerms: string[] | null = null;
+  private sortedTermChanges: string[] = [];
   private revisionGeneration: object = {};
   private absentRevisions = new Map<string, { token: object; readers: number }>();
 
@@ -104,8 +107,6 @@ export class SearchIndex {
       termIds[position++] = termId;
     }
     this.slotTermIds[slot] = termIds;
-
-    this.sortedTerms = null;
   }
 
   private termIdFor(term: string): number {
@@ -125,6 +126,7 @@ export class SearchIndex {
     }
     this.termIds.set(name, termId);
     this.termNames[termId] = name;
+    this.noteTermChange(name);
     this.postings[termId] = undefined;
     return termId;
   }
@@ -172,6 +174,7 @@ export class SearchIndex {
     }
     this.postingCounts[termId] = remaining;
     if (remaining > 0) return;
+    this.noteTermChange(this.termNames[termId]!);
     this.termIds.delete(this.termNames[termId]!);
     this.termNames[termId] = undefined;
     this.postings[termId] = undefined;
@@ -309,7 +312,6 @@ export class SearchIndex {
 
     this.totalDocLength = Math.max(0, this.totalDocLength - entry.termCount);
     this.entries.delete(id);
-    this.sortedTerms = null;
   }
 
   search(
@@ -627,11 +629,37 @@ export class SearchIndex {
     return out;
   }
 
-  private getSortedTerms(): string[] {
-    if (!this.sortedTerms) {
-      this.sortedTerms = Array.from(this.termIds.keys()).sort();
+  private noteTermChange(name: string): void {
+    if (!this.sortedTerms) return;
+    if (this.sortedTermChanges.length < SORTED_TERMS_PATCH_LIMIT) {
+      this.sortedTermChanges.push(name);
+    } else {
+      this.sortedTerms = null;
+      this.sortedTermChanges = [];
     }
-    return this.sortedTerms;
+  }
+
+  // Sorting the whole vocabulary again after every add or removal cost the
+  // next search 0.7 s at 600k terms, so the terms that appeared or
+  // disappeared since the last search are patched into the sorted copy.
+  private getSortedTerms(): string[] {
+    const sorted = this.sortedTerms;
+    if (!sorted) {
+      this.sortedTerms = Array.from(this.termIds.keys()).sort();
+      this.sortedTermChanges = [];
+      return this.sortedTerms;
+    }
+    for (const name of this.sortedTermChanges) {
+      const at = this.lowerBound(sorted, name);
+      const listed = sorted[at] === name;
+      if (this.termIds.has(name)) {
+        if (!listed) sorted.splice(at, 0, name);
+      } else if (listed) {
+        sorted.splice(at, 1);
+      }
+    }
+    this.sortedTermChanges = [];
+    return sorted;
   }
 
   private lowerBound(arr: string[], target: string): number {

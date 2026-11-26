@@ -185,4 +185,27 @@ describe("SearchIndex against the Map/Set reference", () => {
     expectSame();
     expect(index.search("quuxword", 10).map((hit) => hit.obsId)).toEqual([third.id]);
   });
+
+  it("matches the reference when a search follows every single add, update and removal", () => {
+    const random = seededRandom(23);
+    const docs = corpus(260, random);
+    const index = new SearchIndex();
+    const reference = new ReferenceIndex();
+    const both = (apply: (target: SearchIndex | ReferenceIndex) => void) => { apply(index); apply(reference); };
+    for (const doc of docs.slice(0, 200)) both((target) => target.add(doc));
+    let matched = 0;
+    for (let step = 0; step < 120; step++) {
+      const fresh = docs[200 + (step % 60)];
+      const old = docs[step];
+      if (step % 3 === 0) both((target) => target.add({ ...fresh, id: `${fresh.id}_${step}`, title: `${fresh.title} patchword${step}` }));
+      else if (step % 3 === 1) both((target) => target.add({ ...old, narrative: `rewritten${step} narrative` }));
+      else both((target) => target.remove(old.id));
+      for (const text of [`patchw rewri uniq term${step % 10}`, `${fresh.title.split(" ")[0].slice(0, 4)} auth`]) {
+        const expected = reference.search(text, 50);
+        expect(index.search(text, 50), `step ${step}: ${text}`).toEqual(expected);
+        if (expected.length > 0) matched++;
+      }
+    }
+    expect(matched).toBeGreaterThan(200);
+  });
 });
