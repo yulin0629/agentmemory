@@ -40,7 +40,8 @@ const isMemoryId = (id: string): boolean => id.startsWith("mem_");
 
 // Maps one stream's scores onto 0..1 with its best candidate at 1. A stream
 // cut off at the pool limit puts its weakest candidate at 0; a stream that
-// returned everything it found has no cut-off score and scales from 0.
+// returned everything it found has no cut-off score and scales from 0, or
+// from its weakest candidate when that one is negative.
 function unitScale(results: Array<{ score: number }>, cutOff: boolean): (score: number) => number {
   let max = -Infinity;
   let min = Infinity;

@@ -344,7 +344,7 @@ export class SearchIndex {
         }
         exactMatch = ++this.matchEpoch;
         const df = this.postingCounts[termId];
-        const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);
+        const idf = this.idf(df, N);
         const pairs = this.postings[termId];
 
         for (let i = 0; i < df; i++) {
@@ -374,8 +374,7 @@ export class SearchIndex {
 
         const prefixTermId = this.termIds.get(indexTerm)!;
         const prefixDf = this.postingCounts[prefixTermId];
-        const prefixIdf =
-          Math.log((N - prefixDf + 0.5) / (prefixDf + 0.5) + 1) * 0.5;
+        const prefixIdf = this.idf(prefixDf, N) * 0.5;
         const pairs = this.postings[prefixTermId];
         for (let i = 0; i < prefixDf; i++) {
           const slot = pairs ? pairs[i * 2] : this.singleSlot[prefixTermId];
@@ -414,9 +413,13 @@ export class SearchIndex {
       // A synonym stands in for a word of the query; it is not one more word to match.
       if (weight < 1) continue;
       const df = this.documentFrequency(term);
-      total += Math.log((N - df + 0.5) / (df + 0.5) + 1);
+      total += this.idf(df, N);
     }
     return total;
+  }
+
+  private idf(df: number, N: number): number {
+    return Math.log((N - df + 0.5) / (df + 0.5) + 1);
   }
 
   private searchedTerms(query: string): Array<{ term: string; weight: number }> {
