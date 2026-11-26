@@ -33,7 +33,7 @@ it("sends records and queries unchanged to gemini-embedding-001 when no model is
 });
 
 it("tells gemini-embedding-2 which text is a record and which is a query", async () => {
-  env.GEMINI_EMBEDDING_MODEL = "gemini-embedding-2";
+  env.GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-2";
   const provider = new GeminiEmbeddingProvider("key");
   await provider.embedBatch(["a stored record"]);
   await provider.embed("another record");

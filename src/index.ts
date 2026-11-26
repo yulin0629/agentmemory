@@ -504,7 +504,8 @@ async function main() {
   // Another model's vectors have the same width, so nothing fails when they
   // are compared with this model's queries: the scores just mean nothing.
   const savedVectorSpace = loaded?.vectorSpace ?? "";
-  const vectorSpaceChanged = Boolean(embeddingProvider) && savedVectorSpace !== (embeddingProvider?.vectorSpace ?? "");
+  const activeVectorSpace = embeddingProvider?.vectorSpace ?? "";
+  const vectorSpaceChanged = Boolean(embeddingProvider) && savedVectorSpace !== activeVectorSpace;
   if (loaded?.vector && vectorIndex && loaded.vector.size > 0) {
     // Persisted vectors carry whatever dimension the provider had when
     // they were written. If the active provider declares a different
@@ -560,18 +561,20 @@ async function main() {
         for (const [obsId] of loaded.vector.entries()) vectorIndex.markRemoved(obsId);
         console.warn(
           `[agentmemory] Persisted vector index was written by ${describe(savedVectorSpace)}; ` +
-            `the active embedding model is ${describe(embeddingProvider?.vectorSpace ?? "")}. ` +
+            `the active embedding model is ${describe(activeVectorSpace)}. ` +
             `AGENTMEMORY_DROP_STALE_INDEX=true is set — discarding the ${loaded.vector.size} persisted ` +
-            `vectors. Set AGENTMEMORY_VECTOR_BACKFILL=all to embed the stored records again.`,
+            `vectors. AGENTMEMORY_VECTOR_BACKFILL=all embeds the stored records again, at most ` +
+            `AGENTMEMORY_VECTOR_BACKFILL_MAX of them per start.`,
         );
       } else {
         throw new Error(
           `[agentmemory] Refusing to start: the persisted vector index was written by ` +
             `${describe(savedVectorSpace)}, and the active embedding model is ` +
-            `${describe(embeddingProvider?.vectorSpace ?? "")}. Vectors of two models cannot be ` +
+            `${describe(activeVectorSpace)}. Vectors of two models cannot be ` +
             `compared, so search would rank by meaningless scores. Choose one:\n` +
             `  - Set AGENTMEMORY_DROP_STALE_INDEX=true to discard the ${loaded.vector.size} persisted ` +
-            `vectors, and AGENTMEMORY_VECTOR_BACKFILL=all to embed the stored records again.\n` +
+            `vectors, and AGENTMEMORY_VECTOR_BACKFILL=all to embed the stored records again ` +
+            `(at most AGENTMEMORY_VECTOR_BACKFILL_MAX of them per start).\n` +
             `  - Switch the embedding model back to the one that wrote the index.`,
         );
       }
@@ -584,7 +587,7 @@ async function main() {
   }
 
   if (vectorIndex && loaded && loaded.state !== "unavailable") {
-    const replay = await indexPersistence.replayPendingLog(embeddingProvider?.dimensions ?? 0, vectorSpaceChanged);
+    const replay = await indexPersistence.replayPendingLog(embeddingProvider?.dimensions ?? 0);
     if (replay.skipped > 0) vectorBackfillSince = null;
     if (indexPersistence.isRecoveryPaused()) vectorBackfillSince = undefined;
     if (replay.entries > 0) {

@@ -29,7 +29,7 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
     this.apiKey = apiKey || getEnvVar("GEMINI_API_KEY") || "";
     this.fallbackKey = getEnvVar("GEMINI_API_KEY_FALLBACK") || "";
     if (!this.apiKey) throw new Error("GEMINI_API_KEY is required");
-    const model = (getEnvVar("GEMINI_EMBEDDING_MODEL") || "").trim() || DEFAULT_MODEL;
+    const model = (getEnvVar("GEMINI_EMBEDDING_MODEL") || "").trim().replace(/^models\//, "") || DEFAULT_MODEL;
     this.model = `models/${model}`;
     this.prefixed = model.startsWith("gemini-embedding-2");
     if (model !== DEFAULT_MODEL) this.vectorSpace = model;

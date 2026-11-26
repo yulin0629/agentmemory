@@ -233,24 +233,28 @@ describe("pending vector log", () => {
     expect([...third.vector.entries()].map(([id]) => id).sort()).toEqual(["obs_2", "obs_3", "obs_4"]);
   });
 
-  it("replays only the removals when the logged vectors come from another model", async () => {
+  it("does not replay vectors that another embedding model logged, on this start or a later one", async () => {
     const kv = mockKV();
     const first = await boot(kv);
-    first.vector.add("obs_1", "ses_1", v(1));
-    first.vector.add("obs_2", "ses_1", v(2));
-    await first.persistence.save();
-    first.vector.add("obs_3", "ses_1", v(3));
-    first.vector.remove("obs_1");
+    first.vector.add("obs_old", "ses_1", v(1));
     await first.persistence.flushPendingLog();
     first.persistence.stop();
 
+    const options = { saveIntervalMs: 600_000, bucketSize: 4, vectorSpace: "gemini-embedding-2" };
     const vector = new VectorIndex();
-    const persistence = new IndexPersistence(kv as never, vector, { saveIntervalMs: 600_000, bucketSize: 4 });
-    vector.restoreFrom((await persistence.load()).vector!);
-    const replay = await persistence.replayPendingLog(3, true);
+    const persistence = new IndexPersistence(kv as never, vector, options);
+    await persistence.load();
+    expect(await persistence.replayPendingLog(3)).toMatchObject({ added: 0, skipped: 1 });
+    expect(vector.has("obs_old")).toBe(false);
 
-    expect([...vector.entries()].map(([id]) => id)).toEqual(["obs_2"]);
-    expect(replay).toMatchObject({ added: 0, removed: 1, skipped: 1 });
+    vector.add("obs_new", "ses_1", v(2));
+    await persistence.flushPendingLog();
+    persistence.stop();
+    const restarted = new VectorIndex();
+    const later = new IndexPersistence(kv as never, restarted, options);
+    await later.load();
+    await later.replayPendingLog(3);
+    expect([...restarted.entries()].map(([id]) => id)).toEqual(["obs_new"]);
   });
 
   it("skips logged vectors whose dimension does not match the active provider", async () => {

@@ -19,6 +19,7 @@ import {
 } from "../functions/graph-retrieval.js";
 import { extractEntitiesFromQuery } from "../functions/query-expansion.js";
 import { rerank } from "./reranker.js";
+import { embedQuery } from "../providers/embedding/query.js";
 import { logger } from "../logger.js";
 
 const RRF_K = 60;
@@ -141,7 +142,7 @@ export class HybridSearch {
       try {
         if (request) {
           if (!request.embedding || request.embedding.query !== query) {
-            request.embedding = { query, value: this.embeddingProvider.embedQuery?.(query) ?? this.embeddingProvider.embed(query) };
+            request.embedding = { query, value: embedQuery(this.embeddingProvider, query) };
           }
           const embedding = request.embedding;
           try {
@@ -151,7 +152,7 @@ export class HybridSearch {
             throw error;
           }
         } else {
-          queryEmbedding = await (this.embeddingProvider.embedQuery?.(query) ?? this.embeddingProvider.embed(query));
+          queryEmbedding = await embedQuery(this.embeddingProvider, query);
         }
         vectorResults = this.vector.search(queryEmbedding, poolLimit, targetLayer, (id) => this.bm25.layerOf(id));
       } catch {

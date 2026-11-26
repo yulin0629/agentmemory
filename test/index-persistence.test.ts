@@ -382,6 +382,19 @@ describe("IndexPersistence migration from the single-string format", () => {
     }
   });
 
+  it("keeps a migrated snapshot marked as the original model's when another model is active", async () => {
+    await writeLegacyVectorSnapshot(kv, vectorWith([["obs_a", [0.1, 0.2, 0.3]]]));
+    const options = { bucketSize: 16, vectorSpace: "gemini-embedding-2" };
+
+    const migrated = await new IndexPersistence(kv as never, new VectorIndex(), options).load();
+    expect(migrated.state).toBe("migrated");
+    expect(migrated.vectorSpace).toBeUndefined();
+
+    const next = await new IndexPersistence(kv as never, new VectorIndex(), options).load();
+    expect(next.vector!.size).toBe(1);
+    expect(next.vectorSpace).toBeUndefined();
+  });
+
   it("migrates a monolithic vector snapshot", async () => {
     const legacy = vectorWith([["obs_a", [0.1, 0.2, 0.3]]]);
     await writeLegacyVectorSnapshot(kv, legacy, { monolithic: true });
