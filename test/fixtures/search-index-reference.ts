@@ -291,7 +291,7 @@ export class SearchIndex {
     const pool = informative.some((q) => q.df > 0) ? informative : ranked;
     if (pool.length <= MAX_QUERY_TERMS) return pool;
     return [...pool]
-      .sort((a, b) => a.df - b.df || a.order - b.order)
+      .sort((a, b) => Number(a.df === 0) - Number(b.df === 0) || a.df - b.df || a.order - b.order)
       .slice(0, MAX_QUERY_TERMS)
       .sort((a, b) => a.order - b.order);
   }
