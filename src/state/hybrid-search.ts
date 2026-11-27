@@ -335,7 +335,8 @@ export class HybridSearch {
           }, GRAPH_BUDGET_MS);
         }),
       ]);
-      const diagnostic = used.map((query) => query.diagnostics()).find((d) => d.status !== "ready" || d.truncated);
+      // "idle": the query had nothing to look up and read no graph state.
+      const diagnostic = used.map((query) => query.diagnostics()).find((d) => d.status !== "idle" && (d.status !== "ready" || d.truncated));
       if (diagnostic && Date.now() - this.lastGraphTimeoutWarningAt >= 60_000) {
         this.lastGraphTimeoutWarningAt = Date.now();
         logger.warn("Graph enrichment is unavailable or partial", diagnostic);

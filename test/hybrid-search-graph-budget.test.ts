@@ -129,8 +129,10 @@ describe("optional graph retrieval budget", () => {
     const search = new HybridSearch(index, vectors, embedding.provider, kv as never).search("Cobalt");
     for (let seen = -1; seen !== reads.length;) { seen = reads.length; await new Promise((resolve) => setTimeout(resolve, 5)); }
     embedding.release();
-    const hit = (await search).find((result) => result.observation.id === linked.id);
-    expect(hit?.graphScore).toBeGreaterThan(0);
+    const results = await search;
+    // Precondition: the entity search ran out of reads, so its own exact match went unscored.
+    expect(results.find((result) => result.observation.id === observation.id)?.graphScore).toBe(0);
+    expect(results.find((result) => result.observation.id === linked.id)?.graphScore).toBeGreaterThan(0);
   });
 
   it("bounds concurrent query reformulations and can recover on the next search", async () => {

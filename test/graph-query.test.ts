@@ -338,7 +338,7 @@ describe("hybrid graph query lifetime", () => {
     return { ...r, hybrid };
   }
 
-  it.each([false, true])("loads once for entity, vector and reformulated streams (expanded: %s)", async (expanded) => {
+  it.each([false, true])("reads the graph through its index on every request for entity, vector and reformulated streams (expanded: %s)", async (expanded) => {
     const r = await hybridRig();
     const run = () => expanded
       ? r.hybrid.searchWithExpansion("React auth", 10, { reformulations: ["React", "authentication"], temporalConcretizations: ["recent React"], entityExtractions: ["React"] })
