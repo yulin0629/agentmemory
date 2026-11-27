@@ -192,6 +192,17 @@ export interface SessionSummary {
   coveredFingerprint?: string;
 }
 
+export interface ObservationArchive {
+  sessionId: string;
+  project: string;
+  observationCount: number;
+  bytes: number;
+  firstTimestamp: string;
+  lastTimestamp: string;
+  archivedAt: string;
+  updatedAt: string;
+}
+
 export type HookType =
   | "session_start"
   | "prompt_submit"
@@ -748,6 +759,7 @@ export interface AuditEntry {
     | "lesson_delete"
     | "context_knowledge_put"
     | "obsidian_export"
+    | "observation_archive"
     | "reflect"
     | "insight_search"
     | "skill_extract"

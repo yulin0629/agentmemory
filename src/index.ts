@@ -73,6 +73,7 @@ import { registerConsolidateFunction } from "./functions/consolidate.js";
 import { registerPatternsFunction } from "./functions/patterns.js";
 import { registerRememberFunction } from "./functions/remember.js";
 import { registerEvictFunction } from "./functions/evict.js";
+import { registerObservationArchiveFunctions } from "./functions/observation-archive.js";
 import { registerRelationsFunction } from "./functions/relations.js";
 import { registerTimelineFunction } from "./functions/timeline.js";
 import { registerSmartSearchFunction } from "./functions/smart-search.js";
@@ -337,6 +338,7 @@ async function main() {
   registerPatternsFunction(sdk, kv);
   registerRememberFunction(sdk, kv);
   registerEvictFunction(sdk, kv);
+  registerObservationArchiveFunctions(sdk, kv);
   registerSessionSweepFunction(sdk, kv);
   registerSessionFinalizeFunction(sdk, kv);
 
@@ -691,7 +693,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 149 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 153 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
