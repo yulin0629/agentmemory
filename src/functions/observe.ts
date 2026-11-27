@@ -25,6 +25,10 @@ import { observationEmbedText } from "../state/memory-utils.js";
 import { markCompressionDispatchFailed, pendingCompression } from "./compression-state.js";
 import { requestSummaryRefresh } from "./summary-state.js";
 import { scheduleSessionFinalize } from "./session-finalize.js";
+import {
+  findObservationInSessionFamily,
+  withWritableSegment,
+} from "./session-rollover.js";
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -101,10 +105,8 @@ export function registerObserveFunction(
         ? eventObservationId(payload.event_id)
         : durable ? payload.observationId! : generateId("obs");
 
-      return withKeyedLock(`obs:${payload.sessionId}`, async () => {
-        if (payload.event_id && await kv.get(KV.observations(payload.sessionId), obsId)) {
-          return { observationId: obsId, sessionId: payload.sessionId, deduplicated: true };
-        }
+      const rootSessionId = payload.sessionId;
+      return withKeyedLock(`obs:${rootSessionId}`, async () => {
         const incomingProjectId = (payload.data as { contextProjectId?: unknown } | null)?.contextProjectId;
         const contextProjectId = typeof incomingProjectId === "string" && incomingProjectId.trim().length > 0
           && incomingProjectId.length <= 200 ? incomingProjectId.trim() : undefined;
@@ -133,14 +135,23 @@ export function registerObserveFunction(
               ? d["tool_response"] ?? d["tool_output"] ?? d["output"] ?? d["error"]
               : undefined;
           dedupHash = dedupMap.computeHash(
-            payload.sessionId,
+            rootSessionId,
             toolName,
             dedupInput,
             dedupOutput,
           );
           if (!explicitRequest && dedupMap.isDuplicate(dedupHash)) {
             recordDedupSkip();
-            return { deduplicated: true, sessionId: payload.sessionId };
+            return { deduplicated: true, sessionId: rootSessionId };
+          }
+        }
+
+        const rootSession = await kv.get<Session>(KV.sessions, rootSessionId);
+        const activeSegmentId = rootSession?.activeSegmentId || rootSessionId;
+        if (payload.event_id) {
+          const existingByEventId = await findObservationInSessionFamily(kv, rootSessionId, activeSegmentId, obsId);
+          if (existingByEventId) {
+            return { observationId: obsId, sessionId: existingByEventId.sessionId, deduplicated: true };
           }
         }
 
@@ -154,7 +165,7 @@ export function registerObserveFunction(
         else if (TOOL_HOOKS.has(payload.hookType)) originChannel = "tool";
         const raw: RawObservation = {
           id: obsId,
-          sessionId: payload.sessionId,
+          sessionId: activeSegmentId,
           timestamp: payload.timestamp,
           hookType: payload.hookType,
           raw: sanitizedRaw,
@@ -206,257 +217,264 @@ export function registerObserveFunction(
         const livePrompt = submittedPrompt && !backfillPrompt ? submittedPrompt : undefined;
         const promptRef = durable || typeof payload.eventId !== "string" ? obsId : payload.eventId;
 
-        const existing = await kv.list<CompressedObservation>(KV.observations(payload.sessionId));
-        const stored = durable ? existing.find((o) => o?.id === obsId) : undefined;
-        if (stored) {
-          if (livePrompt) await recordLivePrompt(kv, payload.sessionId, livePrompt, promptRef);
-          await restoreIndexEntries(stored);
-          return { observationId: obsId, deduplicated: true, existing: true };
-        }
-        if (backfillPrompt && (await claimBackfillPrompt(kv, payload.sessionId, backfillPrompt, promptRef))) {
+        if (backfillPrompt && (await claimBackfillPrompt(kv, rootSessionId, backfillPrompt, promptRef))) {
           recordDedupSkip();
-          return { deduplicated: true, sessionId: payload.sessionId };
-        }
-        if (maxObservationsPerSession && maxObservationsPerSession > 0) {
-          if (existing.length >= maxObservationsPerSession) {
-            return {
-              success: false,
-              error: `Session observation limit reached (${maxObservationsPerSession})`,
-            };
-          }
+          return { deduplicated: true, sessionId: rootSessionId };
         }
 
-        // Existing session is the source of truth for agentId (even
-        // undefined). Env AGENT_ID only fires when no session row
-        // exists yet — otherwise an unscoped session would get
-        // retroactively scoped by a later AGENT_ID export.
-        const existingSession = await kv.get<{
-          agentId?: string;
-          observationCount?: number;
-          firstPrompt?: string;
-          project?: string;
-          contextProjectId?: string;
-          status?: Session["status"];
-        }>(KV.sessions, payload.sessionId);
-        const inheritedAgentId = existingSession
-          ? existingSession.agentId
-          : getAgentId();
-        if (inheritedAgentId) {
-          raw.agentId = inheritedAgentId;
-        }
-
-        if (pendingImageData && (pendingImageData.startsWith("data:image/") || pendingImageData.startsWith("iVBORw0KGgo") || pendingImageData.startsWith("/9j/"))) {
-          const { filePath, bytesWritten } = await saveImageToDisk(pendingImageData);
-          raw.imageData = filePath;
-          const { incrementImageRef } = await import("./image-refs.js");
-          await incrementImageRef(kv, filePath);
-          sdk.trigger({
-            function_id: "mem::disk-size-delta",
-            payload: { deltaBytes: bytesWritten },
-            action: TriggerAction.Void(),
-          });
-          if (process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] === "true") {
-            sdk.trigger({
-              function_id: "mem::vision-embed",
-              payload: {
-                imageRef: filePath,
-                sessionId: payload.sessionId,
-                observationId: obsId,
-              },
-              action: TriggerAction.Void(),
-            });
-          }
-        }
-
-        const autoCompress = isAutoCompressEnabled();
-        const finalizeIdleMs = getFinalizeIdleMs();
-        if (existingSession && existingSession.status !== "active") {
-          const dueAt = Date.now() + finalizeIdleMs;
-          await requestSummaryRefresh(kv, payload.sessionId, dueAt);
-          if (finalizeIdleMs > 0) await scheduleSessionFinalize(kv, payload.sessionId, dueAt);
-        }
-        const synthetic = budgetLiveObservationSource(buildSyntheticCompression(raw), existing);
-        if (autoCompress) synthetic.compression = pendingCompression();
-        try {
-          await kv.set(KV.observations(payload.sessionId), obsId, synthetic);
-          await indexObservationSession(kv, obsId, payload.sessionId).catch(
-            (err) => {
-              logger.warn("observation index update failed", {
-                obsId,
-                sessionId: payload.sessionId,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            },
-          );
-
-        } catch (error) {
-          if (raw.imageData) {
-            // Roll back the ref taken above. decrementImageRef deletes the file
-            // only when no other observation still references it (deduped images
-            // survive) and emits the disk-size delta itself — deleting the file
-            // directly here would orphan shared images and leave a stale ref.
-            // If the rollback itself fails, log it but still surface the
-            // original write error (the more useful failure to diagnose).
-            try {
-              const { decrementImageRef } = await import("./image-refs.js");
-              await decrementImageRef(kv, sdk, raw.imageData);
-            } catch (rollbackError) {
-              logger.error("Failed to roll back image ref after observation write failure", {
-                imageRef: raw.imageData,
-                error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
-              });
-            }
-          }
-          throw error;
-        }
-
-        if (dedupMap && dedupHash) {
-          dedupMap.record(dedupHash);
-        }
-        if (livePrompt) await recordLivePrompt(kv, payload.sessionId, livePrompt, promptRef);
-
-        emitLiveEvent({
-          id: `raw-${obsId}`,
-          type: "raw_observation",
-          data: { type: "raw", observation: raw, sessionId: payload.sessionId },
-        });
-
-        const session = existingSession;
-        if (session) {
-          const updates: Array<{ type: "set" | "remove"; path: string; value?: unknown }> = [
-            { type: "set", path: "updatedAt", value: new Date().toISOString() },
-            {
-              type: "set",
-              path: "observationCount",
-              value: (session.observationCount || 0) + 1,
-            },
-          ];
-          if (!session.contextProjectId && contextProjectId && session.project === payload.project) {
-            updates.push({ type: "set", path: "contextProjectId", value: contextProjectId });
-          }
-          if (session.status !== "active" && finalizeIdleMs > 0) {
-            updates.push({ type: "set", path: "status", value: "active" });
-            updates.push({ type: "remove", path: "endedAt" });
-          }
-          if (!session.firstPrompt && typeof raw.userPrompt === "string") {
-            const trimmed = raw.userPrompt.replace(/\s+/g, " ").trim();
-            if (trimmed.length > 0) {
-              updates.push({
-                type: "set",
-                path: "firstPrompt",
-                value: trimmed.slice(0, 200),
-              });
-            }
-          }
-          await kv.update(KV.sessions, payload.sessionId, updates);
-        } else if (
-          typeof payload.project === "string" &&
-          payload.project.trim().length > 0 &&
-          typeof payload.cwd === "string" &&
-          payload.cwd.trim().length > 0
-        ) {
-          // OpenCode (and any plugin that skips POST /session/start)
-          // can fire observations before the session record exists. Without
-          // an implicit create, those observations stack up but
-          // `memory_sessions` never lists them, and summarize bails with
-          // "Session not found for summarize". Create the session now from
-          // the observation payload — but only when project + cwd are
-          // present (HookPayload contract). Older test payloads without
-          // those fields keep their original no-op behaviour.
-          const trimmedPrompt =
-            typeof raw.userPrompt === "string"
-              ? raw.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
-              : undefined;
-          const ts = new Date().toISOString();
-          const startedAt = payload.timestamp ?? ts;
-          await kv.set(KV.sessions, payload.sessionId, {
-            id: payload.sessionId,
-            project: payload.project,
-            cwd: payload.cwd,
-            startedAt,
-            updatedAt: ts,
-            status: "active",
-            ...(contextProjectId ? { contextProjectId } : {}),
-            observationCount: 1,
-            ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-            ...(trimmedPrompt && trimmedPrompt.length > 0
-              ? { firstPrompt: trimmedPrompt }
-              : {}),
-          });
-          await addSessionToProjectIndex(kv, payload.project, {
-            id: payload.sessionId,
-            startedAt,
-            ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-          }).catch((err) => {
-            logger.warn("session index update failed", {
-              sessionId: payload.sessionId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
-        }
-
-        let knowledgeCapture: unknown;
-        if (explicitRequest) {
-          // The producer verifies the stored user event itself, and the
-          // synthetic row does not carry the hook payload. Store the raw event
-          // for the capture, then put the synthetic row back. Knowledge-level
-          // dedup handles retries.
-          await kv.set(KV.observations(payload.sessionId), obsId, raw);
-          try {
-            knowledgeCapture = await sdk.trigger({
-              function_id: "mem::context-knowledge-capture",
-              payload: { sessionId: payload.sessionId, observationId: obsId },
-            });
-          } catch {
-            knowledgeCapture = { success: false, error: "capture_failed" };
-          } finally {
-            await kv.set(KV.observations(payload.sessionId), obsId, synthetic);
-          }
-        }
-
-        getSearchIndex().add(synthetic);
-        scheduleIndexSave();
-        // Not awaited: the embed may sit in the coalescing window, and this
-        // runs under the session's observation lock. The add checks the
-        // index revision before it writes, so a late result cannot undo a
-        // delete or a newer compression.
-        void Promise.resolve(vectorIndexAddGuarded(
-          synthetic.id,
-          synthetic.sessionId,
-          observationEmbedText(synthetic),
-          { kind: "synthetic", logId: synthetic.id },
-        )).catch(() => {});
-        emitLiveEvent({
-          id: `compressed-${obsId}`,
-          type: "compressed_observation",
-          data: {
-            type: "compressed",
-            observation: withoutObservationSource(synthetic),
-            sessionId: payload.sessionId,
+        const outcome = await withWritableSegment(
+          {
+            sdk,
+            kv,
+            rootSessionId,
+            rootSession,
+            obsId,
+            checkDuplicate: durable && !payload.event_id,
+            maxObservationsPerSession,
+            payload,
+            contextProjectId,
           },
-        });
+          async ({ sessionId: writeTarget, existingSession, existing }) => {
+            raw.sessionId = writeTarget;
 
-        if (autoCompress) {
-          afterKeyedLock(`obs:${payload.sessionId}`, async () => {
-            try {
-              await sdk.trigger({
-                function_id: "mem::compress",
-                payload: { observationId: obsId, sessionId: payload.sessionId },
+            // Existing session is the source of truth for agentId (even
+            // undefined). Env AGENT_ID only fires when no session row
+            // exists yet — otherwise an unscoped session would get
+            // retroactively scoped by a later AGENT_ID export.
+            const inheritedAgentId = existingSession
+              ? existingSession.agentId
+              : getAgentId();
+            if (inheritedAgentId) {
+              raw.agentId = inheritedAgentId;
+            }
+
+            if (pendingImageData && (pendingImageData.startsWith("data:image/") || pendingImageData.startsWith("iVBORw0KGgo") || pendingImageData.startsWith("/9j/"))) {
+              const { filePath, bytesWritten } = await saveImageToDisk(pendingImageData);
+              raw.imageData = filePath;
+              const { incrementImageRef } = await import("./image-refs.js");
+              await incrementImageRef(kv, filePath);
+              sdk.trigger({
+                function_id: "mem::disk-size-delta",
+                payload: { deltaBytes: bytesWritten },
                 action: TriggerAction.Void(),
               });
-            } catch {
-              await markCompressionDispatchFailed(kv, synthetic);
+              if (process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] === "true") {
+                sdk.trigger({
+                  function_id: "mem::vision-embed",
+                  payload: {
+                    imageRef: filePath,
+                    sessionId: writeTarget,
+                    observationId: obsId,
+                  },
+                  action: TriggerAction.Void(),
+                });
+              }
             }
-          });
-        }
 
-        logger.info("Observation captured", {
-          obsId,
-          sessionId: payload.sessionId,
-          hook: payload.hookType,
-          compress: autoCompress ? "llm" : "synthetic",
-        });
-        return { observationId: obsId, ...(explicitRequest ? { knowledgeCapture } : {}) };
+            const autoCompress = isAutoCompressEnabled();
+            const finalizeIdleMs = getFinalizeIdleMs();
+            if (existingSession && existingSession.status !== "active") {
+              const dueAt = Date.now() + finalizeIdleMs;
+              await requestSummaryRefresh(kv, writeTarget, dueAt);
+              if (finalizeIdleMs > 0) await scheduleSessionFinalize(kv, writeTarget, dueAt);
+            }
+            const synthetic = budgetLiveObservationSource(buildSyntheticCompression(raw), existing);
+            if (autoCompress) synthetic.compression = pendingCompression();
+            try {
+              await kv.set(KV.observations(writeTarget), obsId, synthetic);
+              await indexObservationSession(kv, obsId, writeTarget).catch(
+                (err) => {
+                  logger.warn("observation index update failed", {
+                    obsId,
+                    sessionId: writeTarget,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                },
+              );
+            } catch (error) {
+              if (raw.imageData) {
+                // Roll back the ref taken above. decrementImageRef deletes the file
+                // only when no other observation still references it (deduped images
+                // survive) and emits the disk-size delta itself — deleting the file
+                // directly here would orphan shared images and leave a stale ref.
+                // If the rollback itself fails, log it but still surface the
+                // original write error (the more useful failure to diagnose).
+                try {
+                  const { decrementImageRef } = await import("./image-refs.js");
+                  await decrementImageRef(kv, sdk, raw.imageData);
+                } catch (rollbackError) {
+                  logger.error("Failed to roll back image ref after observation write failure", {
+                    imageRef: raw.imageData,
+                    error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+                  });
+                }
+              }
+              throw error;
+            }
+
+            if (dedupMap && dedupHash) {
+              dedupMap.record(dedupHash);
+            }
+            if (livePrompt) await recordLivePrompt(kv, rootSessionId, livePrompt, promptRef);
+
+            emitLiveEvent({
+              id: `raw-${obsId}`,
+              type: "raw_observation",
+              data: { type: "raw", observation: raw, sessionId: writeTarget },
+            });
+
+            const session = existingSession;
+            if (session) {
+              const updates: Array<{ type: "set" | "remove"; path: string; value?: unknown }> = [
+                { type: "set", path: "updatedAt", value: new Date().toISOString() },
+                {
+                  type: "set",
+                  path: "observationCount",
+                  value: (session.observationCount || 0) + 1,
+                },
+              ];
+              if (!session.contextProjectId && contextProjectId && session.project === payload.project) {
+                updates.push({ type: "set", path: "contextProjectId", value: contextProjectId });
+              }
+              if (session.status !== "active" && finalizeIdleMs > 0) {
+                updates.push({ type: "set", path: "status", value: "active" });
+                updates.push({ type: "remove", path: "endedAt" });
+              }
+              if (!session.firstPrompt && typeof raw.userPrompt === "string") {
+                const trimmed = raw.userPrompt.replace(/\s+/g, " ").trim();
+                if (trimmed.length > 0) {
+                  updates.push({
+                    type: "set",
+                    path: "firstPrompt",
+                    value: trimmed.slice(0, 200),
+                  });
+                }
+              }
+              await kv.update(KV.sessions, writeTarget, updates);
+            } else if (
+              typeof payload.project === "string" &&
+              payload.project.trim().length > 0 &&
+              typeof payload.cwd === "string" &&
+              payload.cwd.trim().length > 0
+            ) {
+              // OpenCode (and any plugin that skips POST /session/start)
+              // can fire observations before the session record exists. Without
+              // an implicit create, those observations stack up but
+              // `memory_sessions` never lists them, and summarize bails with
+              // "Session not found for summarize". Create the session now from
+              // the observation payload — but only when project + cwd are
+              // present (HookPayload contract). Older test payloads without
+              // those fields keep their original no-op behaviour.
+              const trimmedPrompt =
+                typeof raw.userPrompt === "string"
+                  ? raw.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
+                  : undefined;
+              const ts = new Date().toISOString();
+              const startedAt = payload.timestamp ?? ts;
+              await kv.set(KV.sessions, writeTarget, {
+                id: writeTarget,
+                project: payload.project,
+                cwd: payload.cwd,
+                startedAt,
+                updatedAt: ts,
+                status: "active",
+                ...(contextProjectId ? { contextProjectId } : {}),
+                observationCount: 1,
+                ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
+                ...(trimmedPrompt && trimmedPrompt.length > 0
+                  ? { firstPrompt: trimmedPrompt }
+                  : {}),
+              });
+              await addSessionToProjectIndex(kv, payload.project, {
+                id: writeTarget,
+                startedAt,
+                ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
+              }).catch((err) => {
+                logger.warn("session index update failed", {
+                  sessionId: writeTarget,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              });
+            }
+
+            let knowledgeCapture: unknown;
+            if (explicitRequest) {
+              // The producer verifies the stored user event itself, and the
+              // synthetic row does not carry the hook payload. Store the raw event
+              // for the capture, then put the synthetic row back. Knowledge-level
+              // dedup handles retries.
+              await kv.set(KV.observations(writeTarget), obsId, raw);
+              try {
+                knowledgeCapture = await sdk.trigger({
+                  function_id: "mem::context-knowledge-capture",
+                  payload: { sessionId: writeTarget, observationId: obsId },
+                });
+              } catch {
+                knowledgeCapture = { success: false, error: "capture_failed" };
+              } finally {
+                await kv.set(KV.observations(writeTarget), obsId, synthetic);
+              }
+            }
+
+            getSearchIndex().add(synthetic);
+            scheduleIndexSave();
+            // Not awaited: the embed may sit in the coalescing window, and this
+            // runs under the session's observation lock. The add checks the
+            // index revision before it writes, so a late result cannot undo a
+            // delete or a newer compression.
+            void Promise.resolve(vectorIndexAddGuarded(
+              synthetic.id,
+              synthetic.sessionId,
+              observationEmbedText(synthetic),
+              { kind: "synthetic", logId: synthetic.id },
+            )).catch(() => {});
+            emitLiveEvent({
+              id: `compressed-${obsId}`,
+              type: "compressed_observation",
+              data: {
+                type: "compressed",
+                observation: withoutObservationSource(synthetic),
+                sessionId: writeTarget,
+              },
+            });
+
+            if (autoCompress) {
+              afterKeyedLock(`obs:${rootSessionId}`, async () => {
+                try {
+                  await sdk.trigger({
+                    function_id: "mem::compress",
+                    payload: { observationId: obsId, sessionId: writeTarget },
+                    action: TriggerAction.Void(),
+                  });
+                } catch {
+                  await markCompressionDispatchFailed(kv, synthetic).catch(() => {});
+                }
+              });
+            }
+
+            logger.info("Observation captured", {
+              obsId,
+              sessionId: writeTarget,
+              hook: payload.hookType,
+              compress: autoCompress ? "llm" : "synthetic",
+            });
+            return {
+              observationId: obsId,
+              sessionId: writeTarget,
+              ...(explicitRequest ? { knowledgeCapture } : {}),
+            };
+          },
+        );
+
+        if (outcome.kind === "duplicate") {
+          if (livePrompt) await recordLivePrompt(kv, rootSessionId, livePrompt, promptRef);
+          await restoreIndexEntries(outcome.observation);
+          return { observationId: obsId, sessionId: outcome.sessionId, deduplicated: true, existing: true };
+        }
+        if (outcome.kind === "cap_reached") {
+          return { success: false, error: outcome.error };
+        }
+        return outcome.value;
       });
     },
   );

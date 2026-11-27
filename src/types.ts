@@ -14,6 +14,8 @@ export interface Session {
   summary?: string;
   commitShas?: string[];
   agentId?: string;
+  activeSegmentId?: string;
+  parentSessionId?: string;
 }
 
 export interface ProjectSessionIndexEntry {

@@ -23,6 +23,7 @@ import {
 } from "./slots.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
 import { escapeXml, escapeXmlText } from "../prompts/xml.js";
+import { expandSessionFamily } from "./session-rollover.js";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3);
@@ -193,11 +194,12 @@ export function registerContextFunction(
         }
       }
 
+      const excludedSessions = await expandSessionFamily(kv, [data.sessionId]);
       const sessions = projectSessions
         .filter(
           (s) =>
             s.project === data.project &&
-            s.id !== data.sessionId &&
+            !excludedSessions.has(s.id) &&
             (filterAgentId === undefined || s.agentId === filterAgentId),
         )
         .sort(

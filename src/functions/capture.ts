@@ -223,11 +223,11 @@ export function registerCaptureFunctions(
     return inboxSize;
   }
 
-  async function complete(rec: InboxRecord, observationId: string): Promise<void> {
+  async function complete(rec: InboxRecord, observationId: string, storedSessionId?: string): Promise<void> {
     const done: CompletedEvent = {
       key: rec.key,
       eventId: rec.eventId,
-      sessionId: rec.sessionId,
+      sessionId: storedSessionId ?? rec.sessionId,
       project: rec.project,
       observationId,
       acceptedAt: rec.acceptedAt,
@@ -251,7 +251,7 @@ export function registerCaptureFunctions(
 
   async function attempt(rec: InboxRecord): Promise<CaptureResult> {
     rec.attempts++;
-    type ObserveResult = { observationId?: string; deduplicated?: boolean; success?: boolean; error?: string; knowledgeCapture?: unknown };
+    type ObserveResult = { observationId?: string; sessionId?: string; deduplicated?: boolean; success?: boolean; error?: string; knowledgeCapture?: unknown };
     let result = null as ObserveResult | null;
     let failure: string | null = null;
     try {
@@ -269,7 +269,7 @@ export function registerCaptureFunctions(
     const now = new Date();
     if (!failure && result && typeof result.observationId === "string") {
       if (rec.attempts > 1) counters.recovered++;
-      await complete(rec, result.observationId);
+      await complete(rec, result.observationId, typeof result.sessionId === "string" ? result.sessionId : undefined);
       return {
         status: "accepted", state: "completed", eventId: rec.eventId, observationId: result.observationId, attempts: rec.attempts,
         ...(result.knowledgeCapture !== undefined ? { knowledgeCapture: result.knowledgeCapture } : {}),

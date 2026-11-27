@@ -67,6 +67,7 @@ import { getCaptureController, type CaptureResult } from "../functions/capture.j
 import { withoutObservationSource } from "../functions/observation-source.js";
 import { clearSessionFinalize, scheduleSessionFinalize } from "../functions/session-finalize.js";
 import { getSummaryTriggerTimeoutMs, requestSummaryRefresh } from "../functions/summary-state.js";
+import { preserveRolloverState, resolveActiveSessionId } from "../functions/session-rollover.js";
 import { registerCompressionApi } from "./compression.js";
 import {
   getFinalizeIdleMs,
@@ -1186,6 +1187,7 @@ export function registerApiTriggers(
         const existing = await kv.get<Session>(KV.sessions, sessionId);
         const merged: Session = {
           ...freshSession,
+          ...preserveRolloverState(existing),
           observationCount: existing?.observationCount ?? freshSession.observationCount,
           firstPrompt: freshSession.firstPrompt ?? existing?.firstPrompt,
           summary: freshSession.summary ?? existing?.summary,
@@ -1230,13 +1232,14 @@ export function registerApiTriggers(
   sdk.registerFunction("api::session::end",
     async (req: HttpRequest<{ sessionId: string; final?: boolean }>): Promise<Response> => {
       const body = req.body as Record<string, unknown> | undefined;
-      const sessionId = asNonEmptyString(body?.sessionId);
-      if (!sessionId) {
+      const rawSessionId = asNonEmptyString(body?.sessionId);
+      if (!rawSessionId) {
         return {
           status_code: 400,
           body: { error: "sessionId is required and must be a non-empty string" },
         };
       }
+      const sessionId = await resolveActiveSessionId(kv, rawSessionId);
       if (body?.final === false && getFinalizeIdleMs() > 0) {
         const deferResult = await withKeyedLock(`obs:${sessionId}`, async () => {
           const session = await kv.get<Session>(KV.sessions, sessionId);
