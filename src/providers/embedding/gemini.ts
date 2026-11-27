@@ -2,6 +2,7 @@ import type { EmbeddingProvider } from "../../types.js";
 import { getEnvVar } from "../../config.js";
 import { logger } from "../../logger.js";
 import { fetchWithTimeout } from "../_fetch.js";
+import { createGeminiKeyPool, isGeminiKeyFailure, type GeminiKeyPool } from "./gemini-key-pool.js";
 
 const BATCH_LIMIT = 100;
 const MAX_RETRIES = 4;
@@ -22,13 +23,16 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
   readonly vectorSpace?: string;
   private apiKey: string;
   private fallbackKey: string;
+  private keyPool?: GeminiKeyPool;
   private model: string;
   private prefixed: boolean;
 
   constructor(apiKey?: string) {
     this.apiKey = apiKey || getEnvVar("GEMINI_API_KEY") || "";
     this.fallbackKey = getEnvVar("GEMINI_API_KEY_FALLBACK") || "";
-    if (!this.apiKey) throw new Error("GEMINI_API_KEY is required");
+    const keyFile = (getEnvVar("GEMINI_API_KEY_FILE") || "").trim();
+    if (keyFile) this.keyPool = createGeminiKeyPool(keyFile, getEnvVar("GEMINI_API_KEY_PREFER") || "", this.apiKey);
+    if (!this.apiKey && !this.keyPool) throw new Error("GEMINI_API_KEY is required");
     const model = (getEnvVar("GEMINI_EMBEDDING_MODEL") || "").trim().replace(/^models\//, "") || DEFAULT_MODEL;
     this.model = `models/${model}`;
     this.prefixed = model.startsWith("gemini-embedding-2");
@@ -63,6 +67,20 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
     });
   }
 
+  /** One attempt over the key pool: a key that is refused or over its quota is skipped for a while and the next key gets the same chunk. */
+  private async postWithPool(chunk: string[], pool: GeminiKeyPool): Promise<Response> {
+    const keys = pool.order();
+    let response!: Response;
+    for (const [index, { label, key }] of keys.entries()) {
+      response = await this.postChunk(chunk, key);
+      if (response.ok || index === keys.length - 1) break;
+      if (!isGeminiKeyFailure(response.status, await response.clone().text())) break;
+      pool.cool(key);
+      logger.warn("[agentmemory] gemini embed: key refused or over its quota; trying the next key", { label, status: response.status });
+    }
+    return response;
+  }
+
   private async request(texts: string[]): Promise<Float32Array[]> {
     const results: Float32Array[] = [];
 
@@ -72,9 +90,10 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
       let data: { embeddings: Array<{ values: number[] }> } | null = null;
 
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        const useFallback = attempt === MAX_RETRIES && this.fallbackKey !== "";
-        const key = useFallback ? this.fallbackKey : this.apiKey;
-        const response = await this.postChunk(chunk, key);
+        const useFallback = !this.keyPool && attempt === MAX_RETRIES && this.fallbackKey !== "";
+        const response = this.keyPool
+          ? await this.postWithPool(chunk, this.keyPool)
+          : await this.postChunk(chunk, useFallback ? this.fallbackKey : this.apiKey);
 
         if (response.ok) {
           data = (await response.json()) as {
