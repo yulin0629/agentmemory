@@ -15,26 +15,34 @@ export function base64ToFloat32(b64: string): Float32Array {
   );
 }
 
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+function vectorNorm(v: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < v.length; i++) sum += v[i] * v[i];
+  return Math.sqrt(sum);
+}
+
+function cosineSimilarity(a: Float32Array, normA: number, b: Float32Array, normB: number): number {
   if (a.length !== b.length) return 0;
   let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  const denom = normA * normB;
   return denom === 0 ? 0 : dot / denom;
 }
 
 export type VectorEntry = { embedding: Float32Array; sessionId: string };
 
+// A stored embedding is never changed in place, so its norm is computed once
+// when it is stored: the search loop is then one dot product per vector.
+type StoredEntry = VectorEntry & { norm: number };
+
+function storedEntry(embedding: Float32Array, sessionId: string): StoredEntry {
+  return { embedding, sessionId, norm: vectorNorm(embedding) };
+}
+
 export type VectorChangeListener = (obsId: string | null, entry: VectorEntry | null) => void;
 
 export class VectorIndex {
-  private vectors: Map<string, VectorEntry> = new Map();
+  private vectors: Map<string, StoredEntry> = new Map();
   private changes: Map<string, boolean> = new Map();
   private listener: VectorChangeListener | null = null;
 
@@ -43,7 +51,7 @@ export class VectorIndex {
   }
 
   add(obsId: string, sessionId: string, embedding: Float32Array): void {
-    const entry = { embedding, sessionId };
+    const entry = storedEntry(embedding, sessionId);
     this.vectors.set(obsId, entry);
     this.changes.set(obsId, true);
     this.listener?.(obsId, entry);
@@ -69,7 +77,7 @@ export class VectorIndex {
   }
 
   loadPersisted(obsId: string, sessionId: string, embedding: Float32Array): void {
-    this.vectors.set(obsId, { embedding, sessionId });
+    this.vectors.set(obsId, storedEntry(embedding, sessionId));
   }
 
   get pendingChanges(): number {
@@ -109,11 +117,12 @@ export class VectorIndex {
       score: number;
     }> = [];
     let minScore = -Infinity;
+    const queryNorm = vectorNorm(query);
 
     for (const [obsId, entry] of this.vectors) {
       if (!matchesSearchLayer(obsId, entry.sessionId, targetLayer, resolveLayer?.(obsId, entry.sessionId))) continue;
       if (filter && !filter(obsId)) continue;
-      const score = cosineSimilarity(query, entry.embedding);
+      const score = cosineSimilarity(query, queryNorm, entry.embedding, entry.norm);
       if (results.length < limit) {
         results.push({ obsId, sessionId: entry.sessionId, score });
         if (results.length === limit) {
@@ -166,15 +175,13 @@ export class VectorIndex {
   }
 
   restoreFrom(other: VectorIndex): void {
-    const src = (other as any).vectors as Map<
-      string,
-      { embedding: Float32Array; sessionId: string }
-    >;
+    const src = (other as any).vectors as Map<string, StoredEntry>;
     this.vectors = new Map();
     for (const [obsId, entry] of src) {
       this.vectors.set(obsId, {
         embedding: new Float32Array(entry.embedding),
         sessionId: entry.sessionId,
+        norm: entry.norm,
       });
     }
     this.changes = new Map(other.changes);
@@ -213,10 +220,7 @@ export class VectorIndex {
           typeof entry?.sessionId !== "string"
         )
           continue;
-        idx.vectors.set(obsId, {
-          embedding: base64ToFloat32(entry.embedding),
-          sessionId: entry.sessionId,
-        });
+        idx.vectors.set(obsId, storedEntry(base64ToFloat32(entry.embedding), entry.sessionId));
       } catch {
         continue;
       }

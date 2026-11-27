@@ -115,4 +115,24 @@ describe("VectorIndex", () => {
     expect(results[0].obsId).toBe("obs_slice");
     expect(results[0].score).toBeCloseTo(1.0, 4);
   });
+  it("scores a vector the same whichever way it entered the index", () => {
+    const stored = new Float32Array([3, 4, 12]);
+    const query = new Float32Array([1, 2, 2]);
+    const expected = (3 * 1 + 4 * 2 + 12 * 2) / (13 * 3);
+
+    const added = new VectorIndex();
+    added.add("obs_1", "ses_1", stored);
+    const loaded = new VectorIndex();
+    loaded.loadPersisted("obs_1", "ses_1", stored);
+    const restored = new VectorIndex();
+    restored.restoreFrom(added);
+    const deserialized = VectorIndex.deserialize(added.serialize());
+    const replaced = new VectorIndex();
+    replaced.add("obs_1", "ses_1", new Float32Array([100, 0, 0]));
+    replaced.add("obs_1", "ses_1", stored);
+
+    for (const idx of [added, loaded, restored, deserialized, replaced]) {
+      expect(idx.search(query)[0].score).toBeCloseTo(expected, 12);
+    }
+  });
 });
