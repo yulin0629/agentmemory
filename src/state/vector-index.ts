@@ -31,8 +31,9 @@ function cosineSimilarity(a: Float32Array, normA: number, b: Float32Array, normB
 
 export type VectorEntry = { embedding: Float32Array; sessionId: string };
 
-// A stored embedding is never changed in place, so its norm is computed once
-// when it is stored: the search loop is then one dot product per vector.
+// The norm is computed once, when the vector is stored, so the search loop is
+// one dot product per vector. add() and loadPersisted() keep the caller's
+// array: a caller must not change it afterwards, or the stored norm is stale.
 type StoredEntry = VectorEntry & { norm: number };
 
 function storedEntry(embedding: Float32Array, sessionId: string): StoredEntry {
