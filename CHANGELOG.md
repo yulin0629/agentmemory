@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **Graph enrichment no longer waits behind the embedding call.** Hybrid search started the graph's search by entity names only after the query was embedded and the vectors were scanned, then waited up to 500 ms for it. That search now starts before the embedding call, so its storage reads overlap the wait. Expansion from the vector hits still follows the vector stage and reads through its own bounded reader, because the entity search can use up a reader's allowance first. The 500 ms budget still counts from the end of keyword and vector retrieval.
 - **Vector search does a third of the arithmetic per stored vector.** The scan recomputed the norm of the query and of every stored vector on each search; a stored vector's norm is now computed once when the vector is stored. Scores are unchanged bit for bit.
 
 ### Fixed

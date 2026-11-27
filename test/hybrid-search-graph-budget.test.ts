@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HybridSearch } from "../src/state/hybrid-search.js";
 import { SearchIndex } from "../src/state/search-index.js";
+import { VectorIndex } from "../src/state/vector-index.js";
 import { KV } from "../src/state/schema.js";
 import { initializeGraphIndex, reconcileGraphIndexRecord } from "../src/state/graph-retrieval-index.js";
 import type { CompressedObservation } from "../src/types.js";
@@ -38,6 +39,13 @@ async function fixture(hold = true) {
   reads.length = 0;
   holding = hold;
   return { hybrid: new HybridSearch(index, null, null, kv as never), release, reads, kv, index };
+}
+
+// A provider whose query embedding stays pending until the test releases it.
+function heldEmbedding() {
+  let release!: () => void;
+  const pending = new Promise<Float32Array>((resolve) => { release = () => resolve(new Float32Array([1, 0])); });
+  return { provider: { name: "fixture", dimensions: 2, embed: () => pending, embedBatch: async () => [] }, release };
 }
 
 afterEach(() => vi.useRealTimers());
@@ -79,6 +87,50 @@ describe("optional graph retrieval budget", () => {
     expect(results[0].graphScore).toBeGreaterThan(0);
     expect(results[0].graphContext).toContain(observation.title);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("searches the graph by entity during a slow embedding call without spending the budget", async () => {
+    vi.useFakeTimers();
+    const { kv, index, reads } = await fixture(false);
+    const vectors = new VectorIndex();
+    vectors.add(observation.id, observation.sessionId, new Float32Array([1, 0]));
+    const embedding = heldEmbedding();
+    const search = new HybridSearch(index, vectors, embedding.provider, kv as never).search("Cobalt");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(reads).toContain(KV.graphRetrievalData);
+    embedding.release();
+    const results = await search;
+    expect(results[0].graphScore).toBeGreaterThan(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("expands from vector hits after the entity search has used up its reads", async () => {
+    const { kv, index, reads } = await fixture(false);
+    const node = (id: string, name: string, sourceObservationIds: string[]) => reconcileGraphIndexRecord(kv as never, "node", id, {
+      id, name, type: "concept", properties: {}, sourceObservationIds, createdAt: observation.timestamp,
+    });
+    // Nodes named like the query whose sources no longer exist: checking them
+    // takes more reads than one graph query may make.
+    for (let i = 0; i < 30; i++) await node(`gone_${i}`, `Cobalt ${i}`, Array.from({ length: 12 }, (_, j) => `obs_gone_${i}_${j}`));
+    // The vector hit's node leads to a record that no keyword or vector matches.
+    const seed = { ...observation, id: "obs_seed", title: "Seed capture", narrative: "Seed capture", concepts: [] };
+    const linked = { ...observation, id: "obs_linked", title: "Linked evidence", narrative: "Linked evidence", concepts: [] };
+    for (const obs of [seed, linked]) { index.add(obs); await kv.set(KV.observations(obs.sessionId), obs.id, obs); }
+    await node("zeta", "Zeta", [seed.id]);
+    await node("yotta", "Yotta", [linked.id]);
+    await reconcileGraphIndexRecord(kv as never, "edge", "zeta_yotta", {
+      id: "zeta_yotta", sourceNodeId: "zeta", targetNodeId: "yotta", type: "related_to", weight: 0.8,
+      sourceObservationIds: [seed.id], createdAt: observation.timestamp,
+    });
+    const vectors = new VectorIndex();
+    vectors.add(seed.id, seed.sessionId, new Float32Array([1, 0]));
+    const embedding = heldEmbedding();
+    reads.length = 0;
+    const search = new HybridSearch(index, vectors, embedding.provider, kv as never).search("Cobalt");
+    for (let seen = -1; seen !== reads.length;) { seen = reads.length; await new Promise((resolve) => setTimeout(resolve, 5)); }
+    embedding.release();
+    const hit = (await search).find((result) => result.observation.id === linked.id);
+    expect(hit?.graphScore).toBeGreaterThan(0);
   });
 
   it("bounds concurrent query reformulations and can recover on the next search", async () => {

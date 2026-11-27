@@ -39,6 +39,8 @@ export interface HybridSearchRequest {
 const MEMORY_QUOTA = 3;
 const isMemoryId = (id: string): boolean => id.startsWith("mem_");
 
+type GraphQueries = { entities: GraphQuery; chunks: GraphQuery };
+
 // Maps one stream's scores onto 0..1 with its best candidate at 1. A stream
 // cut off at the pool limit puts its weakest candidate at 0; a stream that
 // returned everything it found has no cut-off score and scales from 0, or
@@ -58,6 +60,13 @@ export class HybridSearch {
   private graphRetrieval: GraphRetrieval;
   private lastGraphTimeoutWarningAt = -Infinity;
 
+  // One request makes two graph queries. The entity search starts before the
+  // embedding call and can use up a query's read allowance before the vector
+  // hits exist, which would leave chunk expansion nothing to read with.
+  private graphQueries(authorize?: GraphObservationAuthorization): GraphQueries {
+    return { entities: this.graphRetrieval.createQuery(authorize), chunks: this.graphRetrieval.createQuery(authorize) };
+  }
+
   constructor(
     private bm25: SearchIndex,
     private vector: VectorIndex | null,
@@ -72,7 +81,7 @@ export class HybridSearch {
   }
 
   async search(query: string, limit = 20, targetLayer: SearchLayer = "all", authorizeGraph?: GraphObservationAuthorization, request?: HybridSearchRequest): Promise<HybridSearchResult[]> {
-    return this.tripleStreamSearch(query, limit, targetLayer, this.graphRetrieval.createQuery(authorizeGraph), undefined, true, request);
+    return this.tripleStreamSearch(query, limit, targetLayer, this.graphQueries(authorizeGraph), undefined, true, request);
   }
 
   async searchWithExpansion(
@@ -93,10 +102,10 @@ export class HybridSearch {
       ...extractEntitiesFromQuery(query),
     ];
 
-    const graphQuery = this.graphRetrieval.createQuery(authorizeGraph);
+    const graph = this.graphQueries(authorizeGraph);
     const retrievalLimit = this.rerankEnabled ? Math.max(limit, 20) : limit;
     const resultSets = await Promise.all(
-      allQueries.map((q) => this.tripleStreamSearch(q, retrievalLimit, targetLayer, graphQuery, allEntities, false)),
+      allQueries.map((q) => this.tripleStreamSearch(q, retrievalLimit, targetLayer, graph, allEntities, false)),
     );
 
     const merged = new Map<string, HybridSearchResult>();
@@ -122,7 +131,7 @@ export class HybridSearch {
     query: string,
     limit: number,
     targetLayer: SearchLayer,
-    graphQuery: GraphQuery,
+    graph: GraphQueries,
     entityHints?: string[],
     applyReranking = true,
     request?: HybridSearchRequest,
@@ -130,6 +139,16 @@ export class HybridSearch {
     const retrievalLimit = this.rerankEnabled ? Math.max(limit, 20) : limit;
     const poolLimit = Math.max(retrievalLimit * 2, MIN_FUSION_POOL);
     const bm25Results = this.bm25.search(query, poolLimit, targetLayer);
+
+    // The entity search needs only the query, so its storage reads run while
+    // the embedding call is in flight instead of after the vector stage.
+    const entities =
+      entityHints && entityHints.length > 0
+        ? entityHints
+        : extractEntitiesFromQuery(query);
+    const entityHits = this.graphWeight > 0 && entities.length > 0
+      ? graph.entities.searchByEntities(entities, 2, retrievalLimit, targetLayer).catch(() => [])
+      : undefined;
 
     let vectorResults: Array<{
       obsId: string;
@@ -160,13 +179,9 @@ export class HybridSearch {
       }
     }
 
-    const entities =
-      entityHints && entityHints.length > 0
-        ? entityHints
-        : extractEntitiesFromQuery(query);
     const topVectorObs = vectorResults.slice(0, 5).map((r) => r.obsId);
     const graphResults = this.graphWeight > 0
-      ? await this.graphResults(graphQuery, entities, topVectorObs, retrievalLimit, targetLayer)
+      ? await this.graphResults(graph, entityHits, topVectorObs, targetLayer)
       : [];
 
     const scores = new Map<
@@ -290,25 +305,28 @@ export class HybridSearch {
     return targetLayer === "all" ? this.withMemoryQuota(query, queryEmbedding, ordered, limit) : ordered;
   }
 
+  // The budget is how long the graph may hold back a search whose keyword and
+  // vector streams are done; the entity search has had the embedding call's
+  // duration on top of it.
   private async graphResults(
-    query: GraphQuery,
-    entities: string[],
+    graph: GraphQueries,
+    entityHits: Promise<GraphRetrievalResult[]> | undefined,
     observations: string[],
-    limit: number,
     layer: SearchLayer,
   ): Promise<GraphRetrievalResult[]> {
-    if (!entities.length && !observations.length) return [];
+    if (!entityHits && !observations.length) return [];
+    const used = [...(entityHits ? [graph.entities] : []), ...(observations.length ? [graph.chunks] : [])];
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const work = Promise.all([
-        entities.length ? query.searchByEntities(entities, 2, limit, layer).catch(() => []) : [],
-        observations.length ? query.expandFromChunks(observations, 1, 5, layer).catch(() => []) : [],
+        entityHits ?? [],
+        observations.length ? graph.chunks.expandFromChunks(observations, 1, 5, layer).catch(() => []) : [],
       ]).then((results) => results.flat());
       const results = await Promise.race([
         work,
         new Promise<GraphRetrievalResult[]>((resolve) => {
           timer = setTimeout(() => {
-            query.cancel();
+            for (const query of used) query.cancel();
             if (Date.now() - this.lastGraphTimeoutWarningAt >= 60_000) {
               this.lastGraphTimeoutWarningAt = Date.now();
               logger.warn("Graph enrichment exceeded its budget; returning keyword and vector results", { budgetMs: GRAPH_BUDGET_MS });
@@ -317,8 +335,8 @@ export class HybridSearch {
           }, GRAPH_BUDGET_MS);
         }),
       ]);
-      const diagnostic = query.diagnostics();
-      if ((diagnostic.status !== "ready" || diagnostic.truncated) && Date.now() - this.lastGraphTimeoutWarningAt >= 60_000) {
+      const diagnostic = used.map((query) => query.diagnostics()).find((d) => d.status !== "ready" || d.truncated);
+      if (diagnostic && Date.now() - this.lastGraphTimeoutWarningAt >= 60_000) {
         this.lastGraphTimeoutWarningAt = Date.now();
         logger.warn("Graph enrichment is unavailable or partial", diagnostic);
       }
