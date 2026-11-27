@@ -1268,12 +1268,19 @@ async function main() {
     d.before = before;
     d.stopMs = await instA.stop();
     d.restartMs = await instA.start();
+    // observe() queues embeddings into EMBED_COALESCE_MS, so vectorDocuments can
+    // trail bm25Documents right before stop(); graceful stop flushes pending embeds,
+    // so after restart every indexed document must have a vector.
+    const expectedVectors = Math.max(before.vectorDocuments ?? 0, before.bm25Documents ?? 0);
     const after = await poll("indexes to match the pre-stop totals", async () => {
       const t = await instA.totals();
-      return t.bm25Documents >= before.bm25Documents && t.vectorDocuments >= before.vectorDocuments ? t : null;
+      return t.bm25Documents >= before.bm25Documents && t.vectorDocuments >= expectedVectors ? t : null;
     }, { timeoutMs: 30_000, intervalMs: 500 });
     d.after = after;
-    for (const k of Object.keys(before)) assert(after[k] === before[k], `${k} was ${before[k]} before stop and ${after[k]} after start`);
+    for (const k of Object.keys(before)) {
+      const expected = k === "vectorDocuments" ? expectedVectors : before[k];
+      assert(after[k] === expected, `${k} was ${before[k]} before stop (expected ${expected}) and ${after[k]} after start`);
+    }
     assert((await instA.countMarker(sid, m)) === 1, "the observation captured right before stop is missing");
     assert(await instA.searchFinds(m), "search lost the marker captured right before stop");
   });

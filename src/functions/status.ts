@@ -570,7 +570,7 @@ function captureProblems(capture: CaptureStatus | null, now: Date, restPort: num
       code: "capture-dead-letters",
       message: `${plural(inbox.dead, "captured observation")} could not be stored and ${inbox.dead === 1 ? "is parked as a dead letter" : "are parked as dead letters"}${inbox.lastError ? `: ${inbox.lastError}` : "."}`,
       fix: sessionCap
-        ? `The session reached its MAX_OBS_PER_SESSION cap, so a retry is refused again until the cap is raised. Raise MAX_OBS_PER_SESSION in ~/.agentmemory/.env (0 = no cap) and restart agentmemory. ${listAndRetry}`
+        ? `The session reached its MAX_OBS_PER_SESSION cap. Normal sessions now roll over into linked segments on retry; retry these dead letters first. If retries still hit the cap (for example, a sessionId longer than 193 characters or missing project/cwd), raise MAX_OBS_PER_SESSION in ~/.agentmemory/.env (0 = no cap) and restart agentmemory. ${listAndRetry}`
         : listAndRetry,
     });
   }
