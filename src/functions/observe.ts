@@ -149,7 +149,7 @@ export function registerObserveFunction(
         const rootSession = await kv.get<Session>(KV.sessions, rootSessionId);
         const activeSegmentId = rootSession?.activeSegmentId || rootSessionId;
         if (payload.event_id) {
-          const existingByEventId = await findObservationInSessionFamily(kv, rootSessionId, activeSegmentId, obsId);
+          const existingByEventId = await findObservationInSessionFamily(kv, rootSessionId, activeSegmentId, obsId, Boolean(rootSession));
           if (existingByEventId) {
             return { observationId: obsId, sessionId: existingByEventId.sessionId, deduplicated: true };
           }
@@ -218,7 +218,7 @@ export function registerObserveFunction(
         const promptRef = durable || typeof payload.eventId !== "string" ? obsId : payload.eventId;
 
         if (durable && !payload.event_id) {
-          const stored = await findObservationInSessionFamily(kv, rootSessionId, activeSegmentId, obsId);
+          const stored = await findObservationInSessionFamily(kv, rootSessionId, activeSegmentId, obsId, Boolean(rootSession));
           if (stored) {
             if (livePrompt) await recordLivePrompt(kv, rootSessionId, livePrompt, promptRef);
             await restoreIndexEntries(stored.observation);

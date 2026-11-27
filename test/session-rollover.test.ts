@@ -6,6 +6,8 @@ import { registerCaptureFunctions } from "../src/functions/capture.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import { registerContextFunction } from "../src/functions/context.js";
 import { registerSelectiveContextFunctions } from "../src/functions/selective-context.js";
+import { registerRememberFunction } from "../src/functions/remember.js";
+import { expandSessionFamily } from "../src/functions/session-rollover.js";
 import { DedupMap } from "../src/functions/dedup.js";
 import { KV } from "../src/state/schema.js";
 import { isKeyedLockHeld } from "../src/state/keyed-mutex.js";
@@ -48,66 +50,80 @@ function makePayload(sessionId: string, n: number, overrides: Record<string, unk
 
 describe("server-side session rollover", () => {
   it("rolls over into linked segments across multiple caps, seals old segments outside locks, and indexes new segments", async () => {
-    const { kv, sdk } = setup(2);
-    const stoppedEvents: Array<{ sessionId: string; rootLockHeld: boolean; segLockHeld: boolean }> = [];
-    const compressEvents: Array<{ sessionId: string; observationId: string; rootLockHeld: boolean }> = [];
+    const prevAutoCompress = process.env.AGENTMEMORY_AUTO_COMPRESS;
+    process.env.AGENTMEMORY_AUTO_COMPRESS = "true";
+    try {
+      const { kv, sdk } = setup(2);
+      const stoppedEvents: Array<{ sessionId: string; rootLockHeld: boolean; segLockHeld: boolean }> = [];
+      const compressEvents: Array<{ sessionId: string; observationId: string; rootLockHeld: boolean }> = [];
 
-    sdk.registerFunction("event::session::stopped", async (p: unknown) => {
-      const sid = (p as { sessionId: string }).sessionId;
-      stoppedEvents.push({
-        sessionId: sid,
-        rootLockHeld: isKeyedLockHeld("obs:sess-roll"),
-        segLockHeld: isKeyedLockHeld(`obs:${sid}`),
+      sdk.registerFunction("event::session::stopped", async (p: unknown) => {
+        const sid = (p as { sessionId: string }).sessionId;
+        stoppedEvents.push({
+          sessionId: sid,
+          rootLockHeld: isKeyedLockHeld("obs:sess-roll"),
+          segLockHeld: isKeyedLockHeld(`obs:${sid}`),
+        });
+        return { ok: true };
       });
-      return { ok: true };
-    });
-    sdk.registerFunction("mem::compress", async (p: unknown) => {
-      const { sessionId, observationId } = p as { sessionId: string; observationId: string };
-      compressEvents.push({
-        sessionId,
-        observationId,
-        rootLockHeld: isKeyedLockHeld("obs:sess-roll"),
+      sdk.registerFunction("mem::compress", async (p: unknown) => {
+        const { sessionId, observationId } = p as { sessionId: string; observationId: string };
+        compressEvents.push({
+          sessionId,
+          observationId,
+          rootLockHeld: isKeyedLockHeld("obs:sess-roll"),
+        });
+        return { ok: true };
       });
-      return { ok: true };
-    });
 
-    const results = [];
-    for (let i = 1; i <= 5; i++) {
-      results.push(await sdk.trigger("mem::observe", makePayload("sess-roll", i)) as Record<string, unknown>);
+      const results = [];
+      for (let i = 1; i <= 5; i++) {
+        results.push(await sdk.trigger("mem::observe", makePayload("sess-roll", i)) as Record<string, unknown>);
+      }
+
+      expect(results.every((r) => typeof r.observationId === "string")).toBe(true);
+      expect(results.map((r) => r.sessionId)).toEqual([
+        "sess-roll",
+        "sess-roll",
+        "sess-roll--seg-2",
+        "sess-roll--seg-2",
+        "sess-roll--seg-3",
+      ]);
+
+      expect(await kv.list(KV.observations("sess-roll"))).toHaveLength(2);
+      expect(await kv.list(KV.observations("sess-roll--seg-2"))).toHaveLength(2);
+      expect(await kv.list(KV.observations("sess-roll--seg-3"))).toHaveLength(1);
+
+      const root = await kv.get<Session>(KV.sessions, "sess-roll");
+      const seg2 = await kv.get<Session>(KV.sessions, "sess-roll--seg-2");
+      const seg3 = await kv.get<Session>(KV.sessions, "sess-roll--seg-3");
+      expect(root).toMatchObject({ status: "completed", activeSegmentId: "sess-roll--seg-3" });
+      expect(seg2).toMatchObject({ status: "completed", parentSessionId: "sess-roll" });
+      expect(seg3).toMatchObject({ status: "active", parentSessionId: "sess-roll", observationCount: 1 });
+
+      // Deferred triggers ran AFTER locks were released
+      expect(stoppedEvents).toEqual([
+        { sessionId: "sess-roll", rootLockHeld: false, segLockHeld: false },
+        { sessionId: "sess-roll--seg-2", rootLockHeld: false, segLockHeld: false },
+      ]);
+      expect(compressEvents).toHaveLength(5);
+      expect(compressEvents).toEqual(
+        results.map((r) => ({
+          observationId: r.observationId as string,
+          sessionId: r.sessionId as string,
+          rootLockHeld: false,
+        })),
+      );
+
+      // Project session index includes the rolled-over segments
+      const indexEntries = (await kv.get<Array<{ id: string }>>(KV.projectSessionsIndex, "demo")) ?? [];
+      expect(indexEntries.map((e) => e.id)).toEqual(
+        expect.arrayContaining(["sess-roll", "sess-roll--seg-2", "sess-roll--seg-3"]),
+      );
+    } finally {
+      if (prevAutoCompress === undefined) delete process.env.AGENTMEMORY_AUTO_COMPRESS;
+      else process.env.AGENTMEMORY_AUTO_COMPRESS = prevAutoCompress;
     }
-
-    expect(results.every((r) => typeof r.observationId === "string")).toBe(true);
-    expect(results.map((r) => r.sessionId)).toEqual([
-      "sess-roll",
-      "sess-roll",
-      "sess-roll--seg-2",
-      "sess-roll--seg-2",
-      "sess-roll--seg-3",
-    ]);
-
-    expect(await kv.list(KV.observations("sess-roll"))).toHaveLength(2);
-    expect(await kv.list(KV.observations("sess-roll--seg-2"))).toHaveLength(2);
-    expect(await kv.list(KV.observations("sess-roll--seg-3"))).toHaveLength(1);
-
-    const root = await kv.get<Session>(KV.sessions, "sess-roll");
-    const seg2 = await kv.get<Session>(KV.sessions, "sess-roll--seg-2");
-    const seg3 = await kv.get<Session>(KV.sessions, "sess-roll--seg-3");
-    expect(root).toMatchObject({ status: "completed", activeSegmentId: "sess-roll--seg-3" });
-    expect(seg2).toMatchObject({ status: "completed", parentSessionId: "sess-roll" });
-    expect(seg3).toMatchObject({ status: "active", parentSessionId: "sess-roll", observationCount: 1 });
-
-    // Deferred triggers ran AFTER locks were released
-    expect(stoppedEvents).toEqual([
-      { sessionId: "sess-roll", rootLockHeld: false, segLockHeld: false },
-      { sessionId: "sess-roll--seg-2", rootLockHeld: false, segLockHeld: false },
-    ]);
-    expect(compressEvents.every((c) => !c.rootLockHeld)).toBe(true);
-
-    // Project session index includes the rolled-over segments
-    const indexEntries = (await kv.get<Array<{ id: string }>>(KV.projectSessionsIndex, "demo")) ?? [];
-    expect(indexEntries.map((e) => e.id)).toEqual(
-      expect.arrayContaining(["sess-roll", "sess-roll--seg-2", "sess-roll--seg-3"]),
-    );
   });
 
   it("recovers parked dead letters via capture/retry into seg-2 and deduplicates subsequent client retries", async () => {
@@ -612,7 +628,7 @@ describe("server-side session rollover", () => {
     for (let i = 1; i <= 5; i++) {
       await sdk.trigger("mem::observe", makePayload("sess-orphan", i));
     }
-    const seg2Before = await kv.get<Session>(KV.sessions, "sess-orphan--seg-2");
+    const seg2Before = structuredClone(await kv.get<Session>(KV.sessions, "sess-orphan--seg-2"));
     expect(seg2Before).toMatchObject({
       parentSessionId: "sess-orphan",
       status: "completed",
@@ -648,5 +664,165 @@ describe("server-side session rollover", () => {
       activeSegmentId: "sess-orphan--seg-4",
       observationCount: 2,
     });
+  });
+
+  it("excludes preloaded child segments in mem::context even when root KV lookup fails", async () => {
+    const { kv, sdk } = setup(1);
+    await sdk.trigger("mem::observe", makePayload("sess-cf", 1));
+    await sdk.trigger("mem::observe", makePayload("sess-cf", 2));
+    await sdk.trigger("mem::observe", makePayload("sess-other-cf", 3));
+
+    const origGet = kv.get;
+    kv.get = async <T>(scope: string, key: string) => {
+      if (scope === KV.sessions && key === "sess-cf") {
+        throw new Error("root read failed");
+      }
+      return origGet<T>(scope, key);
+    };
+
+    const ctx = await sdk.trigger("mem::context", {
+      sessionId: "sess-cf",
+      project: "demo",
+      budget: 4000,
+    }) as { context: string };
+    expect(ctx.context).toContain("step-3");
+    expect(ctx.context).not.toContain("step-2");
+  });
+
+  it("verifies parentSessionId in expandSessionFamily, skips unowned/rowless scopes, and preserves parentSessionId on direct segment start", async () => {
+    const { kv, sdk } = setup(1);
+    // Unrelated session occupying R--seg-2 and rowless orphan observations occupying R--seg-3
+    await kv.set(KV.sessions, "sess-col--seg-2", {
+      id: "sess-col--seg-2",
+      project: "demo",
+      cwd: "/tmp/demo",
+      startedAt: "2026-11-26T00:00:00.000Z",
+      status: "active",
+      observationCount: 1,
+    });
+    await kv.set(KV.observations("sess-col--seg-3"), "obs_unowned_1", {
+      id: "obs_unowned_1",
+      sessionId: "sess-col--seg-3",
+      timestamp: "2026-11-26T00:00:01.000Z",
+      type: "change",
+      title: "unowned",
+      narrative: "unowned",
+      facts: [],
+      concepts: [],
+      files: [],
+      importance: 5,
+      confidence: 0.3,
+    });
+
+    await sdk.trigger("mem::observe", makePayload("sess-col", 1));
+    const rolled = await sdk.trigger("mem::observe", makePayload("sess-col", 2)) as Record<string, unknown>;
+    expect(rolled.sessionId).toBe("sess-col--seg-4");
+    expect(await kv.get(KV.sessions, "sess-col--seg-3")).toBeNull();
+    expect(await kv.list(KV.observations("sess-col--seg-3"))).toHaveLength(1);
+
+    // expandSessionFamily must NOT include unrelated seg-2 or unowned seg-3
+    const family = await expandSessionFamily(kv as never, ["sess-col"]);
+    expect([...family].sort()).toEqual(["sess-col", "sess-col--seg-4"]);
+
+    // Direct session/start on seg-4 must preserve parentSessionId
+    await sdk.trigger("api::session::start", {
+      body: { sessionId: "sess-col--seg-4", project: "demo", cwd: "/tmp/demo-direct" },
+    });
+    expect((await kv.get<Session>(KV.sessions, "sess-col--seg-4"))?.parentSessionId).toBe("sess-col");
+  });
+
+  it("deduplicates replayed segment event_id when the root session row is missing", async () => {
+    const { kv, sdk } = setup(1);
+    await sdk.trigger("mem::observe", makePayload("sess-miss", 1));
+    const seg2EventId = randomUUID();
+    const obs2 = await sdk.trigger("mem::observe", makePayload("sess-miss", 2, { event_id: seg2EventId })) as Record<string, unknown>;
+    expect(obs2.sessionId).toBe("sess-miss--seg-2");
+
+    await kv.delete(KV.sessions, "sess-miss");
+    const replay = await sdk.trigger("mem::observe", makePayload("sess-miss", 2, { event_id: seg2EventId })) as Record<string, unknown>;
+    expect(replay).toMatchObject({
+      observationId: obs2.observationId,
+      sessionId: "sess-miss--seg-2",
+      deduplicated: true,
+    });
+    expect(await kv.get(KV.sessions, "sess-miss--seg-3")).toBeNull();
+  });
+
+  it("deletes all verified rolled-over segments when mem::forget targets the root sessionId", async () => {
+    const { kv, sdk } = setup(1);
+    registerRememberFunction(sdk as never, kv as never);
+    await sdk.trigger("mem::observe", makePayload("sess-fg", 1));
+    await sdk.trigger("mem::observe", makePayload("sess-fg", 2));
+    await sdk.trigger("mem::observe", makePayload("sess-keep", 3));
+    await kv.set(KV.summaries, "sess-fg--seg-2", {
+      sessionId: "sess-fg--seg-2",
+      project: "demo",
+      title: "seg2",
+      narrative: "seg2 summary",
+      keyDecisions: [],
+      filesModified: [],
+      observationCount: 1,
+      createdAt: "2026-11-27T00:00:05.000Z",
+    });
+
+    const forgotten = await sdk.trigger("mem::forget", { sessionId: "sess-fg" }) as { success: boolean; deleted: number };
+    expect(forgotten.success).toBe(true);
+    expect(await kv.get(KV.sessions, "sess-fg")).toBeNull();
+    expect(await kv.get(KV.sessions, "sess-fg--seg-2")).toBeNull();
+    expect(await kv.list(KV.observations("sess-fg"))).toHaveLength(0);
+    expect(await kv.list(KV.observations("sess-fg--seg-2"))).toHaveLength(0);
+    expect(await kv.get(KV.summaries, "sess-fg--seg-2")).toBeNull();
+    // Unrelated session stays untouched
+    expect(await kv.get(KV.sessions, "sess-keep")).not.toBeNull();
+    expect(await kv.list(KV.observations("sess-keep"))).toHaveLength(1);
+  });
+
+  it("returns knowledge_changed in selective-context if a concurrent rollover adds a segment mid-call", async () => {
+    const { kv, sdk } = setup(1);
+    await sdk.trigger("mem::observe", makePayload("sess-sc-race", 1));
+    const other = await sdk.trigger("mem::observe", {
+      sessionId: "sess-sc-other",
+      hookType: "stop",
+      project: "demo",
+      cwd: "/tmp/demo",
+      timestamp: "2026-11-26T00:00:02.000Z",
+      data: { last_assistant_message: "Always verify rollover exclusion snapshots." },
+    }) as { observationId: string };
+    const row = await kv.get<CompressedObservation>(KV.observations("sess-sc-other"), other.observationId);
+    await kv.set(KV.observations("sess-sc-other"), other.observationId, {
+      ...row!,
+      type: "decision",
+      title: "Rollover exclusion rule",
+      confidence: 0.9,
+      narrative: "Always verify rollover exclusion snapshots.",
+    });
+
+    const scSdk = mockSdk({ looseTrigger: true });
+    scSdk.registerFunction("mem::smart-search", async () => ({
+      results: [{ obsId: other.observationId, sessionId: "sess-sc-other", score: 10 }],
+    }));
+    registerSelectiveContextFunctions(scSdk as never, kv as never, {
+      namespace: "default",
+      judge: async (_req, candidates) => {
+        // Trigger a concurrent rollover on sess-sc-race while the judge is running
+        await sdk.trigger("mem::observe", makePayload("sess-sc-race", 2));
+        return candidates.flatMap((c) => c.spans.map((s) => ({
+          knowledgeId: c.id,
+          revision: c.revision,
+          spanId: s.id,
+          useful: 0.95,
+          compatibility: "compatible" as const,
+          addition: "adds" as const,
+        })));
+      },
+    });
+
+    const res = await scSdk.trigger("mem::selective-context", {
+      prompt: "how should rollover exclusion work?",
+      project: "demo",
+      sessionId: "sess-sc-race",
+      recallHistory: true,
+    }) as { status: string; error?: string };
+    expect(res).toMatchObject({ status: "unavailable", error: "knowledge_changed" });
   });
 });

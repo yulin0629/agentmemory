@@ -194,11 +194,19 @@ export function registerContextFunction(
         }
       }
 
+      const preloadedSessions = new Map<string, Session | null>(projectSessions.map((s) => [s.id, s]));
+      const fallbackExcluded = new Set<string>([data.sessionId]);
+      const fallbackRootId = preloadedSessions.get(data.sessionId)?.parentSessionId ?? data.sessionId;
+      fallbackExcluded.add(fallbackRootId);
+      for (const s of projectSessions) {
+        if (s.parentSessionId === fallbackRootId) fallbackExcluded.add(s.id);
+      }
       const excludedSessions = await expandSessionFamily(
         kv,
         [data.sessionId],
-        new Map<string, Session | null>(projectSessions.map((s) => [s.id, s])),
-      ).catch(() => new Set<string>([data.sessionId]));
+        preloadedSessions,
+      ).catch(() => new Set<string>());
+      for (const id of fallbackExcluded) excludedSessions.add(id);
       const sessions = projectSessions
         .filter(
           (s) =>

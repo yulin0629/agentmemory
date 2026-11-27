@@ -61,6 +61,7 @@ export function preserveRolloverState(existing: Session | null, project?: string
       status: existing.status,
       activeSegmentId: existing.activeSegmentId,
     } : {}),
+    ...(existing.parentSessionId ? { parentSessionId: existing.parentSessionId } : {}),
     ...(existing.contextProjectId && (project === undefined || existing.project === project)
       ? { contextProjectId: existing.contextProjectId }
       : {}),
@@ -108,14 +109,26 @@ export async function expandSessionFamily(
   }
   await loadMissing([...rootIds]);
 
+  const candidatesByRoot: Array<{ rootId: string; candidateIds: string[] }> = [];
   for (const rootId of rootIds) {
     const root = sessionMap.get(rootId);
     if (!root?.activeSegmentId) continue;
     expanded.add(rootId);
-    expanded.add(root.activeSegmentId);
     const maxIndex = parseSegmentIndex(root.activeSegmentId, rootId);
+    const candidateIds = new Set<string>([root.activeSegmentId]);
     for (let i = 2; i <= maxIndex; i++) {
-      expanded.add(`${rootId}${SEGMENT_SEPARATOR}${i}`);
+      candidateIds.add(`${rootId}${SEGMENT_SEPARATOR}${i}`);
+    }
+    candidatesByRoot.push({ rootId, candidateIds: [...candidateIds] });
+  }
+  if (candidatesByRoot.length > 0) {
+    await loadMissing(candidatesByRoot.flatMap((entry) => entry.candidateIds));
+    for (const { rootId, candidateIds } of candidatesByRoot) {
+      for (const segId of candidateIds) {
+        if (sessionMap.get(segId)?.parentSessionId === rootId) {
+          expanded.add(segId);
+        }
+      }
     }
   }
   return expanded;
@@ -126,9 +139,10 @@ export async function findObservationInSessionFamily(
   rootSessionId: string,
   activeSegmentId: string,
   obsId: string,
+  rootExists = true,
 ): Promise<{ sessionId: string; observation: CompressedObservation } | null> {
   return withSessionLock(activeSegmentId, async () => {
-    if (activeSegmentId === rootSessionId) {
+    if (rootExists && activeSegmentId === rootSessionId) {
       const direct = await kv.get<CompressedObservation>(KV.observations(rootSessionId), obsId);
       return direct ? { sessionId: rootSessionId, observation: direct } : null;
     }
@@ -136,7 +150,9 @@ export async function findObservationInSessionFamily(
     const [direct, indexedSid, inRoot] = await Promise.all([
       kv.get<CompressedObservation>(KV.observations(activeSegmentId), obsId),
       lookupObservationSession(kv, obsId),
-      kv.get<CompressedObservation>(KV.observations(rootSessionId), obsId),
+      activeSegmentId === rootSessionId
+        ? Promise.resolve(null)
+        : kv.get<CompressedObservation>(KV.observations(rootSessionId), obsId),
     ]);
     if (direct) return { sessionId: activeSegmentId, observation: direct };
 
@@ -263,30 +279,28 @@ export async function withWritableSegment<T>(
         }
         if (!existingSession) {
           const keys = await listScopeKeys(kv, KV.observations(currentSessionId));
-          if (keys.length === 0) {
-            const inheritedAgentId = rootSession ? rootSession.agentId : getAgentId();
-            const inheritedContextProjectId = rootSession?.contextProjectId ?? contextProjectId;
-            const nextSession: Session = {
-              id: currentSessionId,
-              project: rollover.project,
-              cwd: rollover.cwd,
-              startedAt: rollover.nowIso,
-              updatedAt: rollover.nowIso,
-              status: "active",
-              observationCount: 0,
-              parentSessionId: rootSessionId,
-              ...(inheritedContextProjectId ? { contextProjectId: inheritedContextProjectId } : {}),
-              ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-              ...(rootSession?.tags ? { tags: [...rootSession.tags] } : {}),
-            };
-            await kv.set(KV.sessions, currentSessionId, nextSession);
-            await indexSession(kv, nextSession);
-            existingSession = nextSession;
-            existing = [];
-          } else if (cap > 0 && keys.length >= cap) {
-            full = true;
-            existingCount = keys.length;
+          if (keys.length > 0) {
+            return { kind: "skip", nextId: nextSegmentId(rootSessionId, currentSessionId) };
           }
+          const inheritedAgentId = rootSession ? rootSession.agentId : getAgentId();
+          const inheritedContextProjectId = rootSession?.contextProjectId ?? contextProjectId;
+          const nextSession: Session = {
+            id: currentSessionId,
+            project: rollover.project,
+            cwd: rollover.cwd,
+            startedAt: rollover.nowIso,
+            updatedAt: rollover.nowIso,
+            status: "active",
+            observationCount: 0,
+            parentSessionId: rootSessionId,
+            ...(inheritedContextProjectId ? { contextProjectId: inheritedContextProjectId } : {}),
+            ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
+            ...(rootSession?.tags ? { tags: [...rootSession.tags] } : {}),
+          };
+          await kv.set(KV.sessions, currentSessionId, nextSession);
+          await indexSession(kv, nextSession);
+          existingSession = nextSession;
+          existing = [];
         }
       }
 

@@ -1280,6 +1280,7 @@ export function registerApiTriggers(
         return result;
       };
       if (body?.final === false && getFinalizeIdleMs() > 0) {
+        let finalizeAt = 0;
         const deferResult = await runWithRolloverRetry((targetId) =>
           withKeyedLock(`obs:${targetId}`, async () => {
             const session = await kv.get<Session>(KV.sessions, targetId);
@@ -1293,6 +1294,7 @@ export function registerApiTriggers(
               updates.push({ type: "remove", path: "endedAt" });
             }
             await kv.update(KV.sessions, targetId, updates);
+            finalizeAt = await scheduleSessionFinalize(kv, targetId);
             return "deferred" as const;
           }),
         );
@@ -1302,7 +1304,6 @@ export function registerApiTriggers(
             body: { success: true, ended: false, reason: deferResult },
           };
         }
-        const finalizeAt = await scheduleSessionFinalize(kv, sessionId);
         return {
           status_code: 200,
           body: {

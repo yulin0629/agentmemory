@@ -496,6 +496,13 @@ export function registerSelectiveContextFunctions(
       if (hermes && JSON.stringify(await kv.get(KV.sessions, hermes.sessionId)) !== JSON.stringify(currentSession)) {
         return { status: "unavailable", spans: [], error: "knowledge_changed" };
       }
+      if ((hermes || parsed.data.recallHistory) && result.spans.length > 0) {
+        const latestExcluded = await expandSessionFamily(kv, rawExcludedSessions);
+        if (latestExcluded.size !== excludedSessions.size
+          || [...latestExcluded].some((id) => !excludedSessions.has(id))) {
+          return { status: "unavailable", spans: [], error: "knowledge_changed" };
+        }
+      }
       return { ...result, catalogRevision: catalog.revision, candidates: candidateCounts,
         ...(hermes || parsed.data.recallHistory ? { timings: {
           retrievalMs: judgeStarted - (deadline - 6500), judgeMs: Date.now() - judgeStarted,
