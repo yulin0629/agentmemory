@@ -57,6 +57,7 @@ export interface ArchiveObservationsInput {
   cursor?: string;
   sessionIds?: string[];
   project?: string;
+  types?: string[];
 }
 
 export interface ArchiveObservationsResult {
@@ -64,6 +65,7 @@ export interface ArchiveObservationsResult {
   dryRun: boolean;
   olderThanDays: number;
   keepImportance: number;
+  types?: string[];
   scannedSessions: number;
   archivedSessions: number;
   archivedObservations: number;
@@ -233,12 +235,14 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
       const olderThanDays = numberInRange(data?.olderThanDays, DEFAULT_OLDER_THAN_DAYS, MIN_OLDER_THAN_DAYS, 36_500);
       const keepImportance = numberInRange(data?.keepImportance, DEFAULT_KEEP_IMPORTANCE, 1, 11);
       const maxSessions = Math.floor(numberInRange(data?.maxSessions, DEFAULT_MAX_SESSIONS, 1, MAX_SESSIONS_PER_CALL));
+      const types = Array.isArray(data?.types) ? new Set(data.types) : null;
       const cutoff = Date.now() - olderThanDays * MS_PER_DAY;
       const result: ArchiveObservationsResult = {
         success: true,
         dryRun,
         olderThanDays,
         keepImportance,
+        ...(types ? { types: [...types] } : {}),
         scannedSessions: 0,
         archivedSessions: 0,
         archivedObservations: 0,
@@ -267,6 +271,7 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
       const eligible = (row: StoredObservation): row is CompressedObservation =>
         "title" in row && Boolean(row.title) && !needsCompression(row) &&
         Date.parse(row.timestamp) < cutoff &&
+        (!types || types.has(row.type)) &&
         (typeof row.importance === "number" ? row.importance : 5) < keepImportance &&
         !row.imageData && !row.imageRef && !keepHot.has(row.id);
 
@@ -351,6 +356,7 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
                 archivedTotal: archived.length,
                 olderThanDays,
                 keepImportance,
+                ...(types ? { types: [...types] } : {}),
               });
               result.archivedSessions++;
               result.archivedObservations += removed;

@@ -1946,6 +1946,9 @@ export function registerApiTriggers(
             ? body.sessionIds.filter((id): id is string => typeof id === "string").slice(0, 500)
             : undefined,
           project: typeof body.project === "string" ? body.project : undefined,
+          types: Array.isArray(body.types)
+            ? body.types.filter((type): type is string => typeof type === "string").slice(0, 50)
+            : undefined,
         },
         timeoutMs: ARCHIVE_TRIGGER_TIMEOUT_MS,
       });
