@@ -217,6 +217,15 @@ export function registerObserveFunction(
         const livePrompt = submittedPrompt && !backfillPrompt ? submittedPrompt : undefined;
         const promptRef = durable || typeof payload.eventId !== "string" ? obsId : payload.eventId;
 
+        if (durable && !payload.event_id) {
+          const stored = await findObservationInSessionFamily(kv, rootSessionId, activeSegmentId, obsId);
+          if (stored) {
+            if (livePrompt) await recordLivePrompt(kv, rootSessionId, livePrompt, promptRef);
+            await restoreIndexEntries(stored.observation);
+            return { observationId: obsId, sessionId: stored.sessionId, deduplicated: true, existing: true };
+          }
+        }
+
         if (backfillPrompt && (await claimBackfillPrompt(kv, rootSessionId, backfillPrompt, promptRef))) {
           recordDedupSkip();
           return { deduplicated: true, sessionId: rootSessionId };
@@ -228,8 +237,6 @@ export function registerObserveFunction(
             kv,
             rootSessionId,
             rootSession,
-            obsId,
-            checkDuplicate: durable && !payload.event_id,
             maxObservationsPerSession,
             payload,
             contextProjectId,
@@ -466,11 +473,6 @@ export function registerObserveFunction(
           },
         );
 
-        if (outcome.kind === "duplicate") {
-          if (livePrompt) await recordLivePrompt(kv, rootSessionId, livePrompt, promptRef);
-          await restoreIndexEntries(outcome.observation);
-          return { observationId: obsId, sessionId: outcome.sessionId, deduplicated: true, existing: true };
-        }
         if (outcome.kind === "cap_reached") {
           return { success: false, error: outcome.error };
         }

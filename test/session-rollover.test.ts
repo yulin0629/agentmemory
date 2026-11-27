@@ -338,4 +338,315 @@ describe("server-side session rollover", () => {
     const second = await sdk.trigger("mem::observe", makePayload(longId, 2)) as Record<string, unknown>;
     expect(second).toMatchObject({ success: false, error: "Session observation limit reached (1)" });
   });
+
+  it("reuses preloaded sessions and degrades softly when KV fails during mem::context exclusion", async () => {
+    const { kv, sdk } = setup(2);
+    await sdk.trigger("mem::observe", makePayload("sess-ctx-cache", 1));
+    await sdk.trigger("mem::observe", makePayload("sess-ctx-other", 2));
+
+    let currentGets = 0;
+    const origGet = kv.get;
+    kv.get = async <T>(scope: string, key: string) => {
+      if (scope === KV.sessions && key === "sess-ctx-cache") currentGets++;
+      return origGet<T>(scope, key);
+    };
+    const res = await sdk.trigger("mem::context", { sessionId: "sess-ctx-cache", project: "demo" }) as { context: string };
+    expect(currentGets).toBe(1);
+    expect(res.context).toContain("step-2");
+
+    // Transient KV error on uncached session lookup must degrade softly instead of throwing
+    kv.get = async <T>(scope: string, key: string) => {
+      if (scope === KV.sessions && key === "sess-missing-transient") {
+        throw new Error("transient kv error");
+      }
+      return origGet<T>(scope, key);
+    };
+    const soft = await sdk.trigger("mem::context", {
+      sessionId: "sess-missing-transient",
+      project: "demo",
+    }) as { context: string };
+    expect(soft.context).toContain("step-2");
+  });
+
+  it("checks durable stored observations before claiming backfill prompt ledger entries", async () => {
+    const { sdk } = setup(10);
+    const first = await sdk.trigger("mem::observe", {
+      sessionId: "sess-bf",
+      hookType: "prompt_submit",
+      project: "demo",
+      cwd: "/tmp/demo",
+      timestamp: "2026-11-27T00:00:01.000Z",
+      eventId: "evh_backfill_11111111",
+      observationId: "obs_backfill_11111111",
+      data: { prompt: "shared prompt text", backfill: true },
+    }) as Record<string, unknown>;
+    expect(first.observationId).toBe("obs_backfill_11111111");
+
+    await sdk.trigger("mem::observe", {
+      sessionId: "sess-bf",
+      hookType: "prompt_submit",
+      project: "demo",
+      cwd: "/tmp/demo",
+      timestamp: "2026-11-27T00:00:02.000Z",
+      eventId: "evh_live_22222222",
+      observationId: "obs_live_22222222",
+      data: { prompt: "shared prompt text" },
+    });
+
+    // Durable replay of already-stored backfill observation must return its observationId
+    // without consuming the live prompt's ledger claim.
+    const replay = await sdk.trigger("mem::observe", {
+      sessionId: "sess-bf",
+      hookType: "prompt_submit",
+      project: "demo",
+      cwd: "/tmp/demo",
+      timestamp: "2026-11-27T00:00:01.000Z",
+      eventId: "evh_backfill_11111111",
+      observationId: "obs_backfill_11111111",
+      data: { prompt: "shared prompt text", backfill: true },
+    }) as Record<string, unknown>;
+    expect(replay).toMatchObject({
+      observationId: "obs_backfill_11111111",
+      sessionId: "sess-bf",
+      deduplicated: true,
+      existing: true,
+    });
+
+    // A later distinct backfill duplicate of the live prompt must still be claimed/deduplicated.
+    const genuineDup = await sdk.trigger("mem::observe", {
+      sessionId: "sess-bf",
+      hookType: "prompt_submit",
+      project: "demo",
+      cwd: "/tmp/demo",
+      timestamp: "2026-11-27T00:00:03.000Z",
+      eventId: "evh_backfill_33333333",
+      observationId: "obs_backfill_33333333",
+      data: { prompt: "shared prompt text", backfill: true },
+    }) as Record<string, unknown>;
+    expect(genuineDup).toEqual({ deduplicated: true, sessionId: "sess-bf" });
+  });
+
+  it("refuses rollover when root is missing and payload lacks project/cwd, and indexes created root when present", async () => {
+    const { kv, sdk } = setup(1);
+    await sdk.trigger("mem::observe", {
+      sessionId: "sess-noproj",
+      hookType: "post_tool_use",
+      timestamp: "2026-11-27T00:00:01.000Z",
+      data: { tool_name: "Bash", tool_input: { command: "echo 1" } },
+    });
+    const blocked = await sdk.trigger("mem::observe", {
+      sessionId: "sess-noproj",
+      hookType: "post_tool_use",
+      timestamp: "2026-11-27T00:00:02.000Z",
+      data: { tool_name: "Bash", tool_input: { command: "echo 2" } },
+    }) as Record<string, unknown>;
+    expect(blocked).toMatchObject({ success: false, error: "Session observation limit reached (1)" });
+    expect(await kv.get(KV.sessions, "sess-noproj")).toBeNull();
+    expect(await kv.get(KV.sessions, "sess-noproj--seg-2")).toBeNull();
+
+    // When a later observation supplies project + cwd, rollover creates and indexes both root and seg-2.
+    const rolled = await sdk.trigger("mem::observe", makePayload("sess-noproj", 3)) as Record<string, unknown>;
+    expect(rolled.sessionId).toBe("sess-noproj--seg-2");
+    const indexEntries = (await kv.get<Array<{ id: string }>>(KV.projectSessionsIndex, "demo")) ?? [];
+    expect(indexEntries.map((e) => e.id)).toEqual(
+      expect.arrayContaining(["sess-noproj", "sess-noproj--seg-2"]),
+    );
+  });
+
+  it("preserves contextProjectId on session/start only when project matches, and reactivates rolled active segment on resume", async () => {
+    const prevIdle = process.env.AGENTMEMORY_FINALIZE_IDLE_MS;
+    process.env.AGENTMEMORY_FINALIZE_IDLE_MS = "0";
+    try {
+      const { kv, sdk } = setup(1);
+      const stopped: string[] = [];
+      sdk.registerFunction("event::session::stopped", async (p: unknown) => {
+        stopped.push((p as { sessionId: string }).sessionId);
+        return { ok: true };
+      });
+
+      // Non-rolled session: same project keeps contextProjectId, different project clears it
+      await kv.set(KV.sessions, "sess-ctxproj", {
+        id: "sess-ctxproj",
+        project: "proj-old",
+        cwd: "/old",
+        contextProjectId: "ctx-old",
+        startedAt: "2026-11-27T00:00:00.000Z",
+        status: "active",
+        observationCount: 1,
+      });
+      await sdk.trigger("api::session::start", {
+        body: { sessionId: "sess-ctxproj", project: "proj-old", cwd: "/old-2" },
+      });
+      expect((await kv.get<Session>(KV.sessions, "sess-ctxproj"))?.contextProjectId).toBe("ctx-old");
+      await sdk.trigger("api::session::start", {
+        body: { sessionId: "sess-ctxproj", project: "proj-new", cwd: "/new" },
+      });
+      expect((await kv.get<Session>(KV.sessions, "sess-ctxproj"))?.contextProjectId).toBeUndefined();
+
+      // Rolled-over session: end -> resume with new agentId/cwd -> end again
+      await sdk.trigger("mem::observe", makePayload("sess-resume", 1));
+      await sdk.trigger("mem::observe", makePayload("sess-resume", 2));
+      const end1 = await sdk.trigger("api::session::end", {
+        body: { sessionId: "sess-resume", final: true },
+      }) as { body: { ended: boolean } };
+      expect(end1.body.ended).toBe(true);
+
+      await sdk.trigger("api::session::start", {
+        body: { sessionId: "sess-resume", project: "demo", cwd: "/tmp/demo-2", agentId: "agent-resumed" },
+      });
+      const seg2Resumed = await kv.get<Session>(KV.sessions, "sess-resume--seg-2");
+      expect(seg2Resumed).toMatchObject({
+        status: "active",
+        cwd: "/tmp/demo-2",
+        agentId: "agent-resumed",
+      });
+      expect(seg2Resumed?.endedAt).toBeUndefined();
+
+      stopped.length = 0;
+      const end2 = await sdk.trigger("api::session::end", {
+        body: { sessionId: "sess-resume", final: true },
+      }) as { body: { ended: boolean } };
+      expect(end2.body.ended).toBe(true);
+      expect(stopped).toEqual(["sess-resume--seg-2"]);
+    } finally {
+      if (prevIdle === undefined) delete process.env.AGENTMEMORY_FINALIZE_IDLE_MS;
+      else process.env.AGENTMEMORY_FINALIZE_IDLE_MS = prevIdle;
+    }
+  });
+
+  it("retries api::session::end when an active rollover advances activeSegmentId mid-call", async () => {
+    const { kv, sdk } = setup(1);
+    const stopped: string[] = [];
+    sdk.registerFunction("event::session::stopped", async (p: unknown) => {
+      stopped.push((p as { sessionId: string }).sessionId);
+      return { ok: true };
+    });
+
+    await sdk.trigger("mem::observe", makePayload("sess-race", 1));
+    await sdk.trigger("mem::observe", makePayload("sess-race", 2));
+    stopped.length = 0;
+
+    // Simulate api::session::end initially seeing the stale pre-rollover root before the rollover pointer is read.
+    let rootReads = 0;
+    const origGet = kv.get;
+    kv.get = async <T>(scope: string, key: string) => {
+      if (scope === KV.sessions && key === "sess-race" && rootReads++ === 0) {
+        const real = await origGet<Session>(scope, key);
+        return (real ? { ...real, activeSegmentId: undefined } : null) as T;
+      }
+      return origGet<T>(scope, key);
+    };
+
+    const endRes = await sdk.trigger("api::session::end", {
+      body: { sessionId: "sess-race", final: true },
+    }) as { body: { ended: boolean } };
+    expect(endRes.body.ended).toBe(true);
+    expect((await kv.get<Session>(KV.sessions, "sess-race--seg-2"))?.status).toBe("completed");
+    expect(stopped).toEqual(["sess-race--seg-2"]);
+  });
+
+  it("expands Hermes verifiedSessionIds across rolled-over agent-less segments", async () => {
+    const { kv, sdk } = setup(1);
+    await sdk.trigger("mem::observe", makePayload("sess-h-past", 1));
+    const obs2 = await sdk.trigger("mem::observe", {
+      sessionId: "sess-h-past",
+      hookType: "stop",
+      project: "demo",
+      cwd: "/tmp/demo",
+      timestamp: "2026-11-26T00:00:02.000Z",
+      data: { last_assistant_message: "We decided to keep server-side rollover segments linked." },
+    }) as { observationId: string; sessionId: string };
+    expect(obs2.sessionId).toBe("sess-h-past--seg-2");
+
+    const row = await kv.get<CompressedObservation>(KV.observations("sess-h-past--seg-2"), obs2.observationId);
+    await kv.set(KV.observations("sess-h-past--seg-2"), obs2.observationId, {
+      ...row!,
+      type: "decision",
+      title: "Rollover segment linkage decision",
+      confidence: 0.9,
+      narrative: "We decided to keep server-side rollover segments linked.",
+    });
+    await kv.set(KV.sessions, "sess-h-cur", {
+      id: "sess-h-cur",
+      project: "demo",
+      cwd: "/tmp/demo",
+      startedAt: "2026-11-27T00:00:00.000Z",
+      status: "active",
+      observationCount: 0,
+    });
+
+    const scSdk = mockSdk({ looseTrigger: true });
+    scSdk.registerFunction("mem::smart-search", async () => ({
+      results: [{ obsId: obs2.observationId, sessionId: "sess-h-past--seg-2", score: 10 }],
+    }));
+    let seenCandidates: string[] = [];
+    registerSelectiveContextFunctions(scSdk as never, kv as never, {
+      namespace: "default",
+      judge: async (_req, candidates) => {
+        seenCandidates = candidates.map((c) => c.id);
+        return [];
+      },
+    });
+
+    await scSdk.trigger("mem::selective-context", {
+      prompt: "what did we decide about rollover?",
+      project: "demo",
+      hermes: {
+        sessionId: "sess-h-cur",
+        ownerId: "owner-1",
+        visibility: "private",
+        verifiedSessionIds: ["sess-h-cur", "sess-h-past"],
+      },
+    });
+    expect(seenCandidates).toContain(`observation:${obs2.observationId}`);
+  });
+
+  it("adopts existing segments without overwriting them when the root session row is deleted", async () => {
+    const { kv, sdk } = setup(2);
+    const stopped: string[] = [];
+    sdk.registerFunction("event::session::stopped", async (p: unknown) => {
+      stopped.push((p as { sessionId: string }).sessionId);
+      return { ok: true };
+    });
+
+    for (let i = 1; i <= 5; i++) {
+      await sdk.trigger("mem::observe", makePayload("sess-orphan", i));
+    }
+    const seg2Before = await kv.get<Session>(KV.sessions, "sess-orphan--seg-2");
+    expect(seg2Before).toMatchObject({
+      parentSessionId: "sess-orphan",
+      status: "completed",
+      observationCount: 2,
+    });
+    expect(typeof seg2Before?.endedAt).toBe("string");
+
+    // Remove the root row (e.g. eviction or snapshot/import overwrite)
+    await kv.delete(KV.sessions, "sess-orphan");
+    stopped.length = 0;
+
+    const r6 = await sdk.trigger("mem::observe", makePayload("sess-orphan", 6)) as Record<string, unknown>;
+    const r7 = await sdk.trigger("mem::observe", makePayload("sess-orphan", 7)) as Record<string, unknown>;
+    const r8 = await sdk.trigger("mem::observe", makePayload("sess-orphan", 8)) as Record<string, unknown>;
+
+    expect([r6.sessionId, r7.sessionId, r8.sessionId]).toEqual([
+      "sess-orphan--seg-3",
+      "sess-orphan--seg-4",
+      "sess-orphan--seg-4",
+    ]);
+
+    // seg-2 must remain untouched and must NOT re-fire stopped
+    const seg2After = await kv.get<Session>(KV.sessions, "sess-orphan--seg-2");
+    expect(seg2After).toEqual(seg2Before);
+    expect(await kv.list(KV.observations("sess-orphan--seg-2"))).toHaveLength(2);
+    expect(await kv.list(KV.observations("sess-orphan--seg-3"))).toHaveLength(2);
+    expect(await kv.list(KV.observations("sess-orphan--seg-4"))).toHaveLength(2);
+    expect(stopped).toEqual(["sess-orphan--seg-3"]);
+
+    const restoredRoot = await kv.get<Session>(KV.sessions, "sess-orphan");
+    expect(restoredRoot).toMatchObject({
+      status: "completed",
+      activeSegmentId: "sess-orphan--seg-4",
+      observationCount: 2,
+    });
+  });
 });

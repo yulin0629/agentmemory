@@ -12,6 +12,22 @@ import { logger } from "../logger.js";
 
 const SEGMENT_SEPARATOR = "--seg-";
 const MAX_SESSION_ID_LENGTH = 200;
+const MAX_ROLLOVER_HOPS = 1000;
+
+function hasValidProjectAndCwd(
+  project: unknown,
+  cwd: unknown,
+): { project: string; cwd: string } | null {
+  if (
+    typeof project === "string" &&
+    project.trim().length > 0 &&
+    typeof cwd === "string" &&
+    cwd.trim().length > 0
+  ) {
+    return { project, cwd };
+  }
+  return null;
+}
 
 function parseSegmentIndex(sessionId: string, rootSessionId: string): number {
   const prefix = `${rootSessionId}${SEGMENT_SEPARATOR}`;
@@ -35,7 +51,7 @@ export async function resolveActiveSessionId(kv: StateKV, sessionId: string): Pr
   return session?.activeSegmentId || sessionId;
 }
 
-export function preserveRolloverState(existing: Session | null): Partial<Session> {
+export function preserveRolloverState(existing: Session | null, project?: string): Partial<Session> {
   if (!existing) return {};
   return {
     ...(existing.activeSegmentId ? {
@@ -45,7 +61,9 @@ export function preserveRolloverState(existing: Session | null): Partial<Session
       status: existing.status,
       activeSegmentId: existing.activeSegmentId,
     } : {}),
-    ...(existing.contextProjectId ? { contextProjectId: existing.contextProjectId } : {}),
+    ...(existing.contextProjectId && (project === undefined || existing.project === project)
+      ? { contextProjectId: existing.contextProjectId }
+      : {}),
   };
 }
 
@@ -137,7 +155,6 @@ export interface WritableSegmentContext {
 }
 
 export type WritableSegmentResult<T> =
-  | { kind: "duplicate"; sessionId: string; observation: CompressedObservation }
   | { kind: "cap_reached"; error: string }
   | { kind: "written"; value: T };
 
@@ -147,8 +164,6 @@ export async function withWritableSegment<T>(
     kv: StateKV;
     rootSessionId: string;
     rootSession: Session | null;
-    obsId: string;
-    checkDuplicate: boolean;
     maxObservationsPerSession?: number;
     payload: HookPayload;
     contextProjectId?: string;
@@ -159,155 +174,271 @@ export async function withWritableSegment<T>(
     sdk,
     kv,
     rootSessionId,
-    rootSession,
-    obsId,
-    checkDuplicate,
     maxObservationsPerSession,
     payload,
     contextProjectId,
   } = options;
-  const currentSessionId = rootSession?.activeSegmentId || rootSessionId;
-
-  if (checkDuplicate) {
-    const stored = await findObservationInSessionFamily(kv, rootSessionId, currentSessionId, obsId);
-    if (stored) return { kind: "duplicate", sessionId: stored.sessionId, observation: stored.observation };
-  }
-
   const cap = maxObservationsPerSession && maxObservationsPerSession > 0 ? maxObservationsPerSession : 0;
-  let sealed = false;
-  let existingCount = 0;
-  let nextId: string | null = null;
-  let nowIso = "";
+  let liveRoot = options.rootSession;
+  let currentSessionId = liveRoot?.activeSegmentId || rootSessionId;
+  let pendingRootPointer: string | null = null;
+  let rootObsCount = liveRoot?.observationCount ?? 0;
+  let hops = 0;
 
-  // debt: ceiling: ~1500-2000 obs (~8 MiB SESSION_SOURCE_MAX_BYTES), upgrade: add byte-budget rollover check if any segment hits source_unavailable
-  const attempt = await withSessionLock(currentSessionId, async () => {
-    const existingSession = currentSessionId === rootSessionId
-      ? rootSession
-      : await kv.get<Session>(KV.sessions, currentSessionId);
-
-    let full = false;
-    let existing: CompressedObservation[] | undefined;
-
-    if (cap > 0 && existingSession && (existingSession.observationCount ?? 0) >= cap) {
-      const keyCount = (await listScopeKeys(kv, KV.observations(currentSessionId))).length;
-      if (keyCount >= cap) {
-        full = true;
-        existingCount = keyCount;
-      }
-    }
-
-    if (!full) {
-      existing = await kv.list<CompressedObservation>(KV.observations(currentSessionId));
-      if (cap > 0 && existing.length >= cap) {
-        full = true;
-        existingCount = existing.length;
-      }
-    }
-
-    if (!full) {
-      return {
-        rolled: false as const,
-        value: await writeFn({ sessionId: currentSessionId, existingSession, existing: existing! }),
-      };
-    }
-
-    nextId = nextSegmentId(rootSessionId, currentSessionId);
-    if (!nextId) {
-      return { rolled: "cap_reached" as const };
-    }
-
-    nowIso = new Date().toISOString();
-    if (existingSession && existingSession.status !== "completed") {
-      await requestSummaryRefresh(kv, currentSessionId);
-      await kv.update(KV.sessions, currentSessionId, [
-        { type: "set", path: "endedAt", value: nowIso },
-        { type: "set", path: "status", value: "completed" },
+  const ensureRootPointsTo = async (
+    targetId: string,
+    nowIso: string,
+    project: string,
+    cwd: string,
+    fallback?: { agentId?: string; contextProjectId?: string },
+  ) => {
+    if (liveRoot) {
+      await kv.update(KV.sessions, rootSessionId, [
+        { type: "set", path: "activeSegmentId", value: targetId },
       ]);
-      sealed = true;
+      liveRoot = { ...liveRoot, activeSegmentId: targetId };
+      return;
     }
-    return { rolled: true as const };
-  });
-
-  if (attempt.rolled === false) {
-    return { kind: "written", value: attempt.value };
-  }
-  if (attempt.rolled === "cap_reached" || !nextId) {
-    return { kind: "cap_reached", error: `Session observation limit reached (${cap})` };
-  }
-
-  const targetNextId: string = nextId;
-  const project = rootSession?.project || payload.project;
-  const cwd = rootSession?.cwd || payload.cwd;
-  const inheritedAgentId = rootSession ? rootSession.agentId : getAgentId();
-  const inheritedContextProjectId = rootSession?.contextProjectId ?? contextProjectId;
-
-  const nextSession: Session = {
-    id: targetNextId,
-    project,
-    cwd,
-    startedAt: nowIso,
-    updatedAt: nowIso,
-    status: "active",
-    observationCount: 0,
-    parentSessionId: rootSessionId,
-    ...(inheritedContextProjectId ? { contextProjectId: inheritedContextProjectId } : {}),
-    ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-    ...(rootSession?.tags ? { tags: [...rootSession.tags] } : {}),
-  };
-
-  if (sealed) {
-    afterKeyedLock(`obs:${rootSessionId}`, async () => {
-      await clearSessionFinalize(kv, currentSessionId).catch(() => {});
-      try {
-        await sdk.trigger({
-          function_id: "event::session::stopped",
-          payload: { sessionId: currentSessionId },
-          action: TriggerAction.Void(),
-        });
-      } catch (err) {
-        logger.warn("rollover session-stopped trigger failed", {
-          sessionId: currentSessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    });
-  }
-
-  const value = await withSessionLock(targetNextId, async () => {
-    await kv.set(KV.sessions, targetNextId, nextSession);
+    const inheritedAgentId = fallback?.agentId ?? getAgentId();
+    const inheritedContextProjectId = fallback?.contextProjectId ?? contextProjectId;
+    const rootStartedAt = payload.timestamp ?? nowIso;
+    const createdRoot: Session = {
+      id: rootSessionId,
+      project,
+      cwd,
+      startedAt: rootStartedAt,
+      updatedAt: nowIso,
+      endedAt: nowIso,
+      status: "completed",
+      observationCount: rootObsCount,
+      activeSegmentId: targetId,
+      ...(inheritedContextProjectId ? { contextProjectId: inheritedContextProjectId } : {}),
+      ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
+    };
+    await kv.set(KV.sessions, rootSessionId, createdRoot);
     await addSessionToProjectIndex(kv, project, {
-      id: targetNextId,
-      startedAt: nowIso,
+      id: rootSessionId,
+      startedAt: rootStartedAt,
       ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
     }).catch((err) => {
       logger.warn("session index update failed", {
-        sessionId: targetNextId,
+        sessionId: rootSessionId,
         error: err instanceof Error ? err.message : String(err),
       });
     });
+    liveRoot = createdRoot;
+  };
 
-    if (rootSession) {
-      await kv.update(KV.sessions, rootSessionId, [
-        { type: "set", path: "activeSegmentId", value: targetNextId },
-      ]);
-    } else {
-      await kv.set(KV.sessions, rootSessionId, {
-        id: rootSessionId,
-        project,
-        cwd,
-        startedAt: payload.timestamp ?? nowIso,
-        updatedAt: nowIso,
-        endedAt: nowIso,
-        status: "completed",
-        observationCount: existingCount,
-        activeSegmentId: targetNextId,
-        ...(inheritedContextProjectId ? { contextProjectId: inheritedContextProjectId } : {}),
-        ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-      } satisfies Session);
+  while (hops < MAX_ROLLOVER_HOPS) {
+    hops++;
+
+    type AttemptResult =
+      | { kind: "written"; value: T }
+      | { kind: "cap_reached" }
+      | {
+          kind: "rollover";
+          nextId: string;
+          nowIso: string;
+          sealed: boolean;
+          existingCount: number;
+          project: string;
+          cwd: string;
+        };
+
+    // debt: ceiling: ~1500-2000 obs (~8 MiB SESSION_SOURCE_MAX_BYTES), upgrade: add byte-budget rollover check if any segment hits source_unavailable
+    const attempt: AttemptResult = await withSessionLock(currentSessionId, async () => {
+      const existingSession = currentSessionId === rootSessionId
+        ? liveRoot
+        : await kv.get<Session>(KV.sessions, currentSessionId);
+
+      let full = false;
+      let existingCount = 0;
+      let existing: CompressedObservation[] | undefined;
+
+      if (cap > 0 && existingSession && (existingSession.observationCount ?? 0) >= cap) {
+        const keyCount = (await listScopeKeys(kv, KV.observations(currentSessionId))).length;
+        if (keyCount >= cap) {
+          full = true;
+          existingCount = keyCount;
+        }
+      }
+
+      if (!full) {
+        existing = await kv.list<CompressedObservation>(KV.observations(currentSessionId));
+        if (cap > 0 && existing.length >= cap) {
+          full = true;
+          existingCount = existing.length;
+        }
+      }
+
+      if (!full) {
+        if (pendingRootPointer) {
+          const meta = hasValidProjectAndCwd(
+            liveRoot?.project || existingSession?.project || payload.project,
+            liveRoot?.cwd || existingSession?.cwd || payload.cwd,
+          );
+          if (meta) {
+            await ensureRootPointsTo(
+              pendingRootPointer,
+              new Date().toISOString(),
+              meta.project,
+              meta.cwd,
+              {
+                agentId: existingSession?.agentId,
+                contextProjectId: existingSession?.contextProjectId,
+              },
+            );
+            pendingRootPointer = null;
+          }
+        }
+        return {
+          kind: "written",
+          value: await writeFn({ sessionId: currentSessionId, existingSession, existing: existing! }),
+        };
+      }
+
+      const meta = hasValidProjectAndCwd(
+        liveRoot?.project || existingSession?.project || payload.project,
+        liveRoot?.cwd || existingSession?.cwd || payload.cwd,
+      );
+      if (!meta) {
+        return { kind: "cap_reached" };
+      }
+
+      const nextId = nextSegmentId(rootSessionId, currentSessionId);
+      if (!nextId) {
+        return { kind: "cap_reached" };
+      }
+
+      const nowIso = new Date().toISOString();
+      let sealed = false;
+      if (existingSession && existingSession.status !== "completed") {
+        await requestSummaryRefresh(kv, currentSessionId);
+        await kv.update(KV.sessions, currentSessionId, [
+          { type: "set", path: "endedAt", value: nowIso },
+          { type: "set", path: "status", value: "completed" },
+        ]);
+        sealed = true;
+      }
+      return {
+        kind: "rollover",
+        nextId,
+        nowIso,
+        sealed,
+        existingCount,
+        project: meta.project,
+        cwd: meta.cwd,
+      };
+    });
+
+    if (attempt.kind === "written") {
+      return { kind: "written", value: attempt.value };
+    }
+    if (attempt.kind === "cap_reached") {
+      return { kind: "cap_reached", error: `Session observation limit reached (${cap})` };
     }
 
-    return writeFn({ sessionId: targetNextId, existingSession: nextSession, existing: [] });
-  });
+    if (currentSessionId === rootSessionId) {
+      rootObsCount = attempt.existingCount;
+    }
 
-  return { kind: "written", value };
+    if (attempt.sealed) {
+      const sealedSessionId = currentSessionId;
+      const notifySealed = async () => {
+        await clearSessionFinalize(kv, sealedSessionId).catch(() => {});
+        try {
+          await sdk.trigger({
+            function_id: "event::session::stopped",
+            payload: { sessionId: sealedSessionId },
+            action: TriggerAction.Void(),
+          });
+        } catch (err) {
+          logger.warn("rollover session-stopped trigger failed", {
+            sessionId: sealedSessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      };
+      if (!afterKeyedLock(`obs:${rootSessionId}`, notifySealed)) {
+        logger.warn("rollover called without root lock; running seal notification immediately", {
+          rootSessionId,
+          sessionId: sealedSessionId,
+        });
+        void notifySealed();
+      }
+    }
+
+    const inheritedAgentId = liveRoot ? liveRoot.agentId : getAgentId();
+    const inheritedContextProjectId = liveRoot?.contextProjectId ?? contextProjectId;
+
+    let targetNextId: string | null = attempt.nextId;
+    while (targetNextId && hops <= MAX_ROLLOVER_HOPS) {
+      const probeId = targetNextId;
+      const probeResult = await withSessionLock(probeId, async (): Promise<
+        | { kind: "written"; value: T }
+        | { kind: "adopt" }
+        | { kind: "skip" }
+      > => {
+        const existingTarget = await kv.get<Session>(KV.sessions, probeId);
+        if (existingTarget) {
+          return existingTarget.parentSessionId === rootSessionId
+            ? { kind: "adopt" }
+            : { kind: "skip" };
+        }
+        const existingTargetKeys = await listScopeKeys(kv, KV.observations(probeId));
+        if (existingTargetKeys.length > 0) {
+          return { kind: "adopt" };
+        }
+
+        const nextSession: Session = {
+          id: probeId,
+          project: attempt.project,
+          cwd: attempt.cwd,
+          startedAt: attempt.nowIso,
+          updatedAt: attempt.nowIso,
+          status: "active",
+          observationCount: 0,
+          parentSessionId: rootSessionId,
+          ...(inheritedContextProjectId ? { contextProjectId: inheritedContextProjectId } : {}),
+          ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
+          ...(liveRoot?.tags ? { tags: [...liveRoot.tags] } : {}),
+        };
+        await kv.set(KV.sessions, probeId, nextSession);
+        await addSessionToProjectIndex(kv, attempt.project, {
+          id: probeId,
+          startedAt: attempt.nowIso,
+          ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
+        }).catch((err) => {
+          logger.warn("session index update failed", {
+            sessionId: probeId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+        await ensureRootPointsTo(probeId, attempt.nowIso, attempt.project, attempt.cwd);
+        pendingRootPointer = null;
+        return {
+          kind: "written",
+          value: await writeFn({ sessionId: probeId, existingSession: nextSession, existing: [] }),
+        };
+      });
+
+      if (probeResult.kind === "written") {
+        return { kind: "written", value: probeResult.value };
+      }
+      if (probeResult.kind === "adopt") {
+        currentSessionId = probeId;
+        pendingRootPointer = probeId;
+        break;
+      }
+      hops++;
+      targetNextId = nextSegmentId(rootSessionId, probeId);
+    }
+
+    if (!targetNextId) {
+      return { kind: "cap_reached", error: `Session observation limit reached (${cap})` };
+    }
+  }
+
+  return { kind: "cap_reached", error: `Session observation limit reached (${cap})` };
 }

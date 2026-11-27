@@ -194,7 +194,11 @@ export function registerContextFunction(
         }
       }
 
-      const excludedSessions = await expandSessionFamily(kv, [data.sessionId]);
+      const excludedSessions = await expandSessionFamily(
+        kv,
+        [data.sessionId],
+        new Map<string, Session | null>(projectSessions.map((s) => [s.id, s])),
+      ).catch(() => new Set<string>([data.sessionId]));
       const sessions = projectSessions
         .filter(
           (s) =>

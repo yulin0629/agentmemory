@@ -379,9 +379,10 @@ export function registerSelectiveContextFunctions(
     if (hermes && /\b(?:do not (?:send|share|upload|transmit)|local only)\b|不要外傳|不得外送|禁止外送|只限本機/i
       .test(`${parsed.data.prompt}\n${parsed.data.previous}`)) return { status: "empty", spans: [] };
     const currentSession = hermes ? await kv.get<Session>(KV.sessions, hermes.sessionId) : null;
-    const verifiedSessionIds = new Set(hermes?.verifiedSessionIds ?? []);
+    const rawVerifiedSessionIds = hermes?.verifiedSessionIds ?? [];
+    const rawVerifiedSet = new Set(rawVerifiedSessionIds);
     if (hermes && (!currentSession || (currentSession.agentId && currentSession.agentId !== hermes.ownerId)
-      || (!currentSession.agentId && !verifiedSessionIds.has(hermes.sessionId)))) {
+      || (!currentSession.agentId && !rawVerifiedSet.has(hermes.sessionId)))) {
       return { status: "unavailable", spans: [], error: "unverified_session" };
     }
     const rawExcludedSessions = [hermes?.sessionId, parsed.data.sessionId, ...(parsed.data.excludedSessionIds ?? [])]
@@ -389,11 +390,14 @@ export function registerSelectiveContextFunctions(
     const deadline = Date.now() + (hermes || parsed.data.recallHistory ? 6500 : 1500);
     const run = async () => {
       const preloadedSessions = hermes ? new Map<string, Session | null>([[hermes.sessionId, currentSession]]) : undefined;
-      const [catalog, excludedSessions] = await Promise.all([
+      const [catalog, excludedSessions, verifiedSessionIds] = await Promise.all([
         read(),
         hermes || parsed.data.recallHistory
           ? expandSessionFamily(kv, rawExcludedSessions, preloadedSessions)
           : Promise.resolve(new Set(rawExcludedSessions)),
+        hermes && rawVerifiedSessionIds.length > 0
+          ? expandSessionFamily(kv, rawVerifiedSessionIds, preloadedSessions)
+          : Promise.resolve(rawVerifiedSet),
       ]);
       const excludedSourceIds = new Set<string>();
       if (hermes || parsed.data.recallHistory) {
