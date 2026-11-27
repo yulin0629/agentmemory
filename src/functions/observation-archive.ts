@@ -251,6 +251,9 @@ export function registerObservationArchiveFunctions(sdk: IIIClient, kv: StateKV)
         skipped: { active: 0, no_summary: 0, summary_stale: 0, repair_pending: 0, nothing_eligible: 0 },
         failedSessions: 0,
       };
+      if (data?.types !== undefined && !types) {
+        return { ...result, success: false, error: "types must be an array of observation types" };
+      }
 
       const wanted = Array.isArray(data?.sessionIds) ? new Set(data.sessionIds) : null;
       const project = typeof data?.project === "string" && data.project ? data.project : null;

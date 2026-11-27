@@ -221,6 +221,15 @@ describe("observation cold storage", () => {
     expect(await t.hotIds()).toEqual(["obs_002"]);
   });
 
+  it("refuses a types value that is not a list instead of moving every type", async () => {
+    const t = await setup([makeObs(1), makeObs(2, { type: "decision" })]);
+
+    const result = await t.archive({ dryRun: false, types: "command_run" });
+
+    expect(result).toMatchObject({ success: false, archivedObservations: 0 });
+    expect(await t.hotIds()).toEqual(["obs_001", "obs_002"]);
+  });
+
   it("treats a legacy summary as stale when its count differs from the session", async () => {
     const t = await setup([makeObs(1), makeObs(2)], { legacySummary: true });
     expect((await t.archive()).archivedObservations).toBe(2);
