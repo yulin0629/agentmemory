@@ -12,7 +12,7 @@ import type { CompressedObservation, MemoryProvider, RawObservation } from "../s
 
 const search = vi.hoisted(() => ({ add: vi.fn(), save: vi.fn(), vector: vi.fn() }));
 vi.mock("../src/functions/search.js", () => ({
-  getSearchIndex: () => ({ add: search.add }),
+  getSearchIndex: () => ({ add: search.add, has: () => false }),
   scheduleIndexSave: search.save,
   vectorIndexAddGuarded: search.vector,
 }));

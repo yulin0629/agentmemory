@@ -96,7 +96,10 @@ export function registerCompressFunction(
       await kv.set(KV.observations(sessionId), observationId, claimed);
       attempt.revisions.add(observationRevision(stored));
       attempt.revisions.add(observationRevision(claimed));
-      if ("title" in claimed) indexObservation(claimed);
+      // The claim changes only the compression state, which is not indexed.
+      // Indexing an indexed row again would cancel the vector its capture is
+      // still embedding, and a failed attempt adds no other.
+      if ("title" in claimed && !getSearchIndex().has(observationId)) indexObservation(claimed);
       return { raw, claimed, fallback, revision: observationRevision(claimed) };
     });
     if (!prepared) return { success: false, error: "observation_not_found", skipped: true, retryable: false };

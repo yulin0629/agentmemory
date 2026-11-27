@@ -14,6 +14,7 @@ vi.mock("iii-sdk", async (importOriginal) => {
 vi.mock("../src/functions/search.js", () => ({
   getSearchIndex: () => ({
     add: vi.fn(),
+    has: () => false,
   }),
   vectorIndexAddGuarded: vi.fn().mockResolvedValue(false),
   scheduleIndexSave: vi.fn(),

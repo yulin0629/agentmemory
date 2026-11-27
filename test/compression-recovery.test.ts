@@ -84,6 +84,41 @@ describe("compression recovery", () => {
     expect(restarted.provider.compress).toHaveBeenCalledOnce();
   });
 
+  // As in production, where embeds wait in a coalescing window, the embedding
+  // of the capture's own text arrives only when the test releases it. The
+  // compressed record's embedding points the other way and arrives at once.
+  function vectorRig() {
+    const vectors = new VectorIndex();
+    const captureEmbedding = deferred<Float32Array>();
+    const embed = vi.fn().mockImplementationOnce(() => captureEmbedding.promise).mockImplementation(async () => new Float32Array([0, 1]));
+    setVectorIndex(vectors); setEmbeddingProvider({ name: "test", dimensions: 2, embed } as never);
+    return { vectors, releaseCapture: () => captureEmbedding.resolve(new Float32Array([1, 0])) };
+  }
+  const direction = (vectors: VectorIndex, id: string) => Array.from(vectors.get(id)?.embedding ?? []);
+
+  it("keeps the vector of a capture whose automatic compression fails", async () => {
+    const { vectors, releaseCapture } = vectorRig();
+    const r = rig({ name: "test", compress: vi.fn(async () => { throw new Error("provider unavailable"); }), summarize: vi.fn() });
+    const captured = await r.call("mem::observe", { sessionId: "session-recovery", project: "project-a", cwd: "/fixture", hookType: "post_tool_use", timestamp: raw().timestamp,
+      data: { tool_name: "Read", tool_output: raw().toolOutput } });
+    await r.flush();
+    expect(await r.kv.get(KV.observations("session-recovery"), captured.observationId)).toMatchObject({ compression: { status: "failed" } });
+    releaseCapture();
+    await vi.waitFor(() => expect(direction(vectors, captured.observationId)).toEqual([1, 0]));
+  });
+
+  it("keeps the compressed record's vector when the capture's own embedding arrives later", async () => {
+    const { vectors, releaseCapture } = vectorRig();
+    const r = rig();
+    const captured = await r.call("mem::observe", { sessionId: "session-recovery", project: "project-a", cwd: "/fixture", hookType: "post_tool_use", timestamp: raw().timestamp,
+      data: { tool_name: "Read", tool_output: raw().toolOutput } });
+    await r.flush();
+    expect(direction(vectors, captured.observationId)).toEqual([0, 1]);
+    releaseCapture();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(direction(vectors, captured.observationId)).toEqual([0, 1]);
+  });
+
   it("accepts the engine caller envelope only at the internal function boundary", async () => {
     const r = rig(); await r.seed();
     expect(await r.call("mem::compression-status", { sessionId: "session-recovery", _caller_worker_id: "engine-worker" })).toMatchObject({ dryRun: true, items: [{ status: "raw" }] });
