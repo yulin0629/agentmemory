@@ -10,6 +10,7 @@ import { SearchIndex, type SearchIndexRevision } from '../state/search-index.js'
 import { VectorIndex } from '../state/vector-index.js'
 import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation, observationEmbedText } from '../state/memory-utils.js'
+import { embedQuery } from '../providers/embedding/query.js'
 import { buildRecallResponse, type RecallFormat } from "./recall-response.js";
 import { recordAccessBatch } from './access-tracker.js'
 import { logger } from "../logger.js";
@@ -123,7 +124,7 @@ export async function rankMemoryIds(
   let semantic: Array<{ obsId: string }> = []
   if (vectorIndex && vectorIndex.size > 0 && currentEmbeddingProvider) {
     try {
-      const embedding = await currentEmbeddingProvider.embed(query)
+      const embedding = await embedQuery(currentEmbeddingProvider, query)
       semantic = vectorIndex
         .search(embedding, fetchLimit, "memory", (id) => getSearchIndex().layerOf(id))
     } catch (err) {

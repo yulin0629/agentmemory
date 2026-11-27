@@ -336,7 +336,13 @@ export interface MemorySlot {
 export interface EmbeddingProvider {
   name: string;
   dimensions: number;
+  // Names the model when it is not the one this provider always used. Vectors
+  // of two models cannot be compared, so an index saved under another name is
+  // not loaded.
+  vectorSpace?: string;
   embed(text: string): Promise<Float32Array>;
+  // For a model that reads a search query differently from a stored record.
+  embedQuery?(text: string): Promise<Float32Array>;
   embedBatch(texts: string[]): Promise<Float32Array[]>;
   embedImage?(src: string): Promise<Float32Array>;
 }

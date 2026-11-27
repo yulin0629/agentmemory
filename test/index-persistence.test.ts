@@ -300,6 +300,17 @@ describe("IndexPersistence bucketed vector storage", () => {
     expect(persistence.status().vectorCountShortfall).toEqual({ expected: 4, loaded: 2 });
   });
 
+  it("reports at load which embedding model wrote the saved vectors", async () => {
+    await new IndexPersistence(kv as never, vectorWith([["obs_a", [0.1, 0.2, 0.3]]]), { vectorSpace: "gemini-embedding-2" }).save();
+    const named = await new IndexPersistence(kv as never, new VectorIndex()).load();
+    expect(named.vector!.size).toBe(1);
+    expect(named.vectorSpace).toBe("gemini-embedding-2");
+
+    const original = mockKV();
+    await new IndexPersistence(original as never, vectorWith([["obs_a", [0.1, 0.2, 0.3]]])).save();
+    expect((await new IndexPersistence(original as never, new VectorIndex()).load()).vectorSpace).toBeUndefined();
+  });
+
   it("reports storage as unavailable when the metadata read fails", async () => {
     const failingKv = {
       ...kv,
@@ -369,6 +380,19 @@ describe("IndexPersistence migration from the single-string format", () => {
     for (const [scope, entries] of kv.store) {
       if (scope.includes(":vectors:") || scope.includes(":bm25:idx_")) expect(entries.size).toBe(0);
     }
+  });
+
+  it("keeps a migrated snapshot marked as the original model's when another model is active", async () => {
+    await writeLegacyVectorSnapshot(kv, vectorWith([["obs_a", [0.1, 0.2, 0.3]]]));
+    const options = { bucketSize: 16, vectorSpace: "gemini-embedding-2" };
+
+    const migrated = await new IndexPersistence(kv as never, new VectorIndex(), options).load();
+    expect(migrated.state).toBe("migrated");
+    expect(migrated.vectorSpace).toBeUndefined();
+
+    const next = await new IndexPersistence(kv as never, new VectorIndex(), options).load();
+    expect(next.vector!.size).toBe(1);
+    expect(next.vectorSpace).toBeUndefined();
   });
 
   it("migrates a monolithic vector snapshot", async () => {

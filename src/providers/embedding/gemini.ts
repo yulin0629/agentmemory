@@ -2,24 +2,50 @@ import type { EmbeddingProvider } from "../../types.js";
 import { getEnvVar } from "../../config.js";
 import { logger } from "../../logger.js";
 import { fetchWithTimeout } from "../_fetch.js";
+import { createGeminiKeyPool, isGeminiKeyFailure, type GeminiKeyPool } from "./gemini-key-pool.js";
 
 const BATCH_LIMIT = 100;
 const MAX_RETRIES = 4;
 const BASE_RETRY_MS = 1000;
 const MAX_RETRY_MS = 8000;
-const MODEL = "models/gemini-embedding-001";
-const API_BASE = `https://generativelanguage.googleapis.com/v1beta/${MODEL}:batchEmbedContents`;
+const DEFAULT_MODEL = "gemini-embedding-001";
+const API_ROOT = "https://generativelanguage.googleapis.com/v1beta";
+// gemini-embedding-2 has no task type field: the text itself says whether it
+// is a stored record or a search query. gemini-embedding-001 gets the text
+// as it is, which is how every index written before the model could be chosen
+// was embedded.
+const DOCUMENT_PREFIX = "title: none | text: ";
+const QUERY_PREFIX = "task: search result | query: ";
 
 export class GeminiEmbeddingProvider implements EmbeddingProvider {
   readonly name = "gemini";
   readonly dimensions = 768;
+  readonly vectorSpace?: string;
   private apiKey: string;
   private fallbackKey: string;
+  private keyPool?: GeminiKeyPool;
+  private model: string;
+  private prefixed: boolean;
 
   constructor(apiKey?: string) {
     this.apiKey = apiKey || getEnvVar("GEMINI_API_KEY") || "";
     this.fallbackKey = getEnvVar("GEMINI_API_KEY_FALLBACK") || "";
-    if (!this.apiKey) throw new Error("GEMINI_API_KEY is required");
+    const keyFile = (getEnvVar("GEMINI_API_KEY_FILE") || "").trim();
+    if (keyFile) {
+      this.keyPool = createGeminiKeyPool(keyFile, getEnvVar("GEMINI_API_KEY_PREFER") || "", this.apiKey);
+      const order = this.keyPool.order().map(({ label }) => label);  // throws when there is no key at all
+      if (order.length === 1 && order[0] === "GEMINI_API_KEY") {
+        logger.warn("[agentmemory] gemini embed: GEMINI_API_KEY_FILE gave no usable key; only GEMINI_API_KEY answers", { file: keyFile });
+      } else {
+        logger.info("[agentmemory] gemini embed: key pool", { order });
+      }
+    } else if (!this.apiKey) {
+      throw new Error("GEMINI_API_KEY is required");
+    }
+    const model = (getEnvVar("GEMINI_EMBEDDING_MODEL") || "").trim().replace(/^models\//, "") || DEFAULT_MODEL;
+    this.model = `models/${model}`;
+    this.prefixed = model.startsWith("gemini-embedding-2");
+    if (model !== DEFAULT_MODEL) this.vectorSpace = model;
   }
 
   async embed(text: string): Promise<Float32Array> {
@@ -27,13 +53,22 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
     return result;
   }
 
+  async embedQuery(text: string): Promise<Float32Array> {
+    const [result] = await this.request([this.prefixed ? QUERY_PREFIX + text : text]);
+    return result;
+  }
+
+  embedBatch(texts: string[]): Promise<Float32Array[]> {
+    return this.request(this.prefixed ? texts.map((t) => DOCUMENT_PREFIX + t) : texts);
+  }
+
   private async postChunk(chunk: string[], key: string): Promise<Response> {
-    return fetchWithTimeout(`${API_BASE}?key=${key}`, {
+    return fetchWithTimeout(`${API_ROOT}/${this.model}:batchEmbedContents?key=${key}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         requests: chunk.map((t) => ({
-          model: MODEL,
+          model: this.model,
           content: { parts: [{ text: t }] },
           outputDimensionality: this.dimensions,
         })),
@@ -41,7 +76,21 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
     });
   }
 
-  async embedBatch(texts: string[]): Promise<Float32Array[]> {
+  /** One attempt over the key pool: a key that is refused or over its quota is skipped for a while and the next key gets the same chunk. */
+  private async postWithPool(chunk: string[], pool: GeminiKeyPool): Promise<Response> {
+    const keys = pool.order();
+    let response!: Response;
+    for (const [index, { label, key }] of keys.entries()) {
+      response = await this.postChunk(chunk, key);
+      if (response.ok || index === keys.length - 1) break;
+      if (!isGeminiKeyFailure(response.status, await response.clone().text())) break;
+      pool.cool(key);
+      logger.warn("[agentmemory] gemini embed: key refused or over its quota; trying the next key", { label, status: response.status });
+    }
+    return response;
+  }
+
+  private async request(texts: string[]): Promise<Float32Array[]> {
     const results: Float32Array[] = [];
 
     for (let i = 0; i < texts.length; i += BATCH_LIMIT) {
@@ -50,9 +99,10 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
       let data: { embeddings: Array<{ values: number[] }> } | null = null;
 
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        const useFallback = attempt === MAX_RETRIES && this.fallbackKey !== "";
-        const key = useFallback ? this.fallbackKey : this.apiKey;
-        const response = await this.postChunk(chunk, key);
+        const useFallback = !this.keyPool && attempt === MAX_RETRIES && this.fallbackKey !== "";
+        const response = this.keyPool
+          ? await this.postWithPool(chunk, this.keyPool)
+          : await this.postChunk(chunk, useFallback ? this.fallbackKey : this.apiKey);
 
         if (response.ok) {
           data = (await response.json()) as {
@@ -101,7 +151,7 @@ function l2Normalize(vec: Float32Array): Float32Array {
     if (!zeroNormWarned) {
       zeroNormWarned = true;
       process.stderr.write(
-        `[agentmemory] warn: gemini-embedding-001 returned a zero-norm ` +
+        `[agentmemory] warn: the Gemini embedding model returned a zero-norm ` +
           `embedding (length=${vec.length}); leaving it un-normalized. ` +
           `Subsequent zero-norm vectors will not be reported.\n`,
       );

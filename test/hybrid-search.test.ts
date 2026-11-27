@@ -100,6 +100,45 @@ describe("HybridSearch", () => {
     expect(results.map((r) => r.observation.id)).toEqual(["obs_both"]);
   });
 
+  it("ranks the closest vector match first when keyword search matches only a passing word of the question", async () => {
+    // A question in Chinese about a record written in English: the two share no word.
+    const target = makeObs({ id: "obs_target", sessionId: "ses_t", title: "Rotate the deploy credential", narrative: "Replaced the expired credential used by the deploy job", facts: [], concepts: [], files: [] });
+    const closeness = [0.8, 0.7, 0.6];
+    const passing = closeness.map((_, i) =>
+      makeObs({ id: `obs_passing_${i}`, sessionId: `ses_p${i}`, title: `kvrocks note ${i}`, narrative: `kvrocks backup schedule ${i}`, facts: [], concepts: [], files: [] }));
+    const vector = new VectorIndex();
+    for (const obs of [target, ...passing]) {
+      bm25.add(obs);
+      await kv.set(KV.observations(obs.sessionId), obs.id, obs);
+    }
+    vector.add(target.id, target.sessionId, new Float32Array([1, 0]));
+    closeness.forEach((x, i) => vector.add(passing[i].id, passing[i].sessionId, new Float32Array([x, Math.sqrt(1 - x * x)])));
+    const provider = { name: "test", dimensions: 2, embed: vi.fn(async () => new Float32Array([1, 0])), embedBatch: vi.fn() };
+    const hybrid = new HybridSearch(bm25, vector, provider, kv as never, 0.4, 0.6, 0, false);
+    const results = await hybrid.search("部署用的憑證過期了要怎麼更換 kvrocks", 4);
+    expect(results[0].observation.id).toBe("obs_target");
+  });
+
+  it("embeds the question as a query when the provider tells queries from records", async () => {
+    const asRecord = makeObs({ id: "obs_as_record", sessionId: "ses_a", title: "alpha note", narrative: "alpha", facts: [], concepts: [], files: [] });
+    const asQuery = makeObs({ id: "obs_as_query", sessionId: "ses_b", title: "beta note", narrative: "beta", facts: [], concepts: [], files: [] });
+    const vector = new VectorIndex();
+    for (const obs of [asRecord, asQuery]) {
+      bm25.add(obs);
+      await kv.set(KV.observations(obs.sessionId), obs.id, obs);
+    }
+    vector.add(asRecord.id, asRecord.sessionId, new Float32Array([1, 0]));
+    vector.add(asQuery.id, asQuery.sessionId, new Float32Array([0, 1]));
+    const provider = {
+      name: "test", dimensions: 2, embedBatch: vi.fn(),
+      embed: async () => new Float32Array([1, 0]),
+      embedQuery: async () => new Float32Array([0, 1]),
+    };
+    const hybrid = new HybridSearch(bm25, vector, provider, kv as never, 0.4, 0.6, 0, false);
+    const results = await hybrid.search("unrelated words", 2);
+    expect(results[0].observation.id).toBe("obs_as_query");
+  });
+
   it("returns a valid lower-ranked record when stale index entries fill the first enrichment pass", async () => {
     for (let i = 0; i < 25; i++) {
       bm25.add(makeObs({ id: `obs_stale_${i}`, sessionId: `ses_stale_${i}`, title: "nebula nebula nebula", narrative: "nebula nebula nebula", facts: [], concepts: [], files: [] }));

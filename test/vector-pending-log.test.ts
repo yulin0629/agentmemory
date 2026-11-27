@@ -233,6 +233,30 @@ describe("pending vector log", () => {
     expect([...third.vector.entries()].map(([id]) => id).sort()).toEqual(["obs_2", "obs_3", "obs_4"]);
   });
 
+  it("does not replay vectors that another embedding model logged, on this start or a later one", async () => {
+    const kv = mockKV();
+    const first = await boot(kv);
+    first.vector.add("obs_old", "ses_1", v(1));
+    await first.persistence.flushPendingLog();
+    first.persistence.stop();
+
+    const options = { saveIntervalMs: 600_000, bucketSize: 4, vectorSpace: "gemini-embedding-2" };
+    const vector = new VectorIndex();
+    const persistence = new IndexPersistence(kv as never, vector, options);
+    await persistence.load();
+    expect(await persistence.replayPendingLog(3)).toMatchObject({ added: 0, skipped: 1 });
+    expect(vector.has("obs_old")).toBe(false);
+
+    vector.add("obs_new", "ses_1", v(2));
+    await persistence.flushPendingLog();
+    persistence.stop();
+    const restarted = new VectorIndex();
+    const later = new IndexPersistence(kv as never, restarted, options);
+    await later.load();
+    await later.replayPendingLog(3);
+    expect([...restarted.entries()].map(([id]) => id)).toEqual(["obs_new"]);
+  });
+
   it("skips logged vectors whose dimension does not match the active provider", async () => {
     const kv = mockKV();
     const first = await boot(kv);

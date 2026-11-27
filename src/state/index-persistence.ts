@@ -46,6 +46,7 @@ type VectorMeta = {
   savedAt: string;
   count: number;
   backfillSince?: string | null;
+  space?: string;
 };
 
 type PersistedVector = {
@@ -62,6 +63,8 @@ type PendingVectorRow = {
   e?: string;
   t?: 1;
   c?: 1;
+  // The embedding provider's vectorSpace when the vector was logged.
+  m?: string;
 };
 
 type BackfillMarker = {
@@ -82,6 +85,7 @@ type IndexPersistenceOptions = {
   bucketSize?: number;
   now?: () => number;
   requireRecoveryPlan?: boolean;
+  vectorSpace?: string;
 };
 
 export interface IndexLegStatus {
@@ -118,6 +122,8 @@ export interface VectorLoadResult {
   savedAt: string | null;
   expectedCount?: number;
   backfillSince?: string | null;
+  // The embedding provider's vectorSpace when the vectors were saved.
+  vectorSpace?: string;
 }
 
 export function vectorBucketScope(bucket: number): string {
@@ -215,6 +221,7 @@ export class IndexPersistence {
   private readonly saveIntervalMs: number;
   private readonly bucketSize: number;
   private readonly now: () => number;
+  private readonly vectorSpace: string | undefined;
   private bucketOfId: Map<string, number> = new Map();
   private bucketCounts: Map<number, number> = new Map();
   private highestBucket = 0;
@@ -244,6 +251,7 @@ export class IndexPersistence {
     this.recoveryReady = !options.requireRecoveryPlan || !vector;
     this.vector?.setChangeListener((id, entry) => this.logChange(id, entry));
     this.now = options.now ?? Date.now;
+    this.vectorSpace = options.vectorSpace;
     const interval = options.saveIntervalMs;
     this.saveIntervalMs =
       typeof interval === "number" && Number.isFinite(interval) && interval > 0
@@ -329,6 +337,12 @@ export class IndexPersistence {
             vector.remove(id);
             result.removed++;
           }
+          continue;
+        }
+        // A vector logged by another model is skipped like one of another
+        // width: its record is embedded again.
+        if ((row.m ?? "") !== (this.vectorSpace ?? "")) {
+          result.skipped++;
           continue;
         }
         let embedding: Float32Array;
@@ -497,6 +511,7 @@ export class IndexPersistence {
         s: entry.sessionId,
         k: id.startsWith(MEMORY_ID_PREFIX) ? "memory" : "observation",
         e: float32ToBase64(entry.embedding),
+        ...(this.vectorSpace ? { m: this.vectorSpace } : {}),
       };
     } else {
       row = { q, id, t: 1 };
@@ -602,7 +617,10 @@ export class IndexPersistence {
           ...this.vectorCountShortfall,
         });
       }
-      return { vector: loaded, state: "buckets", savedAt: meta.savedAt ?? null, expectedCount, backfillSince: meta.backfillSince };
+      return {
+        vector: loaded, state: "buckets", savedAt: meta.savedAt ?? null, expectedCount, backfillSince: meta.backfillSince,
+        vectorSpace: typeof meta.space === "string" ? meta.space : undefined,
+      };
     }
 
     return this.migrateLegacy();
@@ -703,7 +721,9 @@ export class IndexPersistence {
     }
   }
 
-  private async writeChanges(vector: VectorIndex): Promise<void> {
+  // legacy: the vectors come from a snapshot saved before indexes recorded
+  // their model, so they are not stamped with the active one.
+  private async writeChanges(vector: VectorIndex, legacy = false): Promise<void> {
     const changes = vector.takeChanges();
     if (changes.size === 0 && !this.needsRecoveryCheckpoint()) return;
     const failed = new Map<string, boolean>();
@@ -743,6 +763,7 @@ export class IndexPersistence {
         savedAt: new Date(this.now()).toISOString(),
         count: vector.size,
         ...(backfillSince !== undefined ? { backfillSince } : {}),
+        ...(this.vectorSpace && !legacy ? { space: this.vectorSpace } : {}),
       });
       this.checkpointBackfillSince = backfillSince;
     } catch (err) {
@@ -816,7 +837,7 @@ export class IndexPersistence {
     for (const [id, entry] of legacy.entries()) staging.add(id, entry.sessionId, entry.embedding);
     try {
       await this.markBackfillSince(savedAt);
-      await this.writeChanges(staging);
+      await this.writeChanges(staging, true);
     } catch (err) {
       logger.warn("index persistence: migrating the legacy vector snapshot failed; it stays in place and the next save retries", {
         message: errorMessage(err),
