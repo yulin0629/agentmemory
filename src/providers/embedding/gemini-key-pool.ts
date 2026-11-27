@@ -2,10 +2,10 @@ import { readFileSync } from "node:fs";
 
 /**
  * Orders Gemini embedding calls over the keys in an agent.env-style file
- * (GEMINI_API_KEY plus GEMINI_API_KEY_<LABEL>), the same file and parse rule
- * as the gemini-api-access skill's run.py. The preferred label answers while
- * it works; a key that is refused or over its quota is skipped for a while
- * and the next one answers.
+ * (GEMINI_API_KEY plus GEMINI_API_KEY_<LABEL>), the file the gemini-api-access
+ * skill's run.py reads. Keys keep the file's order, with the preferred label
+ * first; a key that is refused or over its quota is skipped for a while and
+ * the next one answers.
  */
 export interface GeminiKey {
   label: string;

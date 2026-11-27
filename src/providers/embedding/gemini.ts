@@ -31,8 +31,17 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
     this.apiKey = apiKey || getEnvVar("GEMINI_API_KEY") || "";
     this.fallbackKey = getEnvVar("GEMINI_API_KEY_FALLBACK") || "";
     const keyFile = (getEnvVar("GEMINI_API_KEY_FILE") || "").trim();
-    if (keyFile) this.keyPool = createGeminiKeyPool(keyFile, getEnvVar("GEMINI_API_KEY_PREFER") || "", this.apiKey);
-    if (!this.apiKey && !this.keyPool) throw new Error("GEMINI_API_KEY is required");
+    if (keyFile) {
+      this.keyPool = createGeminiKeyPool(keyFile, getEnvVar("GEMINI_API_KEY_PREFER") || "", this.apiKey);
+      const order = this.keyPool.order().map(({ label }) => label);  // throws when there is no key at all
+      if (order.length === 1 && order[0] === "GEMINI_API_KEY") {
+        logger.warn("[agentmemory] gemini embed: GEMINI_API_KEY_FILE gave no usable key; only GEMINI_API_KEY answers", { file: keyFile });
+      } else {
+        logger.info("[agentmemory] gemini embed: key pool", { order });
+      }
+    } else if (!this.apiKey) {
+      throw new Error("GEMINI_API_KEY is required");
+    }
     const model = (getEnvVar("GEMINI_EMBEDDING_MODEL") || "").trim().replace(/^models\//, "") || DEFAULT_MODEL;
     this.model = `models/${model}`;
     this.prefixed = model.startsWith("gemini-embedding-2");
