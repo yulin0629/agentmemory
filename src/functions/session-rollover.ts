@@ -67,6 +67,19 @@ export function preserveRolloverState(existing: Session | null, project?: string
   };
 }
 
+function indexSession(kv: StateKV, session: Pick<Session, "id" | "project" | "startedAt" | "agentId">): Promise<void> {
+  return addSessionToProjectIndex(kv, session.project, {
+    id: session.id,
+    startedAt: session.startedAt,
+    ...(session.agentId ? { agentId: session.agentId } : {}),
+  }).catch((err) => {
+    logger.warn("session index update failed", {
+      sessionId: session.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
+
 export async function expandSessionFamily(
   kv: StateKV,
   sessionIds: Iterable<string>,
@@ -77,26 +90,23 @@ export async function expandSessionFamily(
   if (uniqueIds.length === 0) return expanded;
 
   const sessionMap = new Map<string, Session | null>(preloaded ?? []);
-  const uncachedIds = uniqueIds.filter((id) => !sessionMap.has(id));
-  if (uncachedIds.length > 0) {
-    const fetched = await Promise.all(uncachedIds.map((id) => kv.get<Session>(KV.sessions, id)));
-    for (let i = 0; i < uncachedIds.length; i++) {
-      sessionMap.set(uncachedIds[i]!, fetched[i] ?? null);
+  const loadMissing = async (ids: string[]) => {
+    const uncached = ids.filter((id) => !sessionMap.has(id));
+    if (uncached.length === 0) return;
+    const fetched = await Promise.all(uncached.map((id) => kv.get<Session>(KV.sessions, id)));
+    for (let i = 0; i < uncached.length; i++) {
+      sessionMap.set(uncached[i]!, fetched[i] ?? null);
     }
-  }
+  };
+
+  await loadMissing(uniqueIds);
 
   const rootIds = new Set<string>();
   for (const id of uniqueIds) {
     const session = sessionMap.get(id);
     rootIds.add(session?.parentSessionId ?? id);
   }
-  const uncachedRoots = [...rootIds].filter((id) => !sessionMap.has(id));
-  if (uncachedRoots.length > 0) {
-    const fetched = await Promise.all(uncachedRoots.map((id) => kv.get<Session>(KV.sessions, id)));
-    for (let i = 0; i < uncachedRoots.length; i++) {
-      sessionMap.set(uncachedRoots[i]!, fetched[i] ?? null);
-    }
-  }
+  await loadMissing([...rootIds]);
 
   for (const rootId of rootIds) {
     const root = sessionMap.get(rootId);
@@ -174,16 +184,20 @@ export async function withWritableSegment<T>(
     sdk,
     kv,
     rootSessionId,
+    rootSession,
     maxObservationsPerSession,
     payload,
     contextProjectId,
   } = options;
   const cap = maxObservationsPerSession && maxObservationsPerSession > 0 ? maxObservationsPerSession : 0;
-  let liveRoot = options.rootSession;
-  let currentSessionId = liveRoot?.activeSegmentId || rootSessionId;
-  let pendingRootPointer: string | null = null;
-  let rootObsCount = liveRoot?.observationCount ?? 0;
-  let hops = 0;
+  const capReached = (): WritableSegmentResult<T> => ({
+    kind: "cap_reached",
+    error: `Session observation limit reached (${cap})`,
+  });
+
+  let currentSessionId = rootSession?.activeSegmentId || rootSessionId;
+  let rollover: { project: string; cwd: string; nowIso: string } | null = null;
+  let rootObsCount = rootSession?.observationCount ?? 0;
 
   const ensureRootPointsTo = async (
     targetId: string,
@@ -192,11 +206,10 @@ export async function withWritableSegment<T>(
     cwd: string,
     fallback?: { agentId?: string; contextProjectId?: string },
   ) => {
-    if (liveRoot) {
+    if (rootSession) {
       await kv.update(KV.sessions, rootSessionId, [
         { type: "set", path: "activeSegmentId", value: targetId },
       ]);
-      liveRoot = { ...liveRoot, activeSegmentId: targetId };
       return;
     }
     const inheritedAgentId = fallback?.agentId ?? getAgentId();
@@ -216,25 +229,14 @@ export async function withWritableSegment<T>(
       ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
     };
     await kv.set(KV.sessions, rootSessionId, createdRoot);
-    await addSessionToProjectIndex(kv, project, {
-      id: rootSessionId,
-      startedAt: rootStartedAt,
-      ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-    }).catch((err) => {
-      logger.warn("session index update failed", {
-        sessionId: rootSessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    });
-    liveRoot = createdRoot;
+    await indexSession(kv, createdRoot);
   };
 
-  while (hops < MAX_ROLLOVER_HOPS) {
-    hops++;
-
+  for (let hop = 0; hop < MAX_ROLLOVER_HOPS; hop++) {
     type AttemptResult =
       | { kind: "written"; value: T }
       | { kind: "cap_reached" }
+      | { kind: "skip"; nextId: string | null }
       | {
           kind: "rollover";
           nextId: string;
@@ -247,15 +249,48 @@ export async function withWritableSegment<T>(
 
     // debt: ceiling: ~1500-2000 obs (~8 MiB SESSION_SOURCE_MAX_BYTES), upgrade: add byte-budget rollover check if any segment hits source_unavailable
     const attempt: AttemptResult = await withSessionLock(currentSessionId, async () => {
-      const existingSession = currentSessionId === rootSessionId
-        ? liveRoot
+      let existingSession = currentSessionId === rootSessionId
+        ? rootSession
         : await kv.get<Session>(KV.sessions, currentSessionId);
 
       let full = false;
       let existingCount = 0;
       let existing: CompressedObservation[] | undefined;
 
-      if (cap > 0 && existingSession && (existingSession.observationCount ?? 0) >= cap) {
+      if (rollover) {
+        if (existingSession && existingSession.parentSessionId !== rootSessionId) {
+          return { kind: "skip", nextId: nextSegmentId(rootSessionId, currentSessionId) };
+        }
+        if (!existingSession) {
+          const keys = await listScopeKeys(kv, KV.observations(currentSessionId));
+          if (keys.length === 0) {
+            const inheritedAgentId = rootSession ? rootSession.agentId : getAgentId();
+            const inheritedContextProjectId = rootSession?.contextProjectId ?? contextProjectId;
+            const nextSession: Session = {
+              id: currentSessionId,
+              project: rollover.project,
+              cwd: rollover.cwd,
+              startedAt: rollover.nowIso,
+              updatedAt: rollover.nowIso,
+              status: "active",
+              observationCount: 0,
+              parentSessionId: rootSessionId,
+              ...(inheritedContextProjectId ? { contextProjectId: inheritedContextProjectId } : {}),
+              ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
+              ...(rootSession?.tags ? { tags: [...rootSession.tags] } : {}),
+            };
+            await kv.set(KV.sessions, currentSessionId, nextSession);
+            await indexSession(kv, nextSession);
+            existingSession = nextSession;
+            existing = [];
+          } else if (cap > 0 && keys.length >= cap) {
+            full = true;
+            existingCount = keys.length;
+          }
+        }
+      }
+
+      if (!full && existing === undefined && cap > 0 && existingSession && (existingSession.observationCount ?? 0) >= cap) {
         const keyCount = (await listScopeKeys(kv, KV.observations(currentSessionId))).length;
         if (keyCount >= cap) {
           full = true;
@@ -263,7 +298,7 @@ export async function withWritableSegment<T>(
         }
       }
 
-      if (!full) {
+      if (!full && existing === undefined) {
         existing = await kv.list<CompressedObservation>(KV.observations(currentSessionId));
         if (cap > 0 && existing.length >= cap) {
           full = true;
@@ -272,24 +307,22 @@ export async function withWritableSegment<T>(
       }
 
       if (!full) {
-        if (pendingRootPointer) {
-          const meta = hasValidProjectAndCwd(
-            liveRoot?.project || existingSession?.project || payload.project,
-            liveRoot?.cwd || existingSession?.cwd || payload.cwd,
+        if (rollover) {
+          const meta =
+            hasValidProjectAndCwd(
+              rootSession?.project || existingSession?.project || rollover.project,
+              rootSession?.cwd || existingSession?.cwd || rollover.cwd,
+            ) ?? rollover;
+          await ensureRootPointsTo(
+            currentSessionId,
+            rollover.nowIso,
+            meta.project,
+            meta.cwd,
+            {
+              agentId: existingSession?.agentId,
+              contextProjectId: existingSession?.contextProjectId,
+            },
           );
-          if (meta) {
-            await ensureRootPointsTo(
-              pendingRootPointer,
-              new Date().toISOString(),
-              meta.project,
-              meta.cwd,
-              {
-                agentId: existingSession?.agentId,
-                contextProjectId: existingSession?.contextProjectId,
-              },
-            );
-            pendingRootPointer = null;
-          }
         }
         return {
           kind: "written",
@@ -298,8 +331,8 @@ export async function withWritableSegment<T>(
       }
 
       const meta = hasValidProjectAndCwd(
-        liveRoot?.project || existingSession?.project || payload.project,
-        liveRoot?.cwd || existingSession?.cwd || payload.cwd,
+        rootSession?.project || existingSession?.project || payload.project,
+        rootSession?.cwd || existingSession?.cwd || payload.cwd,
       );
       if (!meta) {
         return { kind: "cap_reached" };
@@ -335,7 +368,12 @@ export async function withWritableSegment<T>(
       return { kind: "written", value: attempt.value };
     }
     if (attempt.kind === "cap_reached") {
-      return { kind: "cap_reached", error: `Session observation limit reached (${cap})` };
+      return capReached();
+    }
+    if (attempt.kind === "skip") {
+      if (!attempt.nextId) return capReached();
+      currentSessionId = attempt.nextId;
+      continue;
     }
 
     if (currentSessionId === rootSessionId) {
@@ -368,77 +406,9 @@ export async function withWritableSegment<T>(
       }
     }
 
-    const inheritedAgentId = liveRoot ? liveRoot.agentId : getAgentId();
-    const inheritedContextProjectId = liveRoot?.contextProjectId ?? contextProjectId;
-
-    let targetNextId: string | null = attempt.nextId;
-    while (targetNextId && hops <= MAX_ROLLOVER_HOPS) {
-      const probeId = targetNextId;
-      const probeResult = await withSessionLock(probeId, async (): Promise<
-        | { kind: "written"; value: T }
-        | { kind: "adopt" }
-        | { kind: "skip" }
-      > => {
-        const existingTarget = await kv.get<Session>(KV.sessions, probeId);
-        if (existingTarget) {
-          return existingTarget.parentSessionId === rootSessionId
-            ? { kind: "adopt" }
-            : { kind: "skip" };
-        }
-        const existingTargetKeys = await listScopeKeys(kv, KV.observations(probeId));
-        if (existingTargetKeys.length > 0) {
-          return { kind: "adopt" };
-        }
-
-        const nextSession: Session = {
-          id: probeId,
-          project: attempt.project,
-          cwd: attempt.cwd,
-          startedAt: attempt.nowIso,
-          updatedAt: attempt.nowIso,
-          status: "active",
-          observationCount: 0,
-          parentSessionId: rootSessionId,
-          ...(inheritedContextProjectId ? { contextProjectId: inheritedContextProjectId } : {}),
-          ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-          ...(liveRoot?.tags ? { tags: [...liveRoot.tags] } : {}),
-        };
-        await kv.set(KV.sessions, probeId, nextSession);
-        await addSessionToProjectIndex(kv, attempt.project, {
-          id: probeId,
-          startedAt: attempt.nowIso,
-          ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-        }).catch((err) => {
-          logger.warn("session index update failed", {
-            sessionId: probeId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
-
-        await ensureRootPointsTo(probeId, attempt.nowIso, attempt.project, attempt.cwd);
-        pendingRootPointer = null;
-        return {
-          kind: "written",
-          value: await writeFn({ sessionId: probeId, existingSession: nextSession, existing: [] }),
-        };
-      });
-
-      if (probeResult.kind === "written") {
-        return { kind: "written", value: probeResult.value };
-      }
-      if (probeResult.kind === "adopt") {
-        currentSessionId = probeId;
-        pendingRootPointer = probeId;
-        break;
-      }
-      hops++;
-      targetNextId = nextSegmentId(rootSessionId, probeId);
-    }
-
-    if (!targetNextId) {
-      return { kind: "cap_reached", error: `Session observation limit reached (${cap})` };
-    }
+    currentSessionId = attempt.nextId;
+    rollover = { project: attempt.project, cwd: attempt.cwd, nowIso: attempt.nowIso };
   }
 
-  return { kind: "cap_reached", error: `Session observation limit reached (${cap})` };
+  return capReached();
 }

@@ -1219,24 +1219,14 @@ export function registerApiTriggers(
         }
         return { session: merged, activeSegment: updatedSegment };
       });
-      await addSessionToProjectIndex(kv, project, {
-        id: sessionId,
-        startedAt: session.startedAt,
-        ...(session.agentId ? { agentId: session.agentId } : {}),
-      }).catch((err) => {
-        logger.warn("session index update failed", {
-          sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-      if (activeSegment) {
+      for (const indexed of activeSegment ? [session, activeSegment] : [session]) {
         await addSessionToProjectIndex(kv, project, {
-          id: activeSegment.id,
-          startedAt: activeSegment.startedAt,
-          ...(activeSegment.agentId ? { agentId: activeSegment.agentId } : {}),
+          id: indexed.id,
+          startedAt: indexed.startedAt,
+          ...(indexed.agentId ? { agentId: indexed.agentId } : {}),
         }).catch((err) => {
           logger.warn("session index update failed", {
-            sessionId: activeSegment.id,
+            sessionId: indexed.id,
             error: err instanceof Error ? err.message : String(err),
           });
         });
