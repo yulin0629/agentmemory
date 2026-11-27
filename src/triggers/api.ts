@@ -67,6 +67,7 @@ import { getCaptureController, type CaptureResult } from "../functions/capture.j
 import { withoutObservationSource } from "../functions/observation-source.js";
 import { clearSessionFinalize, scheduleSessionFinalize } from "../functions/session-finalize.js";
 import { getSummaryTriggerTimeoutMs, requestSummaryRefresh } from "../functions/summary-state.js";
+import { preserveRolloverState, resolveActiveSessionId } from "../functions/session-rollover.js";
 import { registerCompressionApi } from "./compression.js";
 import {
   getFinalizeIdleMs,
@@ -1183,28 +1184,53 @@ export function registerApiTriggers(
         ...(title ? { firstPrompt: title.slice(0, 200) } : {}),
         ...(agentId ? { agentId } : {}),
       };
-      const session = await withKeyedLock(`obs:${sessionId}`, async () => {
+      const { session, activeSegment } = await withKeyedLock(`obs:${sessionId}`, async () => {
         const existing = await kv.get<Session>(KV.sessions, sessionId);
         const merged: Session = {
           ...freshSession,
+          ...preserveRolloverState(existing, project),
           observationCount: existing?.observationCount ?? freshSession.observationCount,
           firstPrompt: freshSession.firstPrompt ?? existing?.firstPrompt,
           summary: freshSession.summary ?? existing?.summary,
           commitShas: existing?.commitShas ?? freshSession.commitShas,
         };
         await kv.set(KV.sessions, sessionId, merged);
-        return merged;
+
+        let updatedSegment: Session | null = null;
+        if (existing?.activeSegmentId && existing.activeSegmentId !== sessionId) {
+          const activeSegId = existing.activeSegmentId;
+          updatedSegment = await withKeyedLock(`obs:${activeSegId}`, async () => {
+            const activeSeg = await kv.get<Session>(KV.sessions, activeSegId);
+            if (!activeSeg) return null;
+            const nextSeg: Session = {
+              ...activeSeg,
+              project,
+              cwd,
+              updatedAt: freshSession.startedAt,
+              status: "active",
+            };
+            delete nextSeg.endedAt;
+            if (agentId) nextSeg.agentId = agentId;
+            else delete nextSeg.agentId;
+            if (existing.project !== project) delete nextSeg.contextProjectId;
+            await kv.set(KV.sessions, activeSegId, nextSeg);
+            return nextSeg;
+          });
+        }
+        return { session: merged, activeSegment: updatedSegment };
       });
-      await addSessionToProjectIndex(kv, project, {
-        id: sessionId,
-        startedAt: session.startedAt,
-        ...(session.agentId ? { agentId: session.agentId } : {}),
-      }).catch((err) => {
-        logger.warn("session index update failed", {
-          sessionId,
-          error: err instanceof Error ? err.message : String(err),
+      for (const indexed of activeSegment ? [session, activeSegment] : [session]) {
+        await addSessionToProjectIndex(kv, project, {
+          id: indexed.id,
+          startedAt: indexed.startedAt,
+          ...(indexed.agentId ? { agentId: indexed.agentId } : {}),
+        }).catch((err) => {
+          logger.warn("session index update failed", {
+            sessionId: indexed.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
-      });
+      }
       const contextResult = await sdk.trigger<
         { sessionId: string; project: string; agentId?: string },
         { context: string }
@@ -1231,35 +1257,53 @@ export function registerApiTriggers(
   sdk.registerFunction("api::session::end",
     async (req: HttpRequest<{ sessionId: string; final?: boolean }>): Promise<Response> => {
       const body = req.body as Record<string, unknown> | undefined;
-      const sessionId = asNonEmptyString(body?.sessionId);
-      if (!sessionId) {
+      const rawSessionId = asNonEmptyString(body?.sessionId);
+      if (!rawSessionId) {
         return {
           status_code: 400,
           body: { error: "sessionId is required and must be a non-empty string" },
         };
       }
+      let sessionId = await resolveActiveSessionId(kv, rawSessionId);
+      const runWithRolloverRetry = async <R extends string>(
+        op: (targetId: string) => Promise<R>,
+      ): Promise<R> => {
+        let result = await op(sessionId);
+        for (let retry = 0; retry < 2 && result === "already_completed"; retry++) {
+          const refreshed = await withKeyedLock(`obs:${rawSessionId}`, () =>
+            resolveActiveSessionId(kv, rawSessionId),
+          );
+          if (refreshed === sessionId) break;
+          sessionId = refreshed;
+          result = await op(sessionId);
+        }
+        return result;
+      };
       if (body?.final === false && getFinalizeIdleMs() > 0) {
-        const deferResult = await withKeyedLock(`obs:${sessionId}`, async () => {
-          const session = await kv.get<Session>(KV.sessions, sessionId);
-          if (!session || session.id !== sessionId) return "not_found" as const;
-          if (session.status === "completed") return "already_completed" as const;
-          const updates: Array<{ type: "set" | "remove"; path: string; value?: unknown }> = [
-            { type: "set", path: "updatedAt", value: new Date().toISOString() },
-          ];
-          if (session.status === "abandoned") {
-            updates.push({ type: "set", path: "status", value: "active" });
-            updates.push({ type: "remove", path: "endedAt" });
-          }
-          await kv.update(KV.sessions, sessionId, updates);
-          return "deferred" as const;
-        });
+        let finalizeAt = 0;
+        const deferResult = await runWithRolloverRetry((targetId) =>
+          withKeyedLock(`obs:${targetId}`, async () => {
+            const session = await kv.get<Session>(KV.sessions, targetId);
+            if (!session || session.id !== targetId) return "not_found" as const;
+            if (session.status === "completed") return "already_completed" as const;
+            const updates: Array<{ type: "set" | "remove"; path: string; value?: unknown }> = [
+              { type: "set", path: "updatedAt", value: new Date().toISOString() },
+            ];
+            if (session.status === "abandoned") {
+              updates.push({ type: "set", path: "status", value: "active" });
+              updates.push({ type: "remove", path: "endedAt" });
+            }
+            await kv.update(KV.sessions, targetId, updates);
+            finalizeAt = await scheduleSessionFinalize(kv, targetId);
+            return "deferred" as const;
+          }),
+        );
         if (deferResult !== "deferred") {
           return {
             status_code: 200,
             body: { success: true, ended: false, reason: deferResult },
           };
         }
-        const finalizeAt = await scheduleSessionFinalize(kv, sessionId);
         return {
           status_code: 200,
           body: {
@@ -1270,20 +1314,22 @@ export function registerApiTriggers(
           },
         };
       }
-      const endResult = await withKeyedLock(`obs:${sessionId}`, async () => {
-        return withKeyedLock(`session:${sessionId}`, async () => {
-          const session = await kv.get<Session>(KV.sessions, sessionId);
-          if (!session || session.id !== sessionId) return "not_found" as const;
-          if (session.status === "completed") return "already_completed" as const;
+      const endResult = await runWithRolloverRetry((targetId) =>
+        withKeyedLock(`obs:${targetId}`, async () => {
+          return withKeyedLock(`session:${targetId}`, async () => {
+            const session = await kv.get<Session>(KV.sessions, targetId);
+            if (!session || session.id !== targetId) return "not_found" as const;
+            if (session.status === "completed") return "already_completed" as const;
 
-          await requestSummaryRefresh(kv, sessionId);
-          await kv.update(KV.sessions, sessionId, [
-            { type: "set", path: "endedAt", value: new Date().toISOString() },
-            { type: "set", path: "status", value: "completed" },
-          ]);
-          return "ended" as const;
-        });
-      });
+            await requestSummaryRefresh(kv, targetId);
+            await kv.update(KV.sessions, targetId, [
+              { type: "set", path: "endedAt", value: new Date().toISOString() },
+              { type: "set", path: "status", value: "completed" },
+            ]);
+            return "ended" as const;
+          });
+        }),
+      );
       if (endResult !== "ended") {
         return {
           status_code: 200,

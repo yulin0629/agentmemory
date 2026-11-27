@@ -12,6 +12,7 @@ import { deleteFacetsForTargets } from "./facets.js";
 import { recordAudit } from "./audit.js";
 import { getSearchIndex, getVectorIndex, indexRecords, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { dropObservationArchive, restoreArchivedSession } from "./observation-archive.js";
+import { expandSessionFamily } from "./session-rollover.js";
 import { requestSummaryRefresh } from "./summary-state.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
@@ -438,40 +439,55 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
         !data.memoryId
       ) {
         const sessionId = data.sessionId;
-        await withKeyedLock(`obs:${sessionId}`, () =>
-          withKeyedLock(`obs-write:${sessionId}`, async () => {
+        const forgetSingleSession = (targetId: string) =>
+          withKeyedLock(`obs-write:${targetId}`, async () => {
             const observations = await kv.list<ObservationRef & { id: string }>(
-              KV.observations(sessionId),
+              KV.observations(targetId),
             );
             for (const obs of observations) {
-              await attempt(obs.id, () => forgetObservation(sessionId, obs.id, obs));
+              await attempt(obs.id, () => forgetObservation(targetId, obs.id, obs));
             }
-            await dropObservationArchive(kv, sessionId).catch((err) => recordFailure(`archive:${sessionId}`, err));
-            await attempt(sessionId, () => withKeyedLock(`session:${sessionId}`, async () => {
-              const session = await kv.get<Session>(KV.sessions, sessionId);
+            await dropObservationArchive(kv, targetId).catch((err) => recordFailure(`archive:${targetId}`, err));
+            await attempt(targetId, () => withKeyedLock(`session:${targetId}`, async () => {
+              const session = await kv.get<Session>(KV.sessions, targetId);
               if (!session) return false;
-              await kv.delete(KV.sessions, sessionId);
-              await kv.delete(KV.summaryRepairs, sessionId);
+              await kv.delete(KV.sessions, targetId);
+              await kv.delete(KV.summaryRepairs, targetId);
               await removeSessionFromProjectIndex(
                 kv,
                 session.project,
-                sessionId,
+                targetId,
               ).catch(() => {});
               deletedSession = true;
               return true;
             }));
             try {
-              const summary = await kv.get(KV.summaries, sessionId);
+              const summary = await kv.get(KV.summaries, targetId);
               if (summary) {
-                await kv.delete(KV.summaries, sessionId);
+                await kv.delete(KV.summaries, targetId);
                 deletedSummary = true;
                 deleted++;
               }
             } catch (err) {
-              recordFailure(`summary:${sessionId}`, err);
+              recordFailure(`summary:${targetId}`, err);
             }
-          }),
-        );
+          });
+
+        await withKeyedLock(`obs:${sessionId}`, async () => {
+          const root = await kv.get<Session>(KV.sessions, sessionId);
+          if (root?.activeSegmentId) {
+            const family = await expandSessionFamily(
+              kv,
+              [sessionId],
+              new Map<string, Session | null>([[sessionId, root]]),
+            );
+            for (const segId of family) {
+              if (segId === sessionId) continue;
+              await withKeyedLock(`obs:${segId}`, () => forgetSingleSession(segId));
+            }
+          }
+          await forgetSingleSession(sessionId);
+        });
       }
 
       if (deletedObservationIds.length > 0) {

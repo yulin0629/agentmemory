@@ -113,6 +113,12 @@ export async function collectAll<T = unknown>(kv: StateKV, scope: string): Promi
   return out
 }
 
+export async function listScopeKeys(kv: StateKV, scope: string): Promise<string[]> {
+  if (typeof kv.listKeys === 'function') return kv.listKeys(scope)
+  const rows = await kv.list<{ id?: string }>(scope)
+  return rows.map((row) => row?.id ?? '').filter(Boolean)
+}
+
 export class StateKV {
   readonly backend: StateBackend
 
