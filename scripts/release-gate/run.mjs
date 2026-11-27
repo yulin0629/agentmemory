@@ -1181,7 +1181,9 @@ async function main() {
     await ensureUp(instA);
     await instA.stop();
     await instA.start({ MAX_OBS_PER_SESSION: "2" });
-    const sid = `gate-dead-${randomBytes(4).toString("hex")}`;
+    // Keep sessionId at 195 chars so appending "--seg-2" exceeds the 200-char
+    // rollover ceiling, forcing the cap error to exercise dead-letter recovery.
+    const sid = `gate-dead-${randomBytes(4).toString("hex")}-${"x".repeat(176)}`;
     const ms = [marker("onyx"), marker("opal"), marker("quartz")];
     for (const m of ms) await instA.hook("PostToolUse", instA.toolEvent(sid, m));
     const dead = await poll("a dead letter for the failed capture", async () => {
